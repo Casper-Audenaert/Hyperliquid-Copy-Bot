@@ -220,6 +220,7 @@ Discord: maskiplays
 If you find this bot useful, donations are appreciated:
 
 Arbitrum USDC: 0x2987F53372c02D1a4C67241aA1840C1E83c480fF
+Dont look at PNL :(
 
 ## Final Thoughts
 10/10 Crash fucking sucked
