@@ -13,7 +13,9 @@ class HyperliquidClient:
         self.api_url = api_url
         self.info_url = f"{api_url}/info"
         self.exchange_url = f"{api_url}/exchange"
+        self.dexs = ["", 'xyz', 'flx', 'vntl', 'hyna', 'km', 'abcd', 'cash', 'para'] # empty string which represents the first perp dex
         self.session: Optional[aiohttp.ClientSession] = None
+        
         
     async def __aenter__(self):
         self.session = aiohttp.ClientSession()
@@ -47,27 +49,53 @@ class HyperliquidClient:
             UserState object or None if failed
         """
         try:
-            data = {
-                "type": "clearinghouseState",
-                "user": address
-            }
-            
-            response = await self._post(self.info_url, data)
-            
-            if not response:
-                return None
+            # merge all dex responses to get complete user state across all dexs
+            all_responses = None
+            for dex in self.dexs:
+                data = {
+                    "type": "clearinghouseState",
+                    "user": address,
+                    "dex": dex
+                }
+                
+                response = await self._post(self.info_url, data)
+                
+                if not response:
+                    continue
+                if all_responses is None:
+                    all_responses = response
+                else:
+                    # Merge asset positions
+                    if "assetPositions" in response:
+                        if "assetPositions" not in all_responses:
+                            all_responses["assetPositions"] = []
+                        all_responses["assetPositions"].extend(response["assetPositions"])
+                    
+                    # Merge open orders
+                    if "openOrders" in response:
+                        if "openOrders" not in all_responses:
+                            all_responses["openOrders"] = []
+                        all_responses["openOrders"].extend(response["openOrders"])
+                    
+                    # Update margin summary (balance, margin used, unrealized pnl)
+                    if "marginSummary" in response:
+                        if "marginSummary" not in all_responses:
+                            all_responses["marginSummary"] = response["marginSummary"]
+                        for key in ["accountValue", "totalMarginUsed", "totalNtlPos"]:
+                            all_responses["marginSummary"][key] = float(all_responses["marginSummary"].get(key, 0)) + float(response["marginSummary"].get(key, 0))
+                                
             
             # Parse positions
             positions = []
-            if "assetPositions" in response:
-                for pos_data in response["assetPositions"]:
+            if all_responses and "assetPositions" in all_responses:
+                for pos_data in all_responses["assetPositions"]:
                     position = pos_data.get("position", {})
                     if position and position.get("szi") != "0":  # szi is the position size
                         size = float(position.get("szi", 0))
                         side = PositionSide.LONG if size > 0 else PositionSide.SHORT
                         
                         positions.append(Position(
-                            symbol=pos_data.get("coin", ""),
+                            symbol=position.get("coin", "not found"),
                             side=side,
                             size=abs(size),
                             entry_price=float(position.get("entryPx", 0)),
@@ -80,8 +108,8 @@ class HyperliquidClient:
             
             # Parse orders
             orders = []
-            if "openOrders" in response:
-                for order_data in response["openOrders"]:
+            if all_responses and "openOrders" in all_responses:
+                for order_data in all_responses["openOrders"]:
                     order = order_data.get("order", {})
                     orders.append(Order(
                         order_id=str(order.get("oid", "")),
@@ -96,9 +124,9 @@ class HyperliquidClient:
                     ))
             
             # Parse account balance
-            balance = float(response.get("marginSummary", {}).get("accountValue", 0))
-            margin_used = float(response.get("marginSummary", {}).get("totalMarginUsed", 0))
-            unrealized_pnl = float(response.get("marginSummary", {}).get("totalNtlPos", 0))
+            balance = float(all_responses.get("marginSummary", {}).get("accountValue", 0))
+            margin_used = float(all_responses.get("marginSummary", {}).get("totalMarginUsed", 0))
+            unrealized_pnl = float(all_responses.get("marginSummary", {}).get("totalNtlPos", 0))
             
             from datetime import datetime
             return UserState(
@@ -118,9 +146,16 @@ class HyperliquidClient:
     async def get_all_assets(self) -> List[Dict[str, Any]]:
         """Get list of all available trading assets"""
         try:
-            data = {"type": "meta"}
+            data = {"type": "allPerpMetas"} # This endpoint returns metadata for all perpetual markets, including the different dex asset universe
             response = await self._post(self.info_url, data)
-            return response.get("universe", [])
+            all_assets = []
+            for market in response:
+                universe = market.get("universe", [])
+                for asset in universe:
+                    all_assets.append({
+                        "symbol": asset
+                    })
+            return all_assets
         except Exception as e:
             logger.error(f"Failed to get assets: {e}")
             return []
@@ -128,15 +163,24 @@ class HyperliquidClient:
     async def get_market_price(self, symbol: str) -> Optional[float]:
         """Get current market price for a symbol"""
         try:
-            data = {
-                "type": "allMids"
-            }
-            response = await self._post(self.info_url, data)
-            
-            # Response is a dict with symbol: price
-            if isinstance(response, dict):
-                return float(response.get(symbol, 0))
-            return None
+            # The "allMids" endpoint returns the mid price for all symbols across all dexs, so we can just query it once and extract the price for the symbol we want
+            find_symbol = False
+            for dex in self.dexs:
+                data = {
+                    "type": "allMids",
+                    "dex": dex
+                }
+                response = await self._post(self.info_url, data)
+                if not response:
+                    continue
+                # Response is a dict with symbol: price
+                if isinstance(response, dict):
+                    find_symbol = True
+                    return float(response.get(symbol, 0))
+        
+            if not find_symbol:
+                logger.error(f"Market price for {symbol} not found")
+                return None
             
         except Exception as e:
             logger.error(f"Failed to get market price for {symbol}: {e}")

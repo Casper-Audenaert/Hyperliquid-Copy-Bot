@@ -135,7 +135,7 @@ class WalletMonitor:
         
         for pos_data in positions:
             # Parse position data
-            symbol = pos_data.get("coin", "").upper()
+            symbol = positions.get("coin", "").upper()
             size = float(pos_data.get("szi", 0))
             
             # Check if asset is blocked
