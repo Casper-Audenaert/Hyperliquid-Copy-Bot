@@ -58,7 +58,10 @@ class WalletMonitor:
         await self.ws.connect()
         
         # Subscribe to user updates
-        await self.ws.subscribe_user(self.target_address, self._handle_update)
+        await self.ws.subscribe_user_events(self.target_address, self._handle_user_event)
+        
+        # Subscribe to order updates
+        await self.ws.subscribe_order_updates(self.target_address, self._handle_order_update)
         
         # Start listening
         await self.ws.listen()
@@ -68,7 +71,7 @@ class WalletMonitor:
         logger.info("Stopping wallet monitoring")
         await self.ws.stop()
     
-    async def _handle_update(self, update: WebSocketUpdate):
+    async def _handle_user_event(self, update: WebSocketUpdate):
         """Handle WebSocket updates from target wallet"""
         logger.info(f"🔔 WebSocket Update Received: {update.channel}")
         
@@ -213,3 +216,24 @@ class WalletMonitor:
         
         # Update state
         await self.get_current_state()
+        
+    async def _handle_order_update(self, update: WebSocketUpdate):
+        """Handle order updates from WebSocket"""
+        logger.info(f"🔔 Order Update Received: {update.channel}")
+        
+        try:
+            if "data" not in update.data:
+                logger.warning(f"⚠️ Update has no 'data' field: {update.data}")
+                return
+            
+            data = update.data["data"]
+            logger.info(f"📦 Order update data keys: {list(data.keys())}")
+            
+            if "orders" in data:
+                logger.success(f"📋 ORDERS UPDATE: {len(data['orders'])} orders")
+                await self._handle_orders(data["orders"])
+                
+        except Exception as e:
+            logger.error(f"Error handling order update: {e}")
+            import traceback
+            logger.error(traceback.format_exc())

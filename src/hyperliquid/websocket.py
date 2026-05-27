@@ -90,7 +90,7 @@ class HyperliquidWebSocket:
             except Exception as e:
                 logger.error(f"Error in heartbeat task: {e}")
     
-    async def subscribe_user(self, address: str, callback: Optional[Callable] = None):
+    async def subscribe_user_events(self, address: str, callback: Optional[Callable] = None):
         """
         Subscribe to user updates (positions, orders, fills)
         
@@ -116,6 +116,34 @@ class HyperliquidWebSocket:
             await self._send_subscription(subscription)
         
         logger.info(f"Subscribed to user updates for {address}")
+
+
+    async def subscribe_order_updates(self, address: str, callback: Optional[Callable] = None):
+        """
+        Subscribe to orders updates
+        
+        Args:
+            address: Wallet address to monitor
+            callback: Function to call when updates are received
+        """
+        channel = f"orderUpdates:{address}"
+        
+        subscription = {
+            "method": "subscribe",
+            "subscription": {
+                "type": "orderUpdates",
+                "user": address
+            }
+        }
+        
+        self.subscriptions[channel] = subscription
+        if callback:
+            self.callbacks[channel] = callback
+        
+        if self.ws:
+            await self._send_subscription(subscription)
+        
+        logger.info(f"Subscribed to 'orderUpdates' for {address}")
     
     async def subscribe_trades(self, symbol: str, callback: Optional[Callable] = None):
         """
