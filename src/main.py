@@ -196,19 +196,22 @@ async def on_new_position(position_data: dict):
         # Check minimum position size (Hyperliquid requirement)
         your_position_value = your_size * entry_price
         if your_position_value < MIN_POSITION_SIZE_USD:
-            logger.warning(f"\n⚠️  Skipping Position: {symbol}")
+            logger.warning("")
+            logger.warning(f"⚠️  Skipping Position: {symbol}")
             logger.warning(f"   Position value ${your_position_value:.2f} below Hyperliquid minimum ${MIN_POSITION_SIZE_USD:.2f}")
             logger.success("=" * 60)
             return
         
-        logger.info(f"\nYour Position:")
+        logger.info("")
+        logger.info(f"Your Position:")
         logger.info(f"   Size: {your_size:.4f} {symbol}")
         logger.info(f"   Notional: ${your_size * entry_price:,.2f}")
         logger.info(f"   Leverage: {your_leverage}x")
         logger.info(f"   Entry: ${entry_price:,.2f}")
         
         # Execute the trade
-        logger.info(f"\nExecuting trade...")
+        logger.info("")
+        logger.info(f"Executing trade...")
         result = await executor.execute_market_order(
             symbol=symbol,
             side=side,
@@ -275,7 +278,8 @@ async def on_position_close(position_data: dict):
             simulated_balance += margin_used + pnl
             simulated_pnl += pnl
             
-            logger.success(f"\n💰 SIMULATED POSITION CLOSED!")
+            logger.success("")
+            logger.success(f"💰 SIMULATED POSITION CLOSED!")
             logger.success(f"   Entry: ${pos['entry_price']:,.2f}")
             logger.success(f"   Exit: ${current_price:,.2f}")
             logger.success(f"   PnL: ${pnl:,.2f} ({(pnl/pos['value']*100):+.2f}%)")
@@ -328,7 +332,8 @@ async def on_new_order(order_data: dict):
         target_size = abs(float(order_data.get('sz', 0)))
         price = float(order_data.get('limitPx', 0))
         
-        logger.info(f"\n{'='*50}")
+        logger.info("")
+        logger.info(f"{'='*50}")
         logger.info(f"📋 NEW ORDER DETECTED!")
         logger.info(f"{'='*50}")
         logger.info(f"Symbol: {symbol}")
@@ -347,7 +352,8 @@ async def on_new_order(order_data: dict):
         else:
             our_size = target_size
         
-        logger.info(f"\n📊 Order Sizing:")
+        logger.info("")
+        logger.info(f"📊 Order Sizing:")
         logger.info(f"   Our Size: {our_size:.4f}")
         
         # Execute the order
@@ -365,7 +371,8 @@ async def on_new_order(order_data: dict):
             # Log simulated order
             if settings.simulated_trading:
                 order_value = our_size * price
-                logger.success(f"\n📋 SIMULATED ORDER PLACED!")
+                logger.success("")
+                logger.success(f"📋 SIMULATED ORDER PLACED!")
                 logger.success(f"   Order Value: ${order_value:,.2f}")
                 logger.success(f"   Account Balance: ${simulated_balance:,.2f}")
             
@@ -420,7 +427,8 @@ async def on_order_fill(fill_data: dict):
             # Fallback: Use side indicator
             position_side = PositionSide.LONG if side_str == "B" else PositionSide.SHORT
         
-        logger.info(f"\n{'='*50}")
+        logger.info("")
+        logger.info(f"{'='*50}")
         logger.info(f"📋 FILL DETECTED!")
         logger.info(f"{'='*50}")
         logger.info(f"Symbol: {symbol}")
@@ -504,11 +512,13 @@ async def on_order_fill(fill_data: dict):
         # Check minimum position size (Hyperliquid requirement)
         our_position_value = our_size * price
         if our_position_value < MIN_POSITION_SIZE_USD:
-            logger.warning(f"\n⚠️  Skipping Fill: {symbol}")
+            logger.warning("")
+            logger.warning(f"⚠️  Skipping Fill: {symbol}")
             logger.warning(f"   Position value ${our_position_value:.2f} below Hyperliquid minimum ${MIN_POSITION_SIZE_USD:.2f}")
             return
         
-        logger.info(f"\n📊 Fill Sizing:")
+        logger.info("")
+        logger.info(f"📊 Fill Sizing:")
         logger.info(f"   Target Size: {target_size}")
         logger.info(f"   Our Size: {our_size:.4f}")
         
@@ -588,7 +598,8 @@ async def on_order_fill(fill_data: dict):
                         del simulated_positions[symbol]
                         logger.info(f"   Position {symbol} closed")
                 
-                logger.success(f"\n💰 SIMULATED FILL EXECUTED!")
+                logger.success("")
+                logger.success(f"💰 SIMULATED FILL EXECUTED!")
                 logger.success(f"   Position: {symbol}")
                 if symbol in simulated_positions:
                     logger.success(f"   New Size: {simulated_positions[symbol]['size']:.4f}")
@@ -848,12 +859,14 @@ async def main():
     )
     
     # Fetch target wallet state to auto-calculate ratio
-    logger.info(f"\n📊 Fetching initial state...")
+    logger.info("")
+    logger.info(f"📊 Fetching initial state...")
     state = await monitor.get_current_state()
     
     if state:
         target_balance = state.balance
-        logger.info(f"\n💼 Target Account:")
+        logger.info("")
+        logger.info(f"💼 Target Account:")
         logger.info(f"   Balance: ${target_balance:,.2f}")
         logger.info(f"   Equity: ${state.total_equity:,.2f}")
         logger.info(f"   Unrealized PnL: ${state.unrealized_pnl:,.2f}")
@@ -863,7 +876,8 @@ async def main():
         auto_ratio = simulated_balance / target_balance
         settings.sizing.portfolio_ratio = auto_ratio
         
-        logger.success(f"\n✨ AUTO-CALCULATED SIZING:")
+        logger.success("")
+        logger.success(f"✨ AUTO-CALCULATED SIZING:")
         logger.success(f"   Target Balance: ${target_balance:,.2f}")
         logger.success(f"   Your Balance: ${simulated_balance:,.2f}")
         logger.success(f"   📊 Ratio: 1:{int(1/auto_ratio)} ({auto_ratio*100:.4f}%)")
@@ -876,7 +890,8 @@ async def main():
             # Calculate minimum balance needed to copy at $10
             min_balance_needed = MIN_POSITION_SIZE_USD * (target_balance / smallest_target_value)
             
-            logger.info(f"\n⚠️  MINIMUM BALANCE CHECK:")
+            logger.info("")
+            logger.info(f"⚠️  MINIMUM BALANCE CHECK:")
             logger.info(f"   Hyperliquid Min Order Size: ${MIN_POSITION_SIZE_USD:.2f}")
             logger.info(f"   Smallest Target Position: ${smallest_target_value:,.2f}")
             logger.info(f"   Min Balance Needed (for this ratio): ${min_balance_needed:,.2f}")
@@ -891,7 +906,8 @@ async def main():
                 logger.success(f"   ✅ Your balance is sufficient to copy all positions!")
         
         if state.positions:
-            logger.info(f"\n📊 Current Positions:")
+            logger.info("")
+            logger.info(f"📊 Current Positions:")
             logger.info(f"=" * 60)
             
             total_simulated_margin = 0
@@ -907,21 +923,24 @@ async def main():
                 margin_needed = your_position_value / your_leverage
                 total_simulated_margin += margin_needed
                 
-                logger.info(f"\n   Position {i}: {pos.symbol} {pos.side.value.upper()}")
+                logger.info("")
+                logger.info(f"   Position {i}: {pos.symbol} {pos.side.value.upper()}")
                 logger.info(f"   Target: {pos.size:.4f} @ ${pos.entry_price:,.2f} ({pos.leverage}x)")
                 logger.info(f"   Target Value: ${target_position_value:,.2f}")
                 logger.success(f"   → Your Copy: {your_size:.4f} @ ${pos.entry_price:,.2f} ({your_leverage}x)")
                 logger.success(f"   → Your Value: ${your_position_value:,.2f}")
                 logger.success(f"   → Margin Needed: ${margin_needed:,.2f}")
             
-            logger.info(f"\n" + "=" * 60)
+            logger.info("")
+            logger.info("=" * 60)
             logger.warning(f"📊 If you copied all {len(state.positions)} positions:")
             logger.warning(f"   Total Margin Needed: ${total_simulated_margin:,.2f}")
             logger.warning(f"   Your Balance: ${simulated_balance:,.2f}")
             logger.warning(f"   Remaining: ${simulated_balance - total_simulated_margin:,.2f}")
             logger.info(f"=" * 60)
     
-    logger.info(f"\n🔧 Copy Trading Settings:")
+    logger.info(f"")
+    logger.info(f"🔧 Copy Trading Settings:")
     logger.info(f"   Sizing Mode: {settings.sizing.mode}")
     logger.info(f"   Leverage Adjustment: {settings.leverage.adjustment_ratio}x")
     logger.info(f"   Max Position Size: ${settings.sizing.max_position_size:,.2f}")
@@ -963,11 +982,13 @@ async def main():
                 
                 # Check minimum position size
                 if your_position_value < MIN_POSITION_SIZE_USD:
-                    logger.warning(f"\n⚠️  Skipping Position {i}/{len(state.positions)}: {pos.symbol}")
+                    logger.warning("")
+                    logger.warning(f"⚠️  Skipping Position {i}/{len(state.positions)}: {pos.symbol}")
                     logger.warning(f"   Position value ${your_position_value:.2f} below Hyperliquid minimum ${MIN_POSITION_SIZE_USD:.2f}")
                     continue
                 
-                logger.info(f"\n📊 Copying Position {i}/{len(state.positions)}: {pos.symbol}")
+                logger.info("")
+                logger.info(f"📊 Copying Position {i}/{len(state.positions)}: {pos.symbol}")
                 logger.info(f"   Target: {pos.size:.4f} @ ${pos.entry_price:,.2f} ({pos.leverage}x)")
                 logger.info(f"   Target Value: ${target_position_value:,.2f}")
                 logger.success(f"   → Your Size: {your_size:.4f} @ ${pos.entry_price:,.2f} ({your_leverage}x)")
@@ -1006,7 +1027,8 @@ async def main():
         # Show final account state
         if settings.simulated_trading:
             total_margin_used = sum(p['margin_used'] for p in simulated_positions.values())
-            logger.info("\n" + "=" * 60)
+            logger.info("")
+            logger.info("=" * 60)
             logger.success("✅ EXISTING POSITIONS COPIED!")
             logger.info("=" * 60)
             logger.success(f"💰 Simulated Account Update:")
@@ -1021,7 +1043,8 @@ async def main():
     
     # Copy existing orders if enabled
     if settings.copy_rules.copy_existing_orders and state and state.orders:
-        logger.info("\n" + "=" * 60)
+        logger.info("")
+        logger.info("=" * 60)
         logger.success("📋 COPYING EXISTING ORDERS ON STARTUP")
         logger.info("=" * 60)
         
@@ -1038,7 +1061,8 @@ async def main():
                 your_size = your_order_value / order.price
                 your_leverage = 1.0  # Default leverage for orders
                 
-                logger.info(f"\n📝 Copying Order {i}/{len(state.orders)}: {order.symbol}")
+                logger.info("")
+                logger.info(f"📝 Copying Order {i}/{len(state.orders)}: {order.symbol}")
                 logger.info(f"   Target: {order.size:.4f} @ ${order.price:,.2f}")
                 logger.success(f"   → Your Size: {your_size:.4f} @ ${order.price:,.2f}")
                 
@@ -1099,24 +1123,28 @@ async def main():
     
     try:
         # Get initial state
-        logger.info(f"\n� Fetching initial state...")
+        logger.info("")
+        logger.info(f"📊 Fetching initial state...")
         state = await monitor.get_current_state()
         
         if state:
-            logger.info(f"\n💼 Target Account:")
+            logger.info("")
+            logger.info(f"💼 Target Account:")
             logger.info(f"   Balance: ${state.balance:,.2f}")
             logger.info(f"   Equity: ${state.total_equity:,.2f}")
             logger.info(f"   Unrealized PnL: ${state.unrealized_pnl:,.2f}")
             logger.info(f"   Open Positions: {len(state.positions)}")
             
             if state.positions:
-                logger.info(f"\n� Current Positions:")
+                logger.info("")
+                logger.info(f" Current Positions:")
                 for i, pos in enumerate(state.positions, 1):
                     logger.info(f"   {i}. {pos.symbol} {pos.side.value.upper()}: {pos.size} @ ${pos.entry_price:,.2f} ({pos.leverage}x)")
         
         # Copy existing open orders if configured
         if settings.copy_rules.copy_existing_orders and state and state.orders:
-            logger.info(f"\n📋 Copying {len(state.orders)} existing orders...")
+            logger.info("")
+            logger.info(f"📋 Copying {len(state.orders)} existing orders...")
             for order in state.orders:
                 try:
                     order_dict = {
@@ -1130,7 +1158,8 @@ async def main():
                 except Exception as e:
                     logger.error(f"Failed to copy existing order: {e}")
         
-        logger.info(f"\n�🔌 Starting monitoring...")
+        logger.info("")
+        logger.info(f"🔌 Starting monitoring...")
         logger.info("✅ Bot is now LIVE and monitoring for trades!")
         logger.info(f"   Copy Open Positions: {settings.copy_rules.copy_open_positions}")
         logger.info(f"   Copy Existing Orders: {settings.copy_rules.copy_existing_orders}")
@@ -1153,11 +1182,14 @@ async def main():
         await monitor.start_monitoring()
         
     except KeyboardInterrupt:
-        logger.info("\n⚠️ Shutdown signal received...")
+        logger.info("")
+        logger.info("⚠️ Shutdown signal received...")
     except Exception as e:
+        logger.error
         logger.error(f"❌ Error: {e}")
         raise
     finally:
+        logger.info("")
         logger.info("🛑 Stopping monitoring...")
         
         # Send shutdown notification
