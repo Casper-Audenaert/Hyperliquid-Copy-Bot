@@ -18,6 +18,8 @@ class HyperliquidWebSocket:
         self.reconnect_delay = 5
         self.subscriptions: Dict[str, Any] = {}
         self.callbacks: Dict[str, Callable] = {}
+        self.heartbeat_task: Optional[asyncio.Task] = None
+        self.heartbeat_interval = 55  # Send ping every 55 seconds (server closes at 60)
         
     async def connect(self):
         """Establish WebSocket connection"""
@@ -26,6 +28,11 @@ class HyperliquidWebSocket:
             self.ws = await websockets.connect(self.ws_url)
             self.is_running = True
             logger.info("WebSocket connected successfully")
+            
+            # Start heartbeat task
+            if self.heartbeat_task is None or self.heartbeat_task.done():
+                self.heartbeat_task = asyncio.create_task(self._heartbeat())
+                logger.info("Heartbeat task started")
             
             # Resubscribe to channels after reconnection
             for channel, sub_data in self.subscriptions.items():
@@ -38,6 +45,15 @@ class HyperliquidWebSocket:
     async def disconnect(self):
         """Close WebSocket connection"""
         self.is_running = False
+        
+        # Stop heartbeat task
+        if self.heartbeat_task and not self.heartbeat_task.done():
+            self.heartbeat_task.cancel()
+            try:
+                await self.heartbeat_task
+            except asyncio.CancelledError:
+                logger.info("Heartbeat task cancelled")
+        
         if self.ws:
             await self.ws.close()
             logger.info("WebSocket disconnected")
@@ -51,7 +67,30 @@ class HyperliquidWebSocket:
             except Exception as e:
                 logger.error(f"Failed to send subscription: {e}")
     
-    async def subscribe_user(self, address: str, callback: Optional[Callable] = None):
+    async def _send_ping(self):
+        """Send ping message to keep connection alive"""
+        if self.ws and not self.ws.closed:
+            try:
+                ping_msg = {"method": "ping"}
+                await self.ws.send(json.dumps(ping_msg))
+                logger.debug("❤️ Sent ping to keep connection alive")
+            except Exception as e:
+                logger.error(f"Failed to send ping: {e}")
+    
+    async def _heartbeat(self):
+        """Heartbeat task to keep WebSocket connection alive"""
+        while self.is_running:
+            try:
+                await asyncio.sleep(self.heartbeat_interval)
+                if self.is_running and self.ws and not self.ws.closed:
+                    await self._send_ping()
+            except asyncio.CancelledError:
+                logger.debug("Heartbeat task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in heartbeat task: {e}")
+    
+    async def subscribe_user_events(self, address: str, callback: Optional[Callable] = None):
         """
         Subscribe to user updates (positions, orders, fills)
         
@@ -77,6 +116,34 @@ class HyperliquidWebSocket:
             await self._send_subscription(subscription)
         
         logger.info(f"Subscribed to user updates for {address}")
+
+
+    async def subscribe_order_updates(self, address: str, callback: Optional[Callable] = None):
+        """
+        Subscribe to orders updates
+        
+        Args:
+            address: Wallet address to monitor
+            callback: Function to call when updates are received
+        """
+        channel = f"orderUpdates:{address}"
+        
+        subscription = {
+            "method": "subscribe",
+            "subscription": {
+                "type": "orderUpdates",
+                "user": address
+            }
+        }
+        
+        self.subscriptions[channel] = subscription
+        if callback:
+            self.callbacks[channel] = callback
+        
+        if self.ws:
+            await self._send_subscription(subscription)
+        
+        logger.info(f"Subscribed to 'orderUpdates' for {address}")
     
     async def subscribe_trades(self, symbol: str, callback: Optional[Callable] = None):
         """
@@ -140,6 +207,11 @@ class HyperliquidWebSocket:
             
             # Determine the channel/type of update
             channel = data.get("channel", "unknown")
+            
+            # Handle pong response from heartbeat
+            if channel == "pong":
+                logger.debug("❤️ Received pong from server")
+                return
             
             # Log the parsed data
             logger.info(f"📦 Parsed - Channel: '{channel}', Keys: {list(data.keys())}")
