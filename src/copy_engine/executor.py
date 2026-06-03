@@ -11,7 +11,7 @@ from hyperliquid.models import OrderType, OrderSide
 
 class TradeExecutor:
     """Executes trades on Hyperliquid exchange"""
-    
+
     def __init__(
         self,
         wallet_address: str,
@@ -20,21 +20,13 @@ class TradeExecutor:
         exchange_url: str = "https://api.hyperliquid.xyz/exchange",
         dry_run: bool = True
     ):
-        """Initialize trade executor
-        
-        Args:
-            wallet_address: Hyperliquid wallet address
-            private_key: Private key for signing transactions
-            info_url: Hyperliquid info API URL
-            exchange_url: Hyperliquid exchange API URL
-            dry_run: If True, simulate orders without executing
-        """
         self.wallet_address = wallet_address.lower() if wallet_address else None
         self.private_key = private_key
         self.info_url = info_url
         self.exchange_url = exchange_url
         self.dry_run = dry_run
-        
+        self._coin_index_cache: Dict[str, int] = {}
+
         # Initialize signing account if we have credentials
         self.account = None
         if self.private_key and not self.dry_run:
@@ -54,23 +46,36 @@ class TradeExecutor:
             raise ValueError("Cannot run in live mode without private key")
         else:
             logger.warning("⚠️ Running in DRY RUN mode - no real trades will be executed")
-    
-    def _sign_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
-        """Sign an action using EIP-712 structured data signing
-        
-        Args:
-            action: Action to sign
-            
-        Returns:
-            Signed action with signature
+
+    async def _get_asset_index(self, symbol: str) -> int:
+        """Resolve a coin symbol to its integer asset index.
+
+        Hyperliquid's exchange endpoint requires an integer for the 'asset' /
+        'a' fields, not a coin name string. The index is the coin's position in
+        the universe array returned by the meta endpoint.
         """
+        if not self._coin_index_cache:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.info_url,
+                    json={"type": "meta"},
+                    headers={"Content-Type": "application/json"}
+                ) as response:
+                    data = await response.json()
+            universe = data.get("universe", [])
+            self._coin_index_cache = {coin["name"]: i for i, coin in enumerate(universe)}
+
+        if symbol not in self._coin_index_cache:
+            raise ValueError(f"Unknown asset symbol: {symbol}")
+        return self._coin_index_cache[symbol]
+
+    def _sign_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Sign an action using EIP-712 structured data signing"""
         if not self.account:
             raise ValueError("Cannot sign actions without account")
-        
-        # Add timestamp nonce
+
         timestamp = int(time.time() * 1000)
-        
-        # Create EIP-712 structured data
+
         structured_data = {
             "domain": {
                 "name": "Exchange",
@@ -92,59 +97,47 @@ class TradeExecutor:
                 ]
             },
             "message": {
-                "source": "a",  # "a" indicates API order
+                "source": "a",
                 "connectionId": "0x" + "0" * 64
             }
         }
-        
-        # Sign using sign_typed_data method
+
         signed_message = self.account.sign_typed_data(
             structured_data["domain"],
             {"Agent": structured_data["types"]["Agent"]},
             structured_data["message"]
         )
-        
-        # Create signature object
+
         signature = {
             "r": "0x" + signed_message.r.to_bytes(32, "big").hex(),
             "s": "0x" + signed_message.s.to_bytes(32, "big").hex(),
             "v": signed_message.v
         }
-        
-        # Build final request
+
         return {
             "action": action,
             "nonce": timestamp,
             "signature": signature,
             "vaultAddress": None
         }
-    
+
     async def _update_leverage(
         self,
         symbol: str,
         leverage: int,
         is_cross: bool = True
     ) -> bool:
-        """Update leverage for a symbol
-        
-        Args:
-            symbol: Trading symbol (e.g. "BTC")
-            leverage: Leverage value (integer)
-            is_cross: If True, use cross margin. If False, use isolated
-            
-        Returns:
-            True if successful, False otherwise
-        """
         try:
+            asset_index = await self._get_asset_index(symbol)
             action = {
                 "type": "updateLeverage",
-                "asset": symbol,
+                "asset": asset_index,
                 "isCross": is_cross,
                 "leverage": leverage
             }
-            
+
             signed_action = self._sign_action(action)
-            
+
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     self.exchange_url,
@@ -152,18 +145,18 @@ class TradeExecutor:
                     headers={"Content-Type": "application/json"}
                 ) as response:
                     if response.status == 200:
-                        await response.json()  # Read response
+                        await response.json()
                         logger.success(f"✅ Updated leverage for {symbol} to {leverage}x")
                         return True
                     else:
                         error_text = await response.text()
                         logger.error(f"Failed to update leverage: {error_text}")
                         return False
-                        
+
         except Exception as e:
             logger.error(f"Error updating leverage: {e}")
             return False
-    
+
     async def execute_market_order(
         self,
         symbol: str,
@@ -172,18 +165,6 @@ class TradeExecutor:
         leverage: int = 1,
         reduce_only: bool = False
     ) -> Optional[str]:
-        """Execute a market order
-        
-        Args:
-            symbol: Trading symbol (e.g. "BTC")
-            side: Order side (BUY or SELL)
-            size: Order size
-            leverage: Leverage to use
-            reduce_only: If True, order will only reduce position
-            
-        Returns:
-            Order ID if successful, None otherwise
-        """
         if self.dry_run:
             return await self._simulate_order(
                 symbol=symbol,
@@ -192,29 +173,28 @@ class TradeExecutor:
                 order_type=OrderType.MARKET,
                 leverage=leverage
             )
-        
+
         try:
-            # Update leverage first if needed
             if leverage > 1:
                 await self._update_leverage(symbol, leverage)
-            
-            # Create market order action (price 0 = market order)
+
+            asset_index = await self._get_asset_index(symbol)
             action = {
                 "type": "order",
                 "orders": [{
-                    "a": self.wallet_address,
+                    "a": asset_index,
                     "b": side == OrderSide.BUY,
-                    "p": "0",  # 0 = market order
+                    "p": "0",
                     "s": str(float(size)),
                     "r": reduce_only,
-                    "t": {"limit": {"tif": "Ioc"}},  # Immediate or Cancel
-                    "c": symbol
+                    "t": {"limit": {"tif": "Ioc"}},
+                    "c": None
                 }],
                 "grouping": "na"
             }
-            
+
             signed_action = self._sign_action(action)
-            
+
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     self.exchange_url,
@@ -227,20 +207,19 @@ class TradeExecutor:
                             f"✅ Market {side.value} order executed: {symbol} "
                             f"size={size} leverage={leverage}x"
                         )
-                        # Extract order ID from response
                         if result.get("status") == "ok" and result.get("response", {}).get("data"):
                             order_id = result["response"]["data"].get("statuses", [{}])[0].get("resting", {}).get("oid")
                             return order_id
-                        return "executed"  # Order filled immediately
+                        return "executed"
                     else:
                         error_text = await response.text()
                         logger.error(f"Failed to execute market order: {error_text}")
                         return None
-                        
+
         except Exception as e:
             logger.error(f"Error executing market order: {e}")
             return None
-    
+
     async def execute_limit_order(
         self,
         symbol: str,
@@ -251,20 +230,6 @@ class TradeExecutor:
         reduce_only: bool = False,
         post_only: bool = False
     ) -> Optional[str]:
-        """Execute a limit order
-        
-        Args:
-            symbol: Trading symbol (e.g. "BTC")
-            side: Order side (BUY or SELL)
-            size: Order size
-            price: Limit price
-            leverage: Leverage to use
-            reduce_only: If True, order will only reduce position
-            post_only: If True, order will only add liquidity (maker-only)
-            
-        Returns:
-            Order ID if successful, None otherwise
-        """
         if self.dry_run:
             return await self._simulate_order(
                 symbol=symbol,
@@ -274,31 +239,30 @@ class TradeExecutor:
                 price=price,
                 leverage=leverage
             )
-        
+
         try:
-            # Update leverage first if needed
             if leverage > 1:
                 await self._update_leverage(symbol, leverage)
-            
-            # Create limit order action
-            tif = "Alo" if post_only else "Gtc"  # Alo = Add Liquidity Only, Gtc = Good Till Cancel
-            
+
+            asset_index = await self._get_asset_index(symbol)
+            tif = "Alo" if post_only else "Gtc"
+
             action = {
                 "type": "order",
                 "orders": [{
-                    "a": self.wallet_address,
+                    "a": asset_index,
                     "b": side == OrderSide.BUY,
                     "p": str(float(price)),
                     "s": str(float(size)),
                     "r": reduce_only,
                     "t": {"limit": {"tif": tif}},
-                    "c": symbol
+                    "c": None
                 }],
                 "grouping": "na"
             }
-            
+
             signed_action = self._sign_action(action)
-            
+
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     self.exchange_url,
@@ -311,7 +275,6 @@ class TradeExecutor:
                             f"✅ Limit {side.value} order placed: {symbol} "
                             f"size={size} price={price} leverage={leverage}x"
                         )
-                        # Extract order ID from response
                         if result.get("status") == "ok" and result.get("response", {}).get("data"):
                             order_id = result["response"]["data"].get("statuses", [{}])[0].get("resting", {}).get("oid")
                             return order_id
@@ -320,77 +283,57 @@ class TradeExecutor:
                         error_text = await response.text()
                         logger.error(f"Failed to place limit order: {error_text}")
                         return None
-                        
+
         except Exception as e:
             logger.error(f"Error placing limit order: {e}")
             return None
-    
+
     async def close_position(
         self,
         symbol: str,
         size: Optional[Decimal] = None,
         side: Optional[OrderSide] = None
     ) -> Optional[str]:
-        """Close a position using a market order
-        
-        Args:
-            symbol: Trading symbol
-            size: Position size to close (optional - will close full position)
-            side: Side to close (optional - opposite of current position)
-            
-        Returns:
-            Order ID if successful, None otherwise
-        """
         if self.dry_run:
             if size and side:
                 logger.info(f"🔵 DRY RUN: Would close {side.value} {size} {symbol}")
             else:
                 logger.info(f"🔵 DRY RUN: Would close position {symbol}")
             return f"dry_run_close_{symbol}_{int(time.time())}"
-        
-        # If size and side not provided, fetch current position to determine
+
         if size is None or side is None:
             logger.warning(f"⚠️ Size and/or side not provided for {symbol}, using reduce_only market order")
-            # Use a small market order with reduce_only flag to close whatever position exists
             return await self.execute_market_order(
                 symbol=symbol,
-                side=OrderSide.SELL,  # Will be reduced regardless
-                size=Decimal("0.001"),  # Minimal size with reduce_only
+                side=OrderSide.SELL,
+                size=Decimal("0.001"),
                 reduce_only=True
             )
-        
+
         return await self.execute_market_order(
             symbol=symbol,
             side=side,
             size=size,
             reduce_only=True
         )
-    
+
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
-        """Cancel an order
-        
-        Args:
-            symbol: Trading symbol
-            order_id: Order ID to cancel
-            
-        Returns:
-            True if successful, False otherwise
-        """
         if self.dry_run:
             logger.info(f"🔵 DRY RUN: Would cancel order {order_id} for {symbol}")
             return True
-        
+
         try:
+            asset_index = await self._get_asset_index(symbol)
             action = {
                 "type": "cancel",
                 "cancels": [{
-                    "a": self.wallet_address,
+                    "a": asset_index,
                     "o": order_id
                 }]
             }
-            
+
             signed_action = self._sign_action(action)
-            
+
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     self.exchange_url,
@@ -404,35 +347,28 @@ class TradeExecutor:
                         error_text = await response.text()
                         logger.error(f"Failed to cancel order: {error_text}")
                         return False
-                        
+
         except Exception as e:
             logger.error(f"Error cancelling order: {e}")
             return False
-    
+
     async def cancel_all_orders(self, symbol: Optional[str] = None) -> int:
-        """Cancel all orders
-        
-        Args:
-            symbol: If provided, cancel only orders for this symbol
-            
-        Returns:
-            Number of orders cancelled
-        """
         if self.dry_run:
             logger.info(f"🔵 DRY RUN: Would cancel all orders{f' for {symbol}' if symbol else ''}")
             return 0
-        
+
         try:
+            asset_index = await self._get_asset_index(symbol) if symbol else None
             action = {
                 "type": "cancelByCloid",
                 "cancels": [{
-                    "asset": symbol if symbol else None,
-                    "cloid": None  # Cancel all
+                    "asset": asset_index,
+                    "cloid": None
                 }]
             }
-            
+
             signed_action = self._sign_action(action)
-            
+
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     self.exchange_url,
@@ -448,11 +384,11 @@ class TradeExecutor:
                         error_text = await response.text()
                         logger.error(f"Failed to cancel all orders: {error_text}")
                         return 0
-                        
+
         except Exception as e:
             logger.error(f"Error cancelling all orders: {e}")
             return 0
-    
+
     async def _simulate_order(
         self,
         symbol: str,
@@ -462,21 +398,8 @@ class TradeExecutor:
         price: Optional[Decimal] = None,
         leverage: int = 1
     ) -> str:
-        """Simulate an order without executing
-        
-        Args:
-            symbol: Trading symbol
-            side: Order side
-            size: Order size
-            order_type: Order type
-            price: Order price (for limit orders)
-            leverage: Leverage
-            
-        Returns:
-            Simulated order ID
-        """
         order_id = f"sim_{symbol}_{int(time.time())}"
-        
+
         if order_type == OrderType.MARKET:
             logger.info(
                 f"🔵 DRY RUN: Would execute MARKET {side.value} {symbol} "
@@ -487,5 +410,5 @@ class TradeExecutor:
                 f"🔵 DRY RUN: Would place LIMIT {side.value} {symbol} "
                 f"size={size} price={price} leverage={leverage}x → Order ID: {order_id}"
             )
-        
+
         return order_id
