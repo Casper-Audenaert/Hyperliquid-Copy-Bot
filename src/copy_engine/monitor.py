@@ -138,7 +138,7 @@ class WalletMonitor:
         
         for pos_data in positions:
             # Parse position data
-            symbol = positions.get("coin", "").upper()
+            symbol = pos_data.get("coin", "").upper()
             size = float(pos_data.get("szi", 0))
             
             # Check if asset is blocked
@@ -220,18 +220,24 @@ class WalletMonitor:
     async def _handle_order_update(self, update: WebSocketUpdate):
         """Handle order updates from WebSocket"""
         logger.info(f"🔔 Order Update Received: {update.channel}")
-        
+
         try:
             if "data" not in update.data:
                 logger.warning(f"⚠️ Update has no 'data' field: {update.data}")
                 return
-            
+
             data = update.data["data"]
-            logger.info(f"📦 Order update data keys: {list(data.keys())}")
-            
-            if "orders" in data:
-                logger.success(f"📋 ORDERS UPDATE: {len(data['orders'])} orders")
-                await self._handle_orders(data["orders"])
+
+            # orderUpdates channel sends data as a list of {order: {...}, status: "..."} objects
+            if isinstance(data, list):
+                logger.success(f"📋 ORDERS UPDATE: {len(data)} orders")
+                orders = [item.get("order", item) for item in data if isinstance(item, dict)]
+                await self._handle_orders(orders)
+            elif isinstance(data, dict):
+                logger.info(f"📦 Order update data keys: {list(data.keys())}")
+                if "orders" in data:
+                    logger.success(f"📋 ORDERS UPDATE: {len(data['orders'])} orders")
+                    await self._handle_orders(data["orders"])
                 
         except Exception as e:
             logger.error(f"Error handling order update: {e}")

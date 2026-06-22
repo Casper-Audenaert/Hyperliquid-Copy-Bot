@@ -160,6 +160,28 @@ class HyperliquidClient:
             logger.error(f"Failed to get assets: {e}")
             return []
     
+    async def get_all_mids(self) -> Dict[str, float]:
+        """Get current mid prices for all symbols across all dexes"""
+        all_mids: Dict[str, float] = {}
+        try:
+            async with aiohttp.ClientSession() as session:
+                for dex in self.dexs:
+                    try:
+                        async with session.post(
+                            self.info_url,
+                            json={"type": "allMids", "dex": dex}
+                        ) as response:
+                            data = await response.json()
+                            if data and isinstance(data, dict):
+                                for sym, px in data.items():
+                                    if sym not in all_mids:
+                                        all_mids[sym] = float(px)
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.error(f"Failed to get all mids: {e}")
+        return all_mids
+
     async def get_market_price(self, symbol: str) -> Optional[float]:
         """Get current market price for a symbol"""
         try:

@@ -327,39 +327,41 @@ async def on_new_order(order_data: dict):
     
     try:
         symbol = order_data.get('coin', '')
-        side = order_data.get('side', '')
+        side_raw = order_data.get('side', '')
         order_type = order_data.get('orderType', 'limit')
         target_size = abs(float(order_data.get('sz', 0)))
         price = float(order_data.get('limitPx', 0))
-        
+
+        # Convert raw side string ("B"/"buy" → LONG, "S"/"sell" → SHORT)
+        order_side = PositionSide.LONG if side_raw.upper() in ('B', 'BUY') else PositionSide.SHORT
+
         logger.info("")
         logger.info(f"{'='*50}")
         logger.info(f"📋 NEW ORDER DETECTED!")
         logger.info(f"{'='*50}")
         logger.info(f"Symbol: {symbol}")
-        logger.info(f"Side: {side}")
+        logger.info(f"Side: {order_side.value.upper()}")
         logger.info(f"Type: {order_type}")
         logger.info(f"Target Size: {target_size}")
         logger.info(f"Price: ${price:,.2f}")
-        
-        # Calculate our order size
+
+        # Calculate our order size using the same balance ratio as the fill handler
         if settings.copy_rules.auto_adjust_size:
-            our_size = position_sizer.calculate_size(
-                target_size=target_size,
-                symbol=symbol,
-                current_exposure=monitor.current_state.total_equity if monitor.current_state else 0
-            )
+            target_balance = monitor.current_state.balance if monitor.current_state else 1000000
+            your_balance = simulated_balance if settings.simulated_trading else target_balance
+            ratio = your_balance / target_balance if target_balance > 0 else settings.sizing.portfolio_ratio
+            our_size = target_size * ratio
         else:
             our_size = target_size
-        
+
         logger.info("")
         logger.info(f"📊 Order Sizing:")
         logger.info(f"   Our Size: {our_size:.4f}")
-        
+
         # Execute the order
         result = await executor.execute_limit_order(
             symbol=symbol,
-            side=side,
+            side=order_side,
             size=our_size,
             price=price
         )
@@ -380,7 +382,7 @@ async def on_new_order(order_data: dict):
             if notifier:
                 await notifier.send_trade_notification(
                     symbol=symbol,
-                    side=side,
+                    side=order_side,
                     size=our_size,
                     price=price,
                     leverage=1.0,  # Orders don't have leverage until filled
@@ -565,47 +567,48 @@ async def on_order_fill(fill_data: dict):
         if result:
             logger.success(f"✅ Fill copied successfully!")
             trades_copied_count += 1
-            
-            # Update simulated position
+
+            # Update simulated position and balance
             if settings.simulated_trading:
                 position_value = our_size * price
                 margin_required = position_value / our_leverage
-                
+
                 if symbol not in simulated_positions:
                     simulated_positions[symbol] = {
                         'size': 0,
                         'entry_price': 0,
                         'leverage': our_leverage,
-                        'side': position_side.value
+                        'side': position_side.value,
+                        'value': 0.0,
+                        'margin_used': 0.0,
                     }
-                
+
                 pos = simulated_positions[symbol]
-                
-                # Update position based on direction
+
                 if "Open" in direction:
-                    # Opening new position or adding to existing
                     total_value = (abs(pos['size']) * pos['entry_price']) + position_value
                     new_size = abs(pos['size']) + our_size
                     pos['entry_price'] = total_value / new_size if new_size > 0 else price
                     pos['size'] = new_size if position_side == PositionSide.LONG else -new_size
                     pos['side'] = position_side.value
-                elif "Close" in direction:
-                    # Closing position
-                    pos['size'] = abs(pos['size']) - our_size
-                    if position_side == PositionSide.SHORT:
-                        pos['size'] = -pos['size']
-                    if abs(pos['size']) < 0.0001:  # Effectively zero
-                        del simulated_positions[symbol]
-                        logger.info(f"   Position {symbol} closed")
-                
+                    pos['value'] = pos.get('value', 0.0) + position_value
+                    pos['margin_used'] = pos.get('margin_used', 0.0) + margin_required
+                    simulated_balance -= margin_required
+
+                upnl = _upnl_from_state()
+                equity = simulated_balance + upnl
+                total_margin = sum(p.get('margin_used', 0) for p in simulated_positions.values())
+
                 logger.success("")
-                logger.success(f"💰 SIMULATED FILL EXECUTED!")
-                logger.success(f"   Position: {symbol}")
+                logger.success(f"   📍 {symbol} {position_side.value.upper()} @ ${price:,.4f}  size={our_size:.4f}  {our_leverage}x")
                 if symbol in simulated_positions:
-                    logger.success(f"   New Size: {simulated_positions[symbol]['size']:.4f}")
-                    logger.success(f"   Entry Price: ${simulated_positions[symbol]['entry_price']:.2f}")
-                logger.success(f"   Margin Used: ${margin_required:,.2f}")
-                logger.success(f"   Account Balance: ${simulated_balance:,.2f}")
+                    logger.success(f"   Entry Avg:    ${simulated_positions[symbol]['entry_price']:,.4f}")
+                logger.success(f"   💰 Balance:   ${simulated_balance:,.2f}")
+                logger.success(f"   📈 UPNL:      ${upnl:+,.2f}")
+                logger.success(f"   💎 Equity:    ${equity:,.2f}")
+                logger.success(f"   🔒 Margin:    ${total_margin:,.2f}  ({len(simulated_positions)} positions)")
+            else:
+                logger.success(f"   💰 Balance: live mode")
             
             # Send notification
             if notifier:
@@ -793,6 +796,63 @@ async def handle_stop(close_positions: bool = False):
     # Exit
     import sys
     sys.exit(0)
+
+
+def _upnl_from_state() -> float:
+    """Sync UPNL estimate using last-known prices from the monitor state."""
+    if not simulated_positions or not monitor or not monitor.current_state:
+        return 0.0
+    price_map = {p.symbol: p.current_price for p in monitor.current_state.positions if p.current_price > 0}
+    total = 0.0
+    for sym, pos in simulated_positions.items():
+        px = price_map.get(sym, 0)
+        if px <= 0:
+            continue
+        size = abs(pos['size'])
+        entry = pos.get('entry_price', 0)
+        total += size * (px - entry) if pos.get('side', '').upper() == 'LONG' else size * (entry - px)
+    return total
+
+
+async def periodic_status_update():
+    """Log live balance + UPNL every 30 seconds while positions are open."""
+    while True:
+        try:
+            await asyncio.sleep(30)
+            if not simulated_positions:
+                continue
+
+            # Try fast path (monitor state), fall back to API for missing symbols
+            price_map = {}
+            if monitor and monitor.current_state:
+                price_map = {p.symbol: p.current_price for p in monitor.current_state.positions if p.current_price > 0}
+
+            missing = [s for s in simulated_positions if s not in price_map or price_map[s] <= 0]
+            if missing:
+                all_mids = await client.get_all_mids()
+                price_map.update(all_mids)
+
+            total_upnl = 0.0
+            total_margin = 0.0
+            for sym, pos in simulated_positions.items():
+                px = price_map.get(sym, 0)
+                total_margin += pos.get('margin_used', 0)
+                if px <= 0:
+                    continue
+                size = abs(pos['size'])
+                entry = pos.get('entry_price', 0)
+                total_upnl += size * (px - entry) if pos.get('side', '').upper() == 'LONG' else size * (entry - px)
+
+            equity = simulated_balance + total_upnl
+            logger.info("─" * 50)
+            logger.info(f"📊 LIVE STATUS  |  {len(simulated_positions)} positions  |  {trades_copied_count} trades copied")
+            logger.info(f"   💰 Balance:     ${simulated_balance:,.2f}")
+            logger.info(f"   📈 UPNL:        ${total_upnl:+,.2f}")
+            logger.info(f"   💎 Equity:      ${equity:,.2f}")
+            logger.info(f"   🔒 Margin Used: ${total_margin:,.2f}")
+            logger.info("─" * 50)
+        except Exception as e:
+            logger.error(f"Error in status update: {e}")
 
 
 async def send_hourly_reports():
@@ -1116,11 +1176,14 @@ async def main():
         
         # Start hourly reports task
         asyncio.create_task(send_hourly_reports())
-        
+
         logger.info("✅ Telegram bot ready!")
     else:
         logger.warning("⚠️ Telegram bot not configured (add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to .env)")
-    
+
+    # Always run live status updates regardless of Telegram
+    asyncio.create_task(periodic_status_update())
+
     try:
         # Get initial state
         logger.info("")
