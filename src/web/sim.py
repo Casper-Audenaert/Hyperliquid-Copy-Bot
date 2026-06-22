@@ -204,6 +204,8 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
 
     async def on_position_close(position_data: dict):
         """Safety-net for full closes where the fill stream was missed."""
+        if session.address not in _sessions:
+            return
         symbol = position_data.get("coin", "")
         if symbol not in session.simulated_positions:
             return  # already handled by fill handler
@@ -253,6 +255,8 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
         pass  # orderUpdates subscription is dropped; fills are the signal
 
     async def on_order_fill(fill_data: dict):
+        if session.address not in _sessions:
+            return
         if session.is_paused:
             return
 
@@ -447,6 +451,9 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
     while True:
         try:
             await asyncio.sleep(30)
+            if session.address not in _sessions:
+                logger.debug(f"[{session.label}] Snapshot task exiting — wallet removed")
+                return
             if not session.simulated_positions:
                 continue
 
