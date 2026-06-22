@@ -1,227 +1,58 @@
-# Hyperliquid Copy Trader
+# HL Sim Desk
 
-<p align="center">
-  <a href="https://hyperfoundation.org/" target="_blank">
-    <img src="https://www.cryptoninjas.net/wp-content/uploads/hyperliquid-logo-330x330.webp" alt="Hyperliquid Logo" width="200"/>
-  </a>
-</p>
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-[![Docker](https://img.shields.io/badge/docker-ready-brightgreen.svg)](https://www.docker.com/)
-
-Automated copy trading bot for Hyperliquid DEX. Copies trades from any wallet in real-time with automatic position sizing.
+A copy-trading **simulation** dashboard for Hyperliquid. Watch any number of wallets in real-time, each running as its own independent simulated portfolio. Compare performance, view advanced stats, and add/remove wallets — all without risking real money.
 
 ## Features
 
-- Real-time trade copying via WebSocket
-- Automatic position sizing based on account balance ratio
-- Integer leverage with asset-specific limits
-- Market and limit order support
-- Copy existing positions on startup
-- Simulated trading mode for testing
-- Telegram notifications (optional)
+- Multi-wallet simulation — each wallet is a separate portfolio with its own starting balance
+- Real-time fill copying via WebSocket (fills are the authoritative signal)
+- Per-wallet stats: win rate, max drawdown, Sharpe ratio, profit factor, daily PnL, top assets
+- Compare mode — normalized % return curves across all wallets
+- Wallets persist across restarts (SQLite)
+- Light/dark theme toggle
 
 ## Quick Start
 
-### Docker (Recommended)
-
 ```bash
-docker-compose up -d
-```
-
-### Manual Installation
-
-1. Install Python 3.12+
-2. Install dependencies:
-
-```bash
+# 1. Install dependencies
 pip install -r requirements.txt
+
+# 2. Configure .env (copy from .env.example)
+cp .env.example .env
+# Edit .env: set TARGET_WALLET_ADDRESS to a Hyperliquid wallet to copy
+
+# 3. Run the dashboard
+cd src
+python web_app.py
+# Open http://localhost:5000
 ```
 
-3. Configure .env file with your settings
-4. Run the bot:
+## Configuration (`.env`)
 
-```bash
-python src/main.py
-```
+| Key | Default | Description |
+|---|---|---|
+| `TARGET_WALLET_ADDRESS` | — | Wallet to copy (seeds DB on first start) |
+| `TARGET_WALLETS` | — | Comma-separated list for multiple wallets |
+| `WALLET_LABELS` | — | Display names for `TARGET_WALLETS` |
+| `SIMULATED_ACCOUNT_BALANCE` | `10000` | Starting balance per wallet ($) |
+| `LEVERAGE_ADJUSTMENT` | `1.0` | Scale target leverage (0.5 = half, 1.0 = match) |
+| `BLOCKED_ASSETS` | — | Assets to skip (e.g. `BTC,ETH`) |
 
-## Configuration
+Once wallets are in the DB, the `.env` wallet keys are ignored — use the dashboard UI to add/remove.
 
-Edit the `.env` file:
+## How the simulation works
 
-```properties
-# Hyperliquid API
-HYPERLIQUID_API_URL=https://api.hyperliquid.xyz
+- **Copy ratio** is fixed at start: `your_balance / target_equity`. Never drifts.
+- Existing positions are seeded at the **current mark price** (not the trader's entry) so your starting uPnL is zero.
+- Close/reduce fills realize PnL at the fill price, not a snapshot — win rate and profit factor reflect real exit prices.
+- Fills are deduplicated by trade ID; the WebSocket replays missed fills on reconnect.
 
-# Your Hyperliquid credentials (leave empty for simulation)
-HYPERLIQUID_WALLET_ADDRESS=
-HYPERLIQUID_PRIVATE_KEY=
-
-# Target to copy (wallet or vault)
-TARGET_WALLET_ADDRESS=0x...
-
-# Trading mode
-SIMULATED_TRADING=true
-SIMULATED_ACCOUNT_BALANCE=10000.0
-
-# Copy settings
-COPY_OPEN_POSITIONS=true
-COPY_EXISTING_ORDERS=true
-AUTO_ADJUST_SIZE=true
-USE_LIMIT_ORDERS=false
-LEVERAGE_ADJUSTMENT=1.0
-MAX_OPEN_TRADES=x
-MAX_OPEN_ORDERS=x
-MAX_ACCOUNT_EQUITY=x
-
-# Asset Filters
-BLOCKED_ASSETS=BTC,ETH  # Comma-separated list (e.g., BTC,ETH,SOL)
-
-# Telegram (optional)
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
-
-# Database
-DATABASE_URL=sqlite:///./data/trading.db
-
-# Logging
-LOG_LEVEL=INFO
-LOG_FILE=./logs/trading.log
-```
-
-Notes:
-- `TARGET_WALLET_ADDRESS` accepts either a wallet address or a vault address.
-- `x` means unlimited; set an integer to cap `MAX_OPEN_TRADES`, `MAX_OPEN_ORDERS`, or `MAX_ACCOUNT_EQUITY`.
-- Hyperliquid enforces a $10 minimum notional per order. If your account is much smaller than the target, small fills will be skipped when the proportional size falls below $10. Increase balance or reduce the ratio gap to copy more trades.
-
-## Leverage Adjustment
-
-The `LEVERAGE_ADJUSTMENT` setting controls risk:
-
-- 0.5 = Use 50% of target's leverage (safer)
-- 1.0 = Match target's leverage exactly
-- 2.0 = Use 200% of target's leverage (more aggressive)
-
-Leverage is automatically rounded to integers and capped at asset-specific maximums.
-
-## Blocked Assets
-
-The `BLOCKED_ASSETS` setting lets you exclude specific assets from copying:
-
-```properties
-BLOCKED_ASSETS=BTC,ETH,SOL
-```
-
-When the target wallet trades these assets, the bot will:
-
-- Log a warning message
-- Skip copying the trade
-- Continue monitoring other assets normally
-
-This is useful for:
-
-- Avoiding high-volatility assets
-- Excluding assets you're manually trading
-- Managing risk by limiting exposure to certain markets
-
-Note: Asset symbols are case-insensitive (BTC, btc, Btc all work).
-
-## Position Sizing
-
-Position sizes are automatically calculated based on the ratio of your account balance to the target wallet balance.
-
-Example:
-
-- Target wallet: $100,000
-- Your account: $10,000
-- Ratio: 1:10
-- Target opens 1 BTC position = You open 0.1 BTC position
-
-## Docker Commands
-
-### Windows
-
-Use the batch files in the `windows/` folder:
-
-```cmd
-cd windows
-start.bat    # Start the bot
-logs.bat     # View logs
-stop.bat     # Stop the bot
-```
-
-### Linux/Mac
-
-Use the shell scripts in the `linux/` folder:
-
-```bash
-cd linux
-chmod +x *.sh       # Make executable (first time only)
-./start.sh          # Start the bot
-./logs.sh           # View logs
-./stop.sh           # Stop the bot
-```
-
-### Manual Docker Commands
-
-Start bot:
+## Running with Docker
 
 ```bash
 docker-compose up -d
 ```
 
-View logs:
+## License
 
-```bash
-docker-compose logs -f
-```
-
-Stop bot:
-
-```bash
-docker-compose down
-```
-
-Rebuild after code changes:
-
-```bash
-docker-compose up -d --build
-```
-
-## Telegram Bot
-
-To enable Telegram notifications:
-
-1. Create bot with @BotFather on Telegram
-2. Get your bot token
-3. Send a message to your bot
-4. Get your chat ID from: https://api.telegram.org/bot `<TOKEN>`/getUpdates
-5. Add both values to .env file
-
-Available commands:
-
-- /status - Bot status and balance
-- /positions - Current positions
-- /pnl - Profit and loss report
-- /pause - Pause copying
-- /resume - Resume copying
-
-## Disclaimer
-
-Trading cryptocurrencies involves substantial risk of loss. This software is provided as-is without any warranties. Use at your own risk. The author is not responsible for any financial losses.
-
-## Support
-
-Discord: maskiplays
-
-## Donations
-
-If you find this bot useful, donations are appreciated:
-
-Arbitrum USDC: 0x2987F53372c02D1a4C67241aA1840C1E83c480fF
-Dont look at PNL :(
-
-## Final Thoughts
-10/10 Crash fucking sucked
-Hyperliquid.
+MIT

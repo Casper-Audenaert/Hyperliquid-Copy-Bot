@@ -20,6 +20,7 @@ class HyperliquidWebSocket:
         self.callbacks: Dict[str, Callable] = {}
         self.heartbeat_task: Optional[asyncio.Task] = None
         self.heartbeat_interval = 55  # Send ping every 55 seconds (server closes at 60)
+        self.on_reconnect: Optional[Callable] = None  # called after every reconnect (not first connect)
         
     async def connect(self):
         """Establish WebSocket connection"""
@@ -263,21 +264,28 @@ class HyperliquidWebSocket:
     
     async def listen(self):
         """
-        Main listening loop for WebSocket messages
-        Automatically reconnects on connection loss
+        Main listening loop for WebSocket messages.
+        Automatically reconnects on connection loss and fires on_reconnect
+        so callers can replay missed fills.
         """
+        first_connect = True
         while self.is_running:
             try:
                 if not self.ws or self.ws.closed:
                     await self.connect()
-                
+                    if not first_connect and self.on_reconnect:
+                        # Don't await — let fill replay run concurrently so the
+                        # listen loop stays responsive immediately after reconnect
+                        asyncio.create_task(self.on_reconnect())
+                    first_connect = False
+
                 async for message in self.ws:
                     await self._handle_message(message)
-                    
+
             except websockets.exceptions.ConnectionClosed:
                 logger.warning(f"WebSocket connection closed, reconnecting in {self.reconnect_delay}s...")
                 await asyncio.sleep(self.reconnect_delay)
-                
+
             except Exception as e:
                 logger.error(f"Error in WebSocket listener: {e}")
                 await asyncio.sleep(self.reconnect_delay)
