@@ -25,7 +25,7 @@ class HyperliquidWebSocket:
         """Establish WebSocket connection"""
         try:
             logger.info(f"Connecting to Hyperliquid WebSocket: {self.ws_url}")
-            self.ws = await websockets.connect(self.ws_url)
+            self.ws = await asyncio.wait_for(websockets.connect(self.ws_url), timeout=30)
             self.is_running = True
             logger.info("WebSocket connected successfully")
             
@@ -223,41 +223,28 @@ class HyperliquidWebSocket:
                 timestamp=datetime.utcnow()
             )
             
-            # Call appropriate callback
+            # Exact-match dispatch only — substring matching caused cross-wallet callback leaks
             callback_found = False
-            for callback_channel, callback in self.callbacks.items():
-                logger.info(f"🔍 Checking callback: {callback_channel} vs {channel}")
-                
-                # Match logic:
-                # 1. Exact match: channel == callback_channel
-                # 2. Callback is substring of channel: callback_channel in channel
-                # 3. Channel is substring of callback: channel in callback_channel (for "user" matching "user:0x...")
-                # 4. Both start with same prefix before colon (for user:address matching user channel)
-                should_call = False
-                if channel == callback_channel:
-                    should_call = True
-                elif callback_channel in channel:
-                    should_call = True
-                elif channel in callback_channel:
-                    should_call = True
-                elif ":" in callback_channel:
-                    # Check if channel matches the prefix (e.g., "user" matches "user:0x...")
-                    prefix = callback_channel.split(":")[0]
-                    if channel == prefix:
-                        should_call = True
-                
-                if should_call:
-                    callback_found = True
-                    logger.info(f"✅ Calling callback for {callback_channel}")
-                    try:
-                        if asyncio.iscoroutinefunction(callback):
-                            await callback(update)
-                        else:
-                            callback(update)
-                    except Exception as e:
-                        logger.error(f"Error in callback for {callback_channel}: {e}")
-                        import traceback
-                        logger.error(traceback.format_exc())
+            callback = self.callbacks.get(channel)
+            if callback is None:
+                # user:0x... subscriptions use "user" as the inbound channel type
+                for key, cb in self.callbacks.items():
+                    if ":" in key and key.split(":")[0] == channel:
+                        callback = cb
+                        break
+
+            if callback is not None:
+                callback_found = True
+                logger.info(f"✅ Calling callback for channel '{channel}'")
+                try:
+                    if asyncio.iscoroutinefunction(callback):
+                        await callback(update)
+                    else:
+                        callback(update)
+                except Exception as e:
+                    logger.error(f"Error in callback for channel '{channel}': {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
             
             if not callback_found:
                 # subscriptionResponse is just a confirmation, not an error

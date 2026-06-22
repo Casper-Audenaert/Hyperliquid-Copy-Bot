@@ -124,31 +124,33 @@ class PositionSizer:
         
         return your_size
     
+    # Per-asset max leverage limits on Hyperliquid (default 10x for unknowns)
+    _MAX_LEVERAGE: dict = {
+        'BTC': 50, 'ETH': 50,
+        'SOL': 20, 'MATIC': 20, 'ARB': 20, 'OP': 20, 'AVAX': 20, 'DOGE': 20,
+        'ATOM': 10, 'LTC': 10, 'BCH': 10, 'LINK': 10, 'UNI': 10, 'APE': 10,
+        'APT': 10, 'SUI': 10, 'TIA': 10, 'SEI': 10, 'WLD': 10, 'NEAR': 10,
+        'FET': 10, 'INJ': 10, 'STX': 10, 'PEPE': 10, 'BONK': 10, 'WIF': 10,
+        'HYPE': 10, 'ZEC': 10, 'TRUMP': 10, 'MELANIA': 10, 'PUMP': 10,
+    }
+
     def calculate_leverage(
         self,
         target_leverage: float,
         adjustment_ratio: float = 0.5,
         max_leverage: float = 10.0,
-        min_leverage: float = 1.0
-    ) -> float:
+        min_leverage: float = 1.0,
+        symbol: str = "",
+    ) -> int:
         """
-        Calculate adjusted leverage
-        
-        Args:
-            target_leverage: Target wallet's leverage
-            adjustment_ratio: Multiply target leverage by this (e.g., 0.5 = half)
-            max_leverage: Maximum allowed leverage
-            min_leverage: Minimum leverage
-            
-        Returns:
-            Adjusted leverage value
+        Return an integer leverage adjusted from the target's leverage.
+        Hyperliquid only accepts integer values; per-asset caps are enforced.
         """
+        asset_cap = self._MAX_LEVERAGE.get(symbol.upper(), int(max_leverage))
         adjusted = target_leverage * adjustment_ratio
-        adjusted = max(min_leverage, min(adjusted, max_leverage))
-        
-        logger.debug(f"Leverage adjustment: {target_leverage}x -> {adjusted}x (ratio: {adjustment_ratio})")
-        
-        return adjusted
+        result = max(int(min_leverage), min(round(adjusted), asset_cap))
+        logger.debug(f"Leverage: {target_leverage}x * {adjustment_ratio} -> {result}x (cap {asset_cap}x)")
+        return result
     
     def should_copy_position(
         self,

@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, date
 from loguru import logger
 from config.settings import settings
 from utils.logger import setup_logger
@@ -33,73 +33,18 @@ simulated_balance = 0.0
 simulated_positions = {}  # symbol -> {'size': float, 'entry_price': float, 'side': str}
 simulated_pnl = 0.0
 
+# Deduplication: track processed fill IDs to prevent double-copying the same fill
+_processed_fill_ids: set = set()
 
-def calculate_adjusted_leverage(target_leverage: float, adjustment_ratio: float, symbol: str) -> int:
-    """
-    Calculate adjusted leverage with proper rounding and max leverage limits.
-    
-    Hyperliquid only supports integer leverage (1x, 2x, 3x, etc.)
-    Each asset has different max leverage limits.
-    
-    Args:
-        target_leverage: Target wallet's leverage
-        adjustment_ratio: Multiplier (e.g., 0.5 = use 50% of target's leverage)
-        symbol: Trading symbol (for max leverage lookup)
-    
-    Returns:
-        Integer leverage between 1 and the asset's max leverage
-    """
-    # Asset-specific max leverage limits on Hyperliquid
-    MAX_LEVERAGE_LIMITS = {
-        'BTC': 50,
-        'ETH': 50,
-        'SOL': 20,
-        'MATIC': 20,
-        'ARB': 20,
-        'OP': 20,
-        'AVAX': 20,
-        'DOGE': 20,
-        'ATOM': 10,
-        'LTC': 10,
-        'BCH': 10,
-        'LINK': 10,
-        'UNI': 10,
-        'APE': 10,
-        'APT': 10,
-        'SUI': 10,
-        'TIA': 10,
-        'SEI': 10,
-        'WLD': 10,
-        'NEAR': 10,
-        'FET': 10,
-        'INJ': 10,
-        'STX': 10,
-        'PEPE': 10,
-        'BONK': 10,
-        'WIF': 10,
-        'HYPE': 10,
-        'ZEC': 10,
-        'TRUMP': 10,
-        'MELANIA': 10,
-        'PUMP': 10,
-    }
-    
-    # Get max leverage for this asset (default to 10x if unknown)
-    max_leverage = MAX_LEVERAGE_LIMITS.get(symbol.upper(), 10)
-    
-    # Calculate desired leverage
-    desired_leverage = target_leverage * adjustment_ratio
-    
-    # Round to nearest integer
-    rounded_leverage = round(desired_leverage)
-    
-    # Ensure minimum of 1x
-    rounded_leverage = max(1, rounded_leverage)
-    
-    # Cap at asset's max leverage
-    final_leverage = min(rounded_leverage, max_leverage)
-    
-    return final_leverage
+# Lock for all shared mutable state (simulated_balance, simulated_positions, trades_copied_count)
+# ponytail: single lock keeps it simple; per-symbol locks only if contention becomes measurable
+_state_lock: asyncio.Lock = None  # initialised in main() after event loop exists
+
+# Daily loss tracking (resets at midnight)
+_daily_loss_usd: float = 0.0
+_daily_loss_date: date = None
+
+
 
 
 async def on_new_position(position_data: dict):
@@ -113,7 +58,14 @@ async def on_new_position(position_data: dict):
     if is_paused:
         logger.warning("⏸️ Bot is paused - skipping trade")
         return
-    
+
+    symbol = position_data.get("coin", "")
+
+    # Blocked assets check — centralised guard for on_new_position path
+    if symbol.upper() in settings.copy_rules.blocked_assets:
+        logger.warning(f"⛔ BLOCKED ASSET - Ignoring new position for {symbol}")
+        return
+
     # Check max open trades limit
     if settings.copy_rules.max_open_trades is not None:
         current_trades = len(monitor.current_state.positions) if monitor.current_state else 0
@@ -185,12 +137,13 @@ async def on_new_position(position_data: dict):
         else:
             your_size = settings.sizing.fixed_size / entry_price if entry_price > 0 else 0
         
-        # Calculate adjusted leverage
+        # Calculate adjusted leverage (integer, per-asset cap enforced)
         your_leverage = position_sizer.calculate_leverage(
             target_leverage,
             settings.leverage.adjustment_ratio,
             settings.leverage.max_leverage,
-            settings.leverage.min_leverage
+            settings.leverage.min_leverage,
+            symbol=symbol,
         )
         
         # Check minimum position size (Hyperliquid requirement)
@@ -250,34 +203,33 @@ async def on_new_position(position_data: dict):
 
 async def on_position_close(position_data: dict):
     """Called when target wallet closes a position"""
-    global simulated_balance, simulated_positions, simulated_pnl
-    
+    global simulated_balance, simulated_positions, simulated_pnl, is_paused
+
     symbol = position_data.get("coin", "")
     logger.info(f"🔴 Target closed position: {symbol}")
-    
+
     # Close simulated position and calculate PnL
     if settings.simulated_trading and symbol in simulated_positions:
         pos = simulated_positions[symbol]
-        # Get current price from monitor
         current_price = 0
         if monitor.current_state:
             for p in monitor.current_state.positions:
                 if p.symbol == symbol:
                     current_price = p.current_price
                     break
-        
+
         if current_price > 0:
-            # Calculate PnL
             if pos['side'] == 'LONG':
                 pnl = pos['size'] * (current_price - pos['entry_price'])
             else:
                 pnl = abs(pos['size']) * (pos['entry_price'] - current_price)
-            
-            # Return margin to balance
-            margin_used = pos['value'] / pos['leverage']
-            simulated_balance += margin_used + pnl
-            simulated_pnl += pnl
-            
+
+            async with _state_lock:
+                margin_used = pos['value'] / pos['leverage']
+                simulated_balance += margin_used + pnl
+                simulated_pnl += pnl
+                del simulated_positions[symbol]
+
             logger.success("")
             logger.success(f"💰 SIMULATED POSITION CLOSED!")
             logger.success(f"   Entry: ${pos['entry_price']:,.2f}")
@@ -285,8 +237,18 @@ async def on_position_close(position_data: dict):
             logger.success(f"   PnL: ${pnl:,.2f} ({(pnl/pos['value']*100):+.2f}%)")
             logger.success(f"   New Balance: ${simulated_balance:,.2f}")
             logger.success(f"   Total PnL: ${simulated_pnl:,.2f}")
-            
-            del simulated_positions[symbol]
+
+            # Enforce daily loss limit after each closed trade
+            if pnl < 0 and _record_loss(abs(pnl)):
+                is_paused = True
+                logger.error(
+                    f"🛑 Daily loss limit ${settings.risk_management.max_daily_loss_usd:.2f} reached "
+                    f"(today: ${_daily_loss_usd:.2f}). Bot paused automatically."
+                )
+                if notifier:
+                    await notifier.send_error_notification(
+                        f"Daily loss limit reached (${_daily_loss_usd:.2f}). Bot paused."
+                    )
     
     # Close your corresponding position
     logger.info("   -> Closing your position...")
@@ -401,12 +363,24 @@ async def on_order_fill(fill_data: dict):
     Copy the filled order
     """
     global trades_copied_count, is_paused, simulated_balance, simulated_positions, simulated_pnl
-    
+
     # Check if paused
     if is_paused:
         logger.warning("⏸️ Bot is paused - skipping fill copy")
         return
-    
+
+    # Deduplication: on_new_position and on_order_fill can both fire for the same event.
+    # Key on tid (Hyperliquid trade ID) if available, else composite key.
+    fill_id = fill_data.get("tid") or (
+        fill_data.get("coin", ""),
+        fill_data.get("px", ""),
+        fill_data.get("sz", ""),
+        fill_data.get("dir", ""),
+    )
+    if fill_id in _processed_fill_ids:
+        logger.debug(f"⏭️ Skipping duplicate fill: {fill_id}")
+        return
+
     try:
         symbol = fill_data.get('coin', '')
         side_str = fill_data.get('side', '')  # 'B' for buy, 'S' for sell
@@ -527,11 +501,13 @@ async def on_order_fill(fill_data: dict):
         # Get target leverage
         target_leverage = target_position.leverage if target_position else 1.0
         
-        # Adjust leverage with proper rounding and max limits
-        our_leverage = calculate_adjusted_leverage(
-            target_leverage=target_leverage,
-            adjustment_ratio=settings.leverage.adjustment_ratio,
-            symbol=symbol
+        # Adjust leverage (integer, per-asset cap enforced)
+        our_leverage = position_sizer.calculate_leverage(
+            target_leverage,
+            settings.leverage.adjustment_ratio,
+            settings.leverage.max_leverage,
+            settings.leverage.min_leverage,
+            symbol=symbol,
         )
         
         logger.info(f"   Target Leverage: {target_leverage}x")
@@ -566,49 +542,52 @@ async def on_order_fill(fill_data: dict):
         
         if result:
             logger.success(f"✅ Fill copied successfully!")
-            trades_copied_count += 1
+            _processed_fill_ids.add(fill_id)
 
-            # Update simulated position and balance
-            if settings.simulated_trading:
-                position_value = our_size * price
-                margin_required = position_value / our_leverage
+            async with _state_lock:
+                trades_copied_count += 1
 
-                if symbol not in simulated_positions:
-                    simulated_positions[symbol] = {
-                        'size': 0,
-                        'entry_price': 0,
-                        'leverage': our_leverage,
-                        'side': position_side.value,
-                        'value': 0.0,
-                        'margin_used': 0.0,
-                    }
+                # Update simulated position and balance
+                if settings.simulated_trading:
+                    position_value = our_size * price
+                    margin_required = position_value / our_leverage
 
-                pos = simulated_positions[symbol]
+                    if symbol not in simulated_positions:
+                        simulated_positions[symbol] = {
+                            'size': 0,
+                            'entry_price': 0,
+                            'leverage': our_leverage,
+                            'side': position_side.value,
+                            'value': 0.0,
+                            'margin_used': 0.0,
+                        }
 
-                if "Open" in direction:
-                    total_value = (abs(pos['size']) * pos['entry_price']) + position_value
-                    new_size = abs(pos['size']) + our_size
-                    pos['entry_price'] = total_value / new_size if new_size > 0 else price
-                    pos['size'] = new_size if position_side == PositionSide.LONG else -new_size
-                    pos['side'] = position_side.value
-                    pos['value'] = pos.get('value', 0.0) + position_value
-                    pos['margin_used'] = pos.get('margin_used', 0.0) + margin_required
-                    simulated_balance -= margin_required
+                    pos = simulated_positions[symbol]
 
-                upnl = _upnl_from_state()
-                equity = simulated_balance + upnl
-                total_margin = sum(p.get('margin_used', 0) for p in simulated_positions.values())
+                    if "Open" in direction:
+                        total_value = (abs(pos['size']) * pos['entry_price']) + position_value
+                        new_size = abs(pos['size']) + our_size
+                        pos['entry_price'] = total_value / new_size if new_size > 0 else price
+                        pos['size'] = new_size if position_side == PositionSide.LONG else -new_size
+                        pos['side'] = position_side.value
+                        pos['value'] = pos.get('value', 0.0) + position_value
+                        pos['margin_used'] = pos.get('margin_used', 0.0) + margin_required
+                        simulated_balance -= margin_required
 
-                logger.success("")
-                logger.success(f"   📍 {symbol} {position_side.value.upper()} @ ${price:,.4f}  size={our_size:.4f}  {our_leverage}x")
-                if symbol in simulated_positions:
-                    logger.success(f"   Entry Avg:    ${simulated_positions[symbol]['entry_price']:,.4f}")
-                logger.success(f"   💰 Balance:   ${simulated_balance:,.2f}")
-                logger.success(f"   📈 UPNL:      ${upnl:+,.2f}")
-                logger.success(f"   💎 Equity:    ${equity:,.2f}")
-                logger.success(f"   🔒 Margin:    ${total_margin:,.2f}  ({len(simulated_positions)} positions)")
-            else:
-                logger.success(f"   💰 Balance: live mode")
+                    upnl = _upnl_from_state()
+                    equity = simulated_balance + upnl
+                    total_margin = sum(p.get('margin_used', 0) for p in simulated_positions.values())
+
+                    logger.success("")
+                    logger.success(f"   📍 {symbol} {position_side.value.upper()} @ ${price:,.4f}  size={our_size:.4f}  {our_leverage}x")
+                    if symbol in simulated_positions:
+                        logger.success(f"   Entry Avg:    ${simulated_positions[symbol]['entry_price']:,.4f}")
+                    logger.success(f"   💰 Balance:   ${simulated_balance:,.2f}")
+                    logger.success(f"   📈 UPNL:      ${upnl:+,.2f}")
+                    logger.success(f"   💎 Equity:    ${equity:,.2f}")
+                    logger.success(f"   🔒 Margin:    ${total_margin:,.2f}  ({len(simulated_positions)} positions)")
+                else:
+                    logger.success(f"   💰 Balance: live mode")
             
             # Send notification
             if notifier:
@@ -798,6 +777,22 @@ async def handle_stop(close_positions: bool = False):
     sys.exit(0)
 
 
+def _record_loss(loss_usd: float) -> bool:
+    """
+    Record a realized loss and return True if the daily loss limit is now breached.
+    Resets the counter at midnight automatically.
+    """
+    global _daily_loss_usd, _daily_loss_date
+    today = date.today()
+    if _daily_loss_date != today:
+        _daily_loss_usd = 0.0
+        _daily_loss_date = today
+    if loss_usd > 0:
+        _daily_loss_usd += loss_usd
+    limit = settings.risk_management.max_daily_loss_usd
+    return limit > 0 and _daily_loss_usd >= limit
+
+
 def _upnl_from_state() -> float:
     """Sync UPNL estimate using last-known prices from the monitor state."""
     if not simulated_positions or not monitor or not monitor.current_state:
@@ -880,11 +875,12 @@ async def main():
     Main entry point for the copy trading bot
     """
     global monitor, executor, position_sizer, client, telegram_bot, notifier, bot_start_time
-    global simulated_balance, trades_copied_count
-    
+    global simulated_balance, trades_copied_count, _state_lock
+
     bot_start_time = datetime.now()
     trades_copied_count = 0
-    
+    _state_lock = asyncio.Lock()
+
     # Initialize simulated account
     simulated_balance = settings.simulated_account_balance
     
@@ -975,11 +971,8 @@ async def main():
                 target_position_value = abs(pos.size) * pos.entry_price
                 your_position_value = target_position_value * auto_ratio
                 your_size = your_position_value / pos.entry_price if pos.entry_price > 0 else 0
-                your_leverage = calculate_adjusted_leverage(
-                    target_leverage=pos.leverage,
-                    adjustment_ratio=settings.leverage.adjustment_ratio,
-                    symbol=pos.symbol
-                )
+                your_leverage = PositionSizer._MAX_LEVERAGE.get(pos.symbol.upper(), int(settings.leverage.max_leverage))
+                your_leverage = max(1, min(round(pos.leverage * settings.leverage.adjustment_ratio), your_leverage))
                 margin_needed = your_position_value / your_leverage
                 total_simulated_margin += margin_needed
                 
@@ -1033,13 +1026,15 @@ async def main():
                 target_position_value = abs(pos.size) * pos.entry_price
                 your_position_value = target_position_value * auto_ratio
                 your_size = your_position_value / pos.entry_price if pos.entry_price > 0 else 0
-                your_leverage = calculate_adjusted_leverage(
-                    target_leverage=pos.leverage,
-                    adjustment_ratio=settings.leverage.adjustment_ratio,
-                    symbol=pos.symbol
+                your_leverage = position_sizer.calculate_leverage(
+                    pos.leverage,
+                    settings.leverage.adjustment_ratio,
+                    settings.leverage.max_leverage,
+                    settings.leverage.min_leverage,
+                    symbol=pos.symbol,
                 )
                 margin_needed = your_position_value / your_leverage
-                
+
                 # Check minimum position size
                 if your_position_value < MIN_POSITION_SIZE_USD:
                     logger.warning("")
@@ -1248,7 +1243,6 @@ async def main():
         logger.info("")
         logger.info("⚠️ Shutdown signal received...")
     except Exception as e:
-        logger.error
         logger.error(f"❌ Error: {e}")
         raise
     finally:

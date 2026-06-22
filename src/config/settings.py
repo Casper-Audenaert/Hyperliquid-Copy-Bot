@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from typing import Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -50,14 +50,27 @@ class RiskManagementConfig(BaseModel):
     enable_custom_stops: bool = False
     stop_loss_pct: float = 5.0
 
+def _validate_eth_address(v: Optional[str], field_name: str) -> Optional[str]:
+    """Validate Ethereum address format."""
+    if not v:
+        return v
+    if not (len(v) == 42 and v.startswith("0x") and all(c in "0123456789abcdefABCDEF" for c in v[2:])):
+        raise ValueError(f"{field_name} must be a valid 0x Ethereum address (42 chars), got: {v!r}")
+    return v.lower()
+
+
 class Settings(BaseModel):
     # Target address to copy (wallet or vault - the bot treats them the same)
-    target_wallet: str = "0x0ba5de43fa2419a25c2e680f84aff3a8f57fce22"
-    
+    # Must be set via TARGET_WALLET_ADDRESS env var — no default to prevent accidental live trading
+    target_wallet: str = ""
+    # Multi-wallet support (web dashboard): comma-separated addresses via TARGET_WALLETS env var
+    target_wallets: list[str] = []
+    wallet_labels: list[str] = []
+
     # Trading mode
     simulated_trading: bool = True
     simulated_account_balance: float = 1000.0
-    
+
     # Configuration sections
     hyperliquid: HyperliquidConfig = Field(default_factory=HyperliquidConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
@@ -65,15 +78,34 @@ class Settings(BaseModel):
     leverage: LeverageConfig = Field(default_factory=LeverageConfig)
     copy_rules: CopyRulesConfig = Field(default_factory=CopyRulesConfig)
     risk_management: RiskManagementConfig = Field(default_factory=RiskManagementConfig)
-    
+
     # Paths
     log_level: str = "INFO"
     log_file: str = "./logs/trading.log"
     database_url: str = "sqlite:///./data/trading.db"
-    
+
     class Config:
         env_file = '.env'
         env_file_encoding = 'utf-8'
+
+    @field_validator("simulated_account_balance", mode="before")
+    @classmethod
+    def validate_balance(cls, v: float) -> float:
+        if float(v) <= 0:
+            raise ValueError("simulated_account_balance must be positive")
+        return v
+
+    @model_validator(mode="after")
+    def validate_addresses(self) -> "Settings":
+        _validate_eth_address(self.target_wallet, "target_wallet")
+        _validate_eth_address(self.hyperliquid.wallet_address, "wallet_address")
+        if (
+            self.target_wallet
+            and self.hyperliquid.wallet_address
+            and self.target_wallet.lower() == self.hyperliquid.wallet_address.lower()
+        ):
+            raise ValueError("target_wallet and wallet_address must be different accounts")
+        return self
 
     @classmethod
     def load(cls) -> 'Settings':
@@ -86,7 +118,23 @@ class Settings(BaseModel):
         settings.hyperliquid.private_key = os.getenv('HYPERLIQUID_PRIVATE_KEY')
         
         settings.target_wallet = os.getenv('TARGET_WALLET_ADDRESS', settings.target_wallet)
-        
+
+        # Multi-wallet support (web dashboard)
+        wallets_env = os.getenv('TARGET_WALLETS', '')
+        settings.target_wallets = [w.strip() for w in wallets_env.split(',') if w.strip()]
+        if not settings.target_wallets and settings.target_wallet:
+            settings.target_wallets = [settings.target_wallet]
+        labels_env = os.getenv('WALLET_LABELS', '')
+        settings.wallet_labels = [l.strip() for l in labels_env.split(',') if l.strip()]
+
+        if not settings.target_wallet and not settings.target_wallets:
+            raise EnvironmentError(
+                "TARGET_WALLET_ADDRESS (or TARGET_WALLETS) is required. Set it in .env or as an environment variable."
+            )
+        # Ensure target_wallet is set for CLI compatibility
+        if not settings.target_wallet and settings.target_wallets:
+            settings.target_wallet = settings.target_wallets[0]
+
         # Trading mode
         sim_trading = os.getenv('SIMULATED_TRADING', 'true').lower()
         settings.simulated_trading = sim_trading in ('true', '1', 'yes')

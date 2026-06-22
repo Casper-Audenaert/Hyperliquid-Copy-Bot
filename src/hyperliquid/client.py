@@ -1,3 +1,5 @@
+import asyncio
+import random
 import aiohttp
 import json
 from typing import Optional, List, Dict, Any
@@ -25,18 +27,25 @@ class HyperliquidClient:
         if self.session:
             await self.session.close()
     
-    async def _post(self, url: str, data: dict) -> dict:
-        """Make POST request to API"""
+    async def _post(self, url: str, data: dict, _retries: int = 3) -> dict:
+        """Make POST request with exponential backoff retry."""
         if not self.session:
             self.session = aiohttp.ClientSession()
-            
-        try:
-            async with self.session.post(url, json=data) as response:
-                response.raise_for_status()
-                return await response.json()
-        except aiohttp.ClientError as e:
-            logger.error(f"API request failed: {e}")
-            raise
+
+        last_exc: Exception = RuntimeError("no attempts made")
+        for attempt in range(1, _retries + 1):
+            try:
+                async with self.session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                    response.raise_for_status()
+                    return await response.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                last_exc = e
+                if attempt < _retries:
+                    delay = (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning(f"API request failed (attempt {attempt}/{_retries}), retrying in {delay:.1f}s: {e}")
+                    await asyncio.sleep(delay)
+        logger.error(f"API request failed after {_retries} attempts: {last_exc}")
+        raise last_exc
     
     async def get_user_state(self, address: str) -> Optional[UserState]:
         """
