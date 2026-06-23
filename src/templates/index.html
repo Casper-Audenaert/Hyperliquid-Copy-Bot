@@ -411,6 +411,23 @@ header{
 .mf textarea{resize:vertical;min-height:72px;line-height:1.5}
 .mhint{font-size:10px;color:var(--t3);margin-top:5px;line-height:1.4}
 .mfoot{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+/* ── Compare modal ── */
+.cmp-modal-dlg{
+  width:95vw;max-height:90vh;
+  background:var(--s1);border:1px solid var(--hr);border-radius:var(--r2);
+  padding:0;color:var(--t1);overflow:hidden;display:flex;flex-direction:column
+}
+.cmp-modal-dlg::backdrop{background:rgba(0,0,0,.65)}
+.cmp-modal-hdr{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:12px 16px;border-bottom:1px solid var(--hr);flex-shrink:0
+}
+.cmp-modal-close{
+  background:none;border:none;color:var(--t2);cursor:pointer;
+  font-size:16px;line-height:1;padding:2px 8px;border-radius:4px
+}
+.cmp-modal-close:hover{color:var(--t1);background:var(--s2)}
+.cmp-modal-body{flex:1;overflow:auto;padding:16px}
 </style>
 </head>
 <body>
@@ -560,6 +577,15 @@ header{
     </div>
   </div>
 </div>
+
+<!-- Compare modal (Stats + Correlation tabs) -->
+<dialog id="cmp-modal" class="cmp-modal-dlg">
+  <div class="cmp-modal-hdr">
+    <span id="cmp-modal-title" class="ptitle"></span>
+    <button class="cmp-modal-close" onclick="closeCmpModal()">✕</button>
+  </div>
+  <div id="cmp-modal-body" class="cmp-modal-body"></div>
+</dialog>
 
 <!-- Toast -->
 <div class="toast" id="toast">

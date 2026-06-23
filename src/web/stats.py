@@ -75,7 +75,21 @@ def _risk_stats(equity_rows: list) -> dict:
 
     vals = [v for _, v in sorted(daily.items())]
     if len(vals) < 2:
-        return dict(sharpe=None, volatility=None)
+        # Fallback: use raw snapshot-to-snapshot returns when < 2 calendar days
+        raw = [r.equity for r in equity_rows]
+        if len(raw) < 6:
+            return dict(sharpe=None, volatility=None)
+        rets = [(raw[i] - raw[i-1]) / raw[i-1]
+                for i in range(1, len(raw)) if raw[i-1] > 0]
+        if not rets:
+            return dict(sharpe=None, volatility=None)
+        mean_r = statistics.mean(rets)
+        std_r  = statistics.stdev(rets) if len(rets) > 1 else 0
+        ann    = (365 * 24 * 120) ** 0.5  # 30-sec periods/year
+        return dict(
+            sharpe     = round(mean_r / std_r * ann, 2) if std_r > 0 else None,
+            volatility = round(std_r * ann * 100, 2),
+        )
 
     rets = [(vals[i] - vals[i-1]) / vals[i-1]
             for i in range(1, len(vals)) if vals[i-1] > 0]

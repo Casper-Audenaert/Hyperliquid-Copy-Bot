@@ -703,9 +703,7 @@ function renderComparePanel() {
   if (!compareMode) return;
   renderCmpTabs();
   document.getElementById('stats-title').textContent = 'Compare';
-  if      (cmpTab === 'leaderboard') renderLeaderboard();
-  else if (cmpTab === 'stats')       renderStatsTable();
-  else if (cmpTab === 'correlation') renderCorrelation();
+  openCmpModal(cmpTab);
 }
 
 function renderCmpTabs() {
@@ -713,7 +711,31 @@ function renderCmpTabs() {
     b.classList.toggle('on', b.dataset.tab === cmpTab));
 }
 
-function setCmpTab(tab) { cmpTab = tab; renderComparePanel(); }
+function setCmpTab(tab) {
+  cmpTab = tab;
+  renderCmpTabs();
+  openCmpModal(tab);
+}
+
+function openCmpModal(tab) {
+  const modal = document.getElementById('cmp-modal');
+  const body  = document.getElementById('cmp-modal-body');
+  const titles = { leaderboard: 'Leaderboard', stats: 'Side-by-Side Stats', correlation: 'Return Correlation Matrix' };
+  document.getElementById('cmp-modal-title').textContent = titles[tab] || 'Compare';
+  if (tab === 'leaderboard')      renderLeaderboardInto(body);
+  else if (tab === 'stats')       renderStatsTableInto(body);
+  else if (tab === 'correlation') renderCorrelationInto(body);
+  modal.showModal();
+  modal.onclick = e => { if (e.target === modal) closeCmpModal(); };
+}
+
+function closeCmpModal() {
+  document.getElementById('cmp-modal').close();
+  cmpTab = 'leaderboard';
+  renderCmpTabs();
+  document.getElementById('stats-content').innerHTML =
+    '<div class="no-stats">Click a tab above to open Compare view</div>';
+}
 
 // -- Sortable leaderboard --
 function colVal(addr, col) {
@@ -728,10 +750,15 @@ function colVal(addr, col) {
 
 function setSort(col) {
   if (sortCol === col) sortDir *= -1; else { sortCol = col; sortDir = -1; }
-  renderLeaderboard();
+  const modalBody = document.getElementById('cmp-modal-body');
+  if (modalBody && document.getElementById('cmp-modal').open) {
+    renderLeaderboardInto(modalBody);
+  } else {
+    renderLeaderboard();
+  }
 }
 
-function renderLeaderboard() {
+function renderLeaderboardInto(el) {
   const addrs  = Object.keys(state);
   const sorted = [...addrs].sort((a, b) => {
     const va = colVal(a, sortCol) ?? -Infinity;
@@ -749,8 +776,8 @@ function renderLeaderboard() {
   ];
   const arrow = col => col === sortCol ? (sortDir < 0 ? ' ▼' : ' ▲') : '';
 
-  const el = document.getElementById('stats-content');
   el.innerHTML = `
+  <div style="overflow-x:auto">
   <table class="cmp-lb-tbl">
     <thead><tr>
       <th class="lb-name-col">Wallet</th>
@@ -779,11 +806,13 @@ function renderLeaderboard() {
         </tr>`;
       }).join('')}
     </tbody>
-  </table>`;
+  </table>
+  </div>`;
 }
+function renderLeaderboard() { renderLeaderboardInto(document.getElementById('stats-content')); }
 
 // -- Side-by-side stats table --
-function renderStatsTable() {
+function renderStatsTableInto(el) {
   const addrs = [...compareSelection].filter(a => state[a]);
   if (!addrs.length) return;
   const metrics = [
@@ -799,8 +828,8 @@ function renderStatsTable() {
     { key: 'total_trades',       label: 'Total Trades',   fmt: v => v ?? '—',                       best: 'max', col: () => null },
   ];
 
-  const el = document.getElementById('stats-content');
   el.innerHTML = `
+  <div style="overflow-x:auto">
   <table class="cmp-stats-tbl">
     <thead><tr>
       <th>Metric</th>
@@ -821,15 +850,16 @@ function renderStatsTable() {
         </tr>`;
       }).join('')}
     </tbody>
-  </table>`;
+  </table>
+  </div>`;
 }
+function renderStatsTable() { renderStatsTableInto(document.getElementById('stats-content')); }
 
 // -- Correlation heatmap --
-function renderCorrelation() {
+function renderCorrelationInto(el) {
   const addrs = [...compareSelection].filter(a => state[a] && (state[a]._history || []).length > 1);
   if (addrs.length < 2) {
-    document.getElementById('stats-content').innerHTML =
-      '<div class="no-stats">Need at least 2 wallets with history for correlation.</div>';
+    el.innerHTML = '<div class="no-stats">Need at least 2 wallets with history for correlation.</div>';
     return;
   }
 
@@ -843,11 +873,9 @@ function renderCorrelation() {
     Array.from({length: n}, (_, j) => i === j ? 1 : pearson(returns[i], returns[j]))
   );
 
-  const size = Math.max(36, Math.floor(280 / n));
-  const el = document.getElementById('stats-content');
+  const size = Math.max(36, Math.floor(Math.min(el.clientWidth || 800, 1200) / (n + 1)));
   el.innerHTML = `
-  <div style="padding:12px 14px">
-    <div class="stat-section-title" style="margin-bottom:10px">Return Correlation Matrix</div>
+  <div style="padding:4px 0">
     <div class="corr-wrap" style="overflow-x:auto">
       <table class="corr-tbl" style="border-collapse:separate;border-spacing:2px">
         <thead><tr>
@@ -869,6 +897,7 @@ function renderCorrelation() {
     <div style="margin-top:10px;font-size:10px;color:var(--t3)">Green = moves together · Red = moves opposite · Based on equity return series</div>
   </div>`;
 }
+function renderCorrelation() { renderCorrelationInto(document.getElementById('stats-content')); }
 
 function renderPnlChart(data) {
   const ctx = document.getElementById('pnl-chart');
