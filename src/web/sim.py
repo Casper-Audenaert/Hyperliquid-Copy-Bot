@@ -180,7 +180,7 @@ async def _fetch_target_fills(session: WalletSession, limit: int = 50) -> list:
                             "notional":     round(our_sz * px, 2),
                             "leverage":     None,
                             "timestamp":    datetime.utcfromtimestamp(f.get("time", 0) / 1000).isoformat(),
-                            "realized_pnl": round(raw_pnl * session.copy_ratio, 4) if raw_pnl else None,
+                            "realized_pnl": (round(raw_pnl * session.copy_ratio, 6) or None) if raw_pnl else None,
                             "fill_id":      str(f.get("tid", "")),
                             "wallet_label": session.label,
                         })
@@ -376,6 +376,7 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
                                 session.losses += 1
                             del session.simulated_positions[symbol]
                             db_record_close(session.address, symbol, opnl)
+                            pnl_realized = opnl  # flip close realizes PnL
 
                     # Open / add to position
                     position_value = our_size * price
@@ -519,8 +520,10 @@ def _create_session(address: str, label: str, start_balance: float = None) -> "W
     return session
 
 
-async def start_session(session: WalletSession, emit_fn: Callable):
+async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: float = 0):
     """Initialise and start monitoring a wallet. Runs inside the background asyncio loop."""
+    if offset_secs:
+        await asyncio.sleep(offset_secs)
     session._state_lock = asyncio.Lock()
 
     logger.info(f"[{session.label}] Fetching initial state for {session.address[:10]}…")

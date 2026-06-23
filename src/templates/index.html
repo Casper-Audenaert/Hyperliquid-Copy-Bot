@@ -300,16 +300,54 @@ header{
 .wlbl{font-size:9px;color:var(--t3)}
 .dim{color:var(--t2)}
 
-/* Compare leaderboard */
-.leaderboard{display:flex;flex-direction:column;flex:1;padding:2px 0}
-.lb-row{display:flex;align-items:center;gap:10px;padding:9px 14px;border-bottom:1px solid var(--hr)}
-.lb-row:last-child{border-bottom:none}
-.lb-rank{font-size:11px;font-weight:700;font-family:var(--mono);color:var(--t3);width:18px}
-.lb-swatch{width:8px;height:8px;border-radius:50%;flex-shrink:0}
-.lb-name{flex:1;font-weight:600;font-size:12px}
-.lb-eq{font-family:var(--mono);font-size:12px;font-weight:600}
-.lb-ret{font-family:var(--mono);font-size:11px;width:72px;text-align:right}
-.lb-wr{font-family:var(--mono);font-size:10px;color:var(--t2);width:50px;text-align:right}
+/* Compare wallet card states */
+.wcard.cmp-on { border-color: var(--brand-b); background: var(--brand-a); }
+.wcard.cmp-off { opacity: 0.38; }
+
+/* Compare panel tabs */
+#cmp-tabs{display:none;gap:2px;padding:8px 10px 0;flex-shrink:0}
+.cmp-tab{
+  padding:4px 10px;border-radius:5px;font-size:10px;font-weight:700;cursor:pointer;
+  color:var(--t3);border:1px solid var(--hr);background:var(--s2);
+  font-family:var(--font);transition:all .12s
+}
+.cmp-tab:hover{color:var(--t2)}
+.cmp-tab.on{background:var(--brand-a);color:var(--brand);border-color:var(--brand-b)}
+
+/* Sortable leaderboard table */
+.cmp-lb-tbl{width:100%;border-collapse:collapse;font-size:11px;white-space:nowrap}
+.cmp-lb-tbl th{
+  position:sticky;top:0;background:var(--s1);padding:6px 8px;
+  font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;
+  color:var(--t3);border-bottom:1px solid var(--hr);text-align:right
+}
+.cmp-lb-tbl th.lb-name-col{text-align:left}
+.cmp-lb-tbl th.sortable{cursor:pointer;user-select:none}
+.cmp-lb-tbl th.sortable:hover{color:var(--t1)}
+.cmp-lb-tbl td{padding:7px 8px;border-bottom:1px solid rgba(255,255,255,0.03);text-align:right}
+.cmp-lb-tbl td:first-child{text-align:left}
+.cmp-lb-tbl tr:last-child td{border-bottom:none}
+.cmp-lb-tbl tr:hover td{background:var(--s2)}
+.lb-swatch{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;flex-shrink:0;vertical-align:middle}
+.lb-nm{font-weight:600;font-size:12px;vertical-align:middle}
+
+/* Side-by-side stats table */
+.cmp-stats-tbl{width:100%;border-collapse:collapse;font-size:11px}
+.cmp-stats-tbl th{
+  position:sticky;top:0;background:var(--s1);
+  padding:6px 8px;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;
+  color:var(--t3);border-bottom:1px solid var(--hr);text-align:right
+}
+.cmp-stats-tbl th:first-child{text-align:left}
+.cmp-stats-tbl td{padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.03);text-align:right}
+.cmp-stats-tbl td:first-child{text-align:left}
+.cmp-stats-tbl tr:hover td{background:var(--s2)}
+.metric-lbl{font-size:11px;color:var(--t2)}
+.best-cell{background:rgba(124,108,255,0.12);border-radius:3px}
+
+/* Portfolio combined btn */
+#combined-btn{display:none}
+#combined-btn.on{background:var(--s3);color:var(--t1)}
 
 /* ── Toast notification ── */
 .toast{
@@ -325,6 +363,26 @@ header{
 .toast-icon{font-size:15px}
 .toast-msg{color:var(--t1)}
 .toast-sub{font-size:11px;color:var(--t2);margin-top:2px}
+
+/* ── Sub-chart sections (stacked below equity chart) ── */
+.sub-chart-section{
+  border-top:1px solid var(--hr);padding:5px 14px 8px;flex-shrink:0;display:none
+}
+.sub-chart-section.visible{display:block}
+.sub-chart-hdr{
+  font-size:9px;font-weight:700;text-transform:uppercase;
+  letter-spacing:.9px;color:var(--t3);padding-bottom:4px
+}
+.sub-chart-wrap{height:60px;position:relative}
+
+/* Score pill on wallet cards */
+.score-pill{
+  font-size:9px;font-weight:700;font-family:var(--mono);
+  padding:1px 6px;border-radius:10px;flex-shrink:0;margin-left:auto
+}
+.score-pill.good{background:var(--green-a);color:var(--green);border:1px solid var(--green-b)}
+.score-pill.ok  {background:var(--brand-a);color:var(--brand);border:1px solid var(--brand-b)}
+.score-pill.bad {background:var(--red-a);color:var(--red);border:1px solid var(--red-b)}
 
 /* ── Modal ── */
 .mbg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.72);backdrop-filter:blur(8px);
@@ -344,12 +402,14 @@ header{
 .mf{margin-bottom:12px}
 .mf label{display:block;font-size:10px;font-weight:700;text-transform:uppercase;
   letter-spacing:.6px;color:var(--t2);margin-bottom:6px}
-.mf input{
+.mf input,.mf textarea{
   width:100%;padding:9px 11px;background:var(--bg);border:1px solid var(--hr);
   border-radius:8px;color:var(--t1);font-size:13px;font-family:var(--mono);
   outline:none;transition:border-color .14s
 }
-.mf input:focus{border-color:var(--brand)}
+.mf input:focus,.mf textarea:focus{border-color:var(--brand)}
+.mf textarea{resize:vertical;min-height:72px;line-height:1.5}
+.mhint{font-size:10px;color:var(--t3);margin-top:5px;line-height:1.4}
 .mfoot{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
 </style>
 </head>
@@ -411,22 +471,39 @@ header{
     <div class="panel chart-panel">
       <div class="phdr">
         <span class="ptitle" id="chart-ttl">Equity Curve</span>
-        <div class="range-row">
-          <span class="rp" data-h="1"   onclick="setRange(this)">1H</span>
-          <span class="rp" data-h="4"   onclick="setRange(this)">4H</span>
-          <span class="rp on" data-h="24" onclick="setRange(this)">1D</span>
-          <span class="rp" data-h="168" onclick="setRange(this)">7D</span>
-          <span class="rp" data-h="0"   onclick="setRange(this)">ALL</span>
+        <div style="display:flex;align-items:center;gap:6px">
+          <div class="range-row">
+            <span class="rp" data-h="1"   onclick="setRange(this)">1H</span>
+            <span class="rp" data-h="4"   onclick="setRange(this)">4H</span>
+            <span class="rp on" data-h="24" onclick="setRange(this)">1D</span>
+            <span class="rp" data-h="168" onclick="setRange(this)">7D</span>
+            <span class="rp" data-h="0"   onclick="setRange(this)">ALL</span>
+          </div>
+          <div class="range-row">
+            <span class="rp" id="combined-btn" onclick="toggleCombined()" title="Overlay combined portfolio curve">Portfolio</span>
+          </div>
+          <div class="range-row" id="analysis-btns" style="display:none">
+            <span class="rp" id="btn-underwater" onclick="toggleSubChart('underwater')" title="Drawdown depth over time">▽ DD</span>
+          </div>
         </div>
       </div>
       <div class="chart-wrap"><canvas id="chart-canvas"></canvas></div>
+      <div class="sub-chart-section" id="dd-section">
+        <div class="sub-chart-hdr">Drawdown (Underwater)</div>
+        <div class="sub-chart-wrap"><canvas id="dd-canvas"></canvas></div>
+      </div>
     </div>
 
-    <!-- Right col, both rows: Stats tearsheet -->
+    <!-- Right col, both rows: Stats tearsheet / Compare panel -->
     <div class="panel stats-panel" id="stats-panel">
       <div class="phdr">
         <span class="ptitle" id="stats-title">Tearsheet</span>
         <span class="badge" id="stats-badge">All time</span>
+      </div>
+      <div id="cmp-tabs">
+        <button class="cmp-tab on" data-tab="leaderboard" onclick="setCmpTab('leaderboard')">Leaderboard</button>
+        <button class="cmp-tab"    data-tab="stats"        onclick="setCmpTab('stats')">Stats</button>
+        <button class="cmp-tab"    data-tab="correlation"  onclick="setCmpTab('correlation')">Correlation</button>
       </div>
       <div class="stats-scroll" id="stats-content">
         <div class="no-stats">Select a wallet to see<br>performance stats</div>
@@ -468,11 +545,15 @@ header{
 <div class="mbg" id="mbg" onclick="if(event.target===this)closeModal()">
   <div class="mbox">
     <h2>Add Portfolio</h2>
-    <p class="msub">Simulate copy-trading from this Hyperliquid wallet.</p>
+    <p class="msub">Paste one address per line to add multiple wallets at once.</p>
     <div class="merr" id="merr"></div>
-    <div class="mf"><label>Wallet Address</label><input id="m-addr" placeholder="0x…" autocomplete="off"></div>
-    <div class="mf"><label>Label (optional)</label><input id="m-lbl" placeholder="e.g. Trader A" autocomplete="off"></div>
-    <div class="mf"><label>Starting Balance ($)</label><input id="m-bal" type="number" min="1" step="100" placeholder="10000" autocomplete="off"></div>
+    <div class="mf">
+      <label>Wallet Address(es)</label>
+      <textarea id="m-addr" rows="4" placeholder="0xabc…&#10;0xdef… Bot B&#10;0xghi… Bot C,10000" autocomplete="off" spellcheck="false"></textarea>
+      <div class="mhint">One per line · optional label after a space · optional balance after a comma<br>e.g. <code style="color:var(--brand)">0xabc… Alpha Bot, 5000</code></div>
+    </div>
+    <div class="mf" id="mf-lbl"><label>Label (single wallet)</label><input id="m-lbl" placeholder="e.g. Trader A" autocomplete="off"></div>
+    <div class="mf"><label>Default Starting Balance ($)</label><input id="m-bal" type="number" min="1" step="100" placeholder="10000" autocomplete="off"></div>
     <div class="mfoot">
       <button class="btn" onclick="closeModal()">Cancel</button>
       <button class="btn btn-brand" id="m-submit" onclick="addWallet()">Start Monitoring</button>

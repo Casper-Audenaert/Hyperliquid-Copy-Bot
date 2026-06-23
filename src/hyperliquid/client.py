@@ -6,6 +6,17 @@ from typing import Optional, List, Dict, Any
 from loguru import logger
 from .models import Position, Order, UserState, PositionSide, OrderSide
 
+# Shared across ALL client instances — prevents 429s when many wallets fire simultaneously.
+# ponytail: 4 concurrent; raise to 8 if Hyperliquid increases their rate limit
+_api_sem: Optional[asyncio.Semaphore] = None
+
+def _get_sem() -> asyncio.Semaphore:
+    global _api_sem
+    if _api_sem is None:
+        _api_sem = asyncio.Semaphore(4)
+    return _api_sem
+
+
 class HyperliquidClient:
     """
     Client for interacting with Hyperliquid REST API
@@ -28,16 +39,17 @@ class HyperliquidClient:
             await self.session.close()
     
     async def _post(self, url: str, data: dict, _retries: int = 3) -> dict:
-        """Make POST request with exponential backoff retry."""
+        """Make POST request with exponential backoff retry, rate-limited by global semaphore."""
         if not self.session:
             self.session = aiohttp.ClientSession()
 
         last_exc: Exception = RuntimeError("no attempts made")
         for attempt in range(1, _retries + 1):
             try:
-                async with self.session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=30)) as response:
-                    response.raise_for_status()
-                    return await response.json()
+                async with _get_sem():
+                    async with self.session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                        response.raise_for_status()
+                        return await response.json()
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 last_exc = e
                 if attempt < _retries:
@@ -176,15 +188,16 @@ class HyperliquidClient:
             async with aiohttp.ClientSession() as session:
                 for dex in self.dexs:
                     try:
-                        async with session.post(
-                            self.info_url,
-                            json={"type": "allMids", "dex": dex}
-                        ) as response:
-                            data = await response.json()
-                            if data and isinstance(data, dict):
-                                for sym, px in data.items():
-                                    if sym not in all_mids:
-                                        all_mids[sym] = float(px)
+                        async with _get_sem():
+                            async with session.post(
+                                self.info_url,
+                                json={"type": "allMids", "dex": dex}
+                            ) as response:
+                                data = await response.json()
+                                if data and isinstance(data, dict):
+                                    for sym, px in data.items():
+                                        if sym not in all_mids:
+                                            all_mids[sym] = float(px)
                     except Exception:
                         continue
         except Exception as e:

@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 
 // ── State ──────────────────────────────────────────────────────────────────
 const socket = io({ transports: ['websocket'] });
@@ -8,8 +8,19 @@ let compareMode  = false;
 let rangeHours   = 24;
 let chart        = null;
 let pnlChart     = null;
+let underwaterChart    = null;
+let winRateChart       = null;
+let symPnlChart        = null;
+let histChart          = null;
+let sharpeSeriesChart  = null;
 let fillCount    = 0;
 let statsCache   = {};      // addr → stats dict (cached from /api/stats)
+let compareSelection = new Set(); // addrs visible in compare mode
+let showCombined     = false;     // overlay combined portfolio curve
+let showUnderwater   = false;     // toggle underwater sub-chart
+let sortCol          = 'score';
+let sortDir          = -1;        // -1 = desc
+let cmpTab           = 'leaderboard';
 
 const PALETTE = ['#7C6CFF','#16C784','#F5A524','#F0506A','#06b6d4','#a855f7','#ff6b35'];
 const clr = addr => PALETTE[Object.keys(state).indexOf(addr) % PALETTE.length] || PALETTE[0];
@@ -36,9 +47,15 @@ function applyTheme(theme) {
   document.getElementById('theme-btn').textContent = theme === 'light' ? '☾' : '☀';
   localStorage.setItem('hl-theme', theme);
   rebuildChart();
-  if (pnlChart) { pnlChart.destroy(); pnlChart = null; }
+  if (pnlChart)         { pnlChart.destroy();        pnlChart        = null; }
+  if (underwaterChart)  { underwaterChart.destroy();  underwaterChart  = null; }
+  if (winRateChart)     { winRateChart.destroy();     winRateChart     = null; }
+  if (symPnlChart)      { symPnlChart.destroy();      symPnlChart      = null; }
+  if (histChart)        { histChart.destroy();        histChart        = null; }
+  if (sharpeSeriesChart){ sharpeSeriesChart.destroy();sharpeSeriesChart= null; }
   const cur = activeWallet || Object.keys(state)[0];
   if (cur && statsCache[cur]) renderStats(statsCache[cur]);
+  if (showUnderwater && cur) renderUnderwaterChart(cur);
 }
 
 function toggleTheme() {
@@ -55,6 +72,8 @@ function toggleTheme() {
 
 // ── Formatters ─────────────────────────────────────────────────────────────
 const fUsd  = n => n == null ? '—' : (n < 0 ? '-$' : '$') + Math.abs(n).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+// Adaptive precision: shows 4 decimal places for sub-cent values so small PnL doesn't collapse to $0.00
+const fPnl  = n => { if (n == null) return null; const a = Math.abs(n); const d = a > 0 && a < 0.01 ? 4 : 2; return (n < 0 ? '-$' : '$') + a.toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d}); };
 const fNum  = n => n == null ? '—' : Number(n).toLocaleString(undefined,{minimumFractionDigits:4,maximumFractionDigits:4});
 const fPct  = (n,plus=true) => n == null ? '—' : (plus&&n>=0?'+':'') + Number(n).toFixed(2) + '%';
 const fPx   = n => !n ? '—' : n>=1000 ? n.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}) : n>=1 ? n.toFixed(4) : n.toFixed(6);
@@ -127,6 +146,61 @@ function buildGrad(ctx, col) {
   return g;
 }
 
+// ── Underwater / drawdown chart ────────────────────────────────────────────
+function computeUnderwaterData(history) {
+  let peak = -Infinity;
+  return history.map(p => {
+    if (p.equity > peak) peak = p.equity;
+    return { x: p.t.endsWith('Z') ? p.t : p.t + 'Z',
+             y: peak > 0 ? (p.equity - peak) / peak * 100 : 0 };
+  });
+}
+
+function renderUnderwaterChart(addr) {
+  const canvas = document.getElementById('dd-canvas');
+  if (!canvas) return;
+  if (underwaterChart) { underwaterChart.destroy(); underwaterChart = null; }
+  const h = filteredHistory(addr);
+  if (h.length < 2) return;
+  const c = chartColors();
+  underwaterChart = new Chart(canvas.getContext('2d'), {
+    type: 'line',
+    data: { datasets: [{ data: computeUnderwaterData(h),
+      borderColor: 'rgba(240,80,106,0.8)', backgroundColor: 'rgba(240,80,106,0.12)',
+      borderWidth: 1.5, pointRadius: 0, fill: true, tension: 0.2 }] },
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: {
+        backgroundColor: c.s1, borderColor: c.hr, borderWidth: 1,
+        titleColor: c.t1, bodyColor: c.t2,
+        callbacks: { label: ctx => ` DD: ${ctx.parsed.y.toFixed(2)}%` }
+      }},
+      scales: {
+        x: { type: 'time',
+             time: { tooltipFormat: 'HH:mm:ss', displayFormats: { minute:'HH:mm', hour:'HH:mm', day:'MMM d' } },
+             ticks: { color: c.t3, maxTicksLimit: 6, font: { size: 9 } },
+             grid: { color: c.hr+'66' }, border: { color: c.hr } },
+        y: { max: 0,
+             ticks: { color: c.t3, font: { size: 9 }, callback: v => v.toFixed(1)+'%' },
+             grid: { color: c.hr+'66' }, border: { color: c.hr } }
+      }
+    }
+  });
+}
+
+function toggleSubChart(which) {
+  if (which !== 'underwater') return;
+  showUnderwater = !showUnderwater;
+  document.getElementById('dd-section').classList.toggle('visible', showUnderwater);
+  document.getElementById('btn-underwater').classList.toggle('on', showUnderwater);
+  if (showUnderwater) {
+    const cur = activeWallet || Object.keys(state)[0];
+    if (cur) renderUnderwaterChart(cur);
+  } else {
+    if (underwaterChart) { underwaterChart.destroy(); underwaterChart = null; }
+  }
+}
+
 function filteredHistory(addr) {
   const h = state[addr]?._history || [];
   if (!rangeHours) return h;
@@ -134,10 +208,49 @@ function filteredHistory(addr) {
   return h.filter(p => new Date(p.t.endsWith('Z')?p.t:p.t+'Z').getTime() >= cut);
 }
 
+// ── Compare helpers ────────────────────────────────────────────────────────
+function combinedHistory(addrs) {
+  const maps = addrs.map(a => {
+    const m = {};
+    (state[a]?._history || []).forEach(p => m[p.t] = p.equity);
+    return m;
+  });
+  const allTimes = [...new Set(addrs.flatMap((_, i) => Object.keys(maps[i])))].sort();
+  const last = addrs.map(a => state[a]?.start_balance || 10000);
+  return allTimes.map(t => {
+    addrs.forEach((_, i) => { if (maps[i][t] != null) last[i] = maps[i][t]; });
+    return { t, equity: last.reduce((s, v) => s + v, 0) };
+  });
+}
+
+function combinedStartBal(addrs) {
+  return addrs.reduce((s, a) => s + (state[a]?.start_balance || 10000), 0);
+}
+
+function pearson(a, b) {
+  const n = Math.min(a.length, b.length);
+  if (n < 2) return null;
+  const ax = a.slice(-n), bx = b.slice(-n);
+  const ma = ax.reduce((s, v) => s + v, 0) / n;
+  const mb = bx.reduce((s, v) => s + v, 0) / n;
+  const num = ax.reduce((s, v, i) => s + (v - ma) * (bx[i] - mb), 0);
+  const dxa = Math.sqrt(ax.reduce((s, v) => s + (v - ma) ** 2, 0));
+  const dxb = Math.sqrt(bx.reduce((s, v) => s + (v - mb) ** 2, 0));
+  return (dxa && dxb) ? num / (dxa * dxb) : null;
+}
+
+function corrColor(r) {
+  if (r == null) return 'var(--s3)';
+  const t = (r + 1) / 2;
+  const g   = Math.round(22  + t * (199 - 22));
+  const red = Math.round(240 - t * (240 - 22));
+  return `rgba(${red},${g},100,0.55)`;
+}
+
 function rebuildChart() {
   if (!chart) return;
   const cur   = activeWallet || Object.keys(state)[0];
-  const addrs = compareMode ? Object.keys(state) : (cur ? [cur] : []);
+  const addrs = compareMode ? [...compareSelection] : (cur ? [cur] : []);
   const c     = chartColors();
   const ctx   = document.getElementById('chart-canvas').getContext('2d');
 
@@ -172,6 +285,16 @@ function rebuildChart() {
       pointHoverBackgroundColor:col, fill:!compareMode, tension:0.35,
     };
   });
+  if (compareMode && showCombined && addrs.length > 1) {
+    const combined = combinedHistory(addrs);
+    const sb = combinedStartBal(addrs);
+    chart.data.datasets.push({
+      label: 'Combined', borderColor: '#ffffff', borderWidth: 2,
+      borderDash: [5, 3], backgroundColor: 'transparent',
+      pointRadius: 0, pointHoverRadius: 4, tension: 0.35, fill: false,
+      data: combined.map(p => ({ x: p.t, y: ((p.equity / sb) - 1) * 100 })),
+    });
+  }
   chart.update('none');
 }
 
@@ -220,14 +343,21 @@ function renderSidebar() {
     const ret = s.return_pct || 0;
     const pos = ret > 0.005, neg = ret < -0.005;
     const wr  = s.win_rate != null ? `${s.win_rate}% win` : '';
-    const sel = !compareMode && cur === addr;
+    const inCmp  = compareMode && compareSelection.has(addr);
+    const cardCls = compareMode ? (inCmp ? ' cmp-on' : ' cmp-off') : (!compareMode && cur===addr ? ' sel' : '');
+    const clickFn = compareMode ? `toggleCompareWallet('${addr}')` : `selectWallet('${addr}')` ;
+    // sel kept as alias for backward compat with unchanged code below
+    const sel = inCmp || (!compareMode && cur===addr);
+    const score    = statsCache[addr]?.score;
+    const scoreCls = score == null ? '' : score >= 70 ? 'good' : score >= 50 ? 'ok' : 'bad';
     const shortAddr = addr.slice(0,6) + '…' + addr.slice(-4);
-    return `<div class="wcard${sel?' sel':''}" onclick="selectWallet('${addr}')">
+    return `<div class="wcard${cardCls}" onclick="${clickFn}">
   <div class="wcard-inner">
     <div class="wc-header">
       <span class="wc-rank">#${rank+1}</span>
       <div class="wc-dot${s.is_paused?' paused':''}"></div>
       <span class="wc-name" title="${addr}">${s.label}</span>
+      ${score != null ? `<span class="score-pill ${scoreCls}">${score}</span>` : ''}
       <div class="wc-actions">
         <button class="wc-act-btn rst" onclick="event.stopPropagation();resetWallet('${addr}')" title="Reset">⟳</button>
         <button class="wc-act-btn del" onclick="event.stopPropagation();removeWallet('${addr}')" title="Remove">✕</button>
@@ -251,23 +381,51 @@ function selectWallet(addr) {
   compareMode  = false;
   activeWallet = addr;
   document.getElementById('cmp-btn').classList.remove('on');
+  document.getElementById('cmp-tabs').style.display = 'none';
+  document.getElementById('combined-btn').style.display = 'none';
+  document.getElementById('analysis-btns').style.display = '';
+  showCombined = false;
   renderSidebar();
   renderKpis();
   renderPositions();
   rebuildChart();
+  if (showUnderwater) renderUnderwaterChart(addr);
   loadTrades(addr);
   loadStats(addr);
+}
+
+function toggleCompareWallet(addr) {
+  if (compareSelection.has(addr)) {
+    if (compareSelection.size > 1) compareSelection.delete(addr);
+  } else {
+    compareSelection.add(addr);
+  }
+  renderSidebar(); renderKpis(); rebuildChart(); renderComparePanel();
+}
+
+function toggleCombined() {
+  showCombined = !showCombined;
+  document.getElementById('combined-btn').classList.toggle('on', showCombined);
+  rebuildChart();
 }
 
 function toggleCompare() {
   compareMode  = !compareMode;
   activeWallet = null;
+  if (compareMode) {
+    compareSelection = new Set(Object.keys(state));
+    cmpTab = 'leaderboard';
+  }
   document.getElementById('cmp-btn').classList.toggle('on', compareMode);
+  document.getElementById('cmp-tabs').style.display = compareMode ? 'flex' : 'none';
+  document.getElementById('combined-btn').style.display = compareMode ? '' : 'none';
+  document.getElementById('analysis-btns').style.display = compareMode ? 'none' : '';
+  if (!compareMode) { showCombined = false; document.getElementById('combined-btn').classList.remove('on'); }
   renderSidebar();
   renderKpis();
   renderPositions();
   rebuildChart();
-  if (compareMode) renderCompareStats();
+  if (compareMode) renderComparePanel();
   else {
     const cur = Object.keys(state)[0];
     if (cur) loadStats(cur);
@@ -277,7 +435,9 @@ function toggleCompare() {
 // ── KPI cards ──────────────────────────────────────────────────────────────
 function renderKpis() {
   const cur   = activeWallet || Object.keys(state)[0];
-  const sess  = compareMode ? Object.values(state) : (state[cur] ? [state[cur]] : []);
+  const sess  = compareMode
+    ? [...compareSelection].filter(a => state[a]).map(a => state[a])
+    : (state[cur] ? [state[cur]] : []);
   if (!sess.length) return;
 
   const bal   = sess.reduce((a,s)=>a+(s.balance||0), 0);
@@ -309,8 +469,13 @@ function renderKpis() {
   document.getElementById('live-txt').textContent = paused ? 'PAUSED' : 'LIVE';
   document.getElementById('btn-pause').textContent = paused ? '▶ Resume' : '⏸ Pause';
 
-  const uptime = Math.max(0, ...sess.map(s=>s.uptime_h||0));
-  document.getElementById('uptime-lbl').textContent = uptime>0 ? `up ${uptime.toFixed(1)}h` : '';
+  const uptime = Math.max(0, ...sess.map(s => s.uptime_h || 0));
+  const total  = Object.keys(state).length;
+  const selN   = compareMode ? compareSelection.size : 0;
+  document.getElementById('uptime-lbl').textContent =
+    compareMode && selN < total
+      ? `${selN}/${total} wallets`
+      : uptime > 0 ? `up ${uptime.toFixed(1)}h` : '';
 }
 
 function setKpi(id, val, sub, num) {
@@ -383,10 +548,12 @@ function prependFill(f) {
   const ph    = document.getElementById('feed-ph');
   if (ph) ph.remove();
 
-  const dir  = f.direction || f.side || '';
-  const pnl  = f.realized_pnl;
-  const pnlH = pnl==null ? `<span class="dim">—</span>`
-    : `<span style="color:${pnl>=0?'var(--green)':'var(--red)'}">${pnl>=0?'+':''}${fUsd(pnl)}</span>`;
+  const dir    = f.direction || f.side || '';
+  const pnl    = f.realized_pnl;
+  const pnlFmt = fPnl(pnl);
+  const pnlH   = pnlFmt == null
+    ? `<span class="dim">—</span>`
+    : `<span style="color:${pnl>=0?'var(--green)':'var(--red)'}">${pnl>=0?'+':''}${pnlFmt}</span>`;
 
   const tr = document.createElement('tr');
   tr.className = 'fnew';
@@ -410,12 +577,14 @@ async function loadStats(addr) {
     const r  = await fetch(`/api/stats/${addr}`);
     const st = await r.json();
     statsCache[addr] = st;
-    if (!compareMode && (activeWallet||Object.keys(state)[0]) === addr)
-      renderStats(st);
+    const isCur = !compareMode && (activeWallet||Object.keys(state)[0]) === addr;
+    if (isCur) renderStats(st);
+    if (compareMode) renderComparePanel(); // refresh active tab, not just leaderboard
   } catch(e) { console.warn('loadStats', e); }
 }
 
 function renderStats(st) {
+  if (!st) return;
   const el = document.getElementById('stats-content');
   document.getElementById('stats-title').textContent = 'Tearsheet';
 
@@ -425,15 +594,26 @@ function renderStats(st) {
   const pfC  = n => n==null?'var(--t2)':n>=1?'var(--green)':'var(--red)';
   const ddC  = n => (n||0)<0?'var(--red)':'var(--t2)';
   const shC  = n => n==null?'var(--t2)':n>1?'var(--green)':n>0?'var(--warn)':'var(--red)';
+  const scC  = n => n==null?'var(--t2)':n>=70?'var(--green)':n>=50?'var(--brand)':'var(--red)';
 
-  const pnlByDay  = st.pnl_by_day  || [];
-  const topAssets = st.top_assets   || [];
+  const pnlByDay       = st.pnl_by_day      || [];
+  const topAssets      = st.top_assets       || [];
+  const rollingWinrate = st.rolling_winrate  || [];
+  const symbolPnl      = st.symbol_pnl       || [];
+  const pnlHistogram   = st.pnl_histogram    || [];
+  const rollingSharp   = st.rolling_sharpe   || [];
 
-  // Each section stacks vertically in the narrow right column
+  // Destroy stale tearsheet chart instances before replacing DOM
+  if (winRateChart)     { winRateChart.destroy();     winRateChart     = null; }
+  if (symPnlChart)      { symPnlChart.destroy();      symPnlChart      = null; }
+  if (histChart)        { histChart.destroy();        histChart        = null; }
+  if (sharpeSeriesChart){ sharpeSeriesChart.destroy();sharpeSeriesChart= null; }
+
   el.innerHTML = `
     <div class="stat-section">
       <div class="stat-section-title">Performance</div>
       <div class="stat-grid">
+        <div class="stat-row"><span class="stat-lbl">Score</span>${sv(st.score!=null?st.score+'/100':'—', scC(st.score))}</div>
         <div class="stat-row"><span class="stat-lbl">Win Rate</span>${sv(st.win_rate!=null?st.win_rate+'%':'—', wrC(st.win_rate))}</div>
         <div class="stat-row"><span class="stat-lbl">Record</span>${sv((st.wins||0)+'W / '+(st.losses||0)+'L','var(--t2)')}</div>
         <div class="stat-row"><span class="stat-lbl">Profit Factor</span>${sv(st.profit_factor!=null?st.profit_factor+'×':'—', pfC(st.profit_factor))}</div>
@@ -452,6 +632,7 @@ function renderStats(st) {
         <div class="stat-row"><span class="stat-lbl">Max Drawdown</span>${sv(st.max_drawdown!=null?st.max_drawdown+'%':'—', ddC(st.max_drawdown))}</div>
         <div class="stat-row"><span class="stat-lbl">Current DD</span>${sv(st.current_drawdown!=null?st.current_drawdown+'%':'—', ddC(st.current_drawdown))}</div>
         <div class="stat-row"><span class="stat-lbl">Sharpe</span>${sv(st.sharpe??'—', shC(st.sharpe))}</div>
+        <div class="stat-row"><span class="stat-lbl">Calmar</span>${sv(st.calmar!=null?st.calmar+'×':'—', shC(st.calmar))}</div>
         <div class="stat-row"><span class="stat-lbl">Volatility</span>${sv(st.volatility!=null?st.volatility+'%':'—','var(--t2)')}</div>
         <div class="stat-row"><span class="stat-lbl">Win Streak</span>${sv(st.longest_win_streak||0,'var(--t2)')}</div>
       </div>
@@ -484,31 +665,208 @@ function renderStats(st) {
       <div class="stat-section-title">Daily PnL</div>
       <div class="pnl-chart-wrap"><canvas id="pnl-chart"></canvas></div>
     </div>` : ''}
+
+    ${rollingWinrate.length ? `
+    <div class="pnl-chart-section">
+      <div class="stat-section-title">Win Rate Stability (rolling ${rollingWinrate.length > 10 ? 50 : ''}trades)</div>
+      <div class="pnl-chart-wrap" style="height:90px"><canvas id="wr-chart"></canvas></div>
+    </div>` : ''}
+
+    ${rollingSharp.length ? `
+    <div class="pnl-chart-section">
+      <div class="stat-section-title">Rolling 7-Day Sharpe</div>
+      <div class="pnl-chart-wrap" style="height:90px"><canvas id="sharpe-ts-chart"></canvas></div>
+    </div>` : ''}
+
+    ${symbolPnl.length ? `
+    <div class="pnl-chart-section">
+      <div class="stat-section-title">Symbol PnL Breakdown</div>
+      <div class="pnl-chart-wrap" style="height:${Math.min(symbolPnl.length,10)*22+20}px"><canvas id="sym-pnl-chart"></canvas></div>
+    </div>` : ''}
+
+    ${pnlHistogram.length ? `
+    <div class="pnl-chart-section">
+      <div class="stat-section-title">Trade PnL Distribution</div>
+      <div class="pnl-chart-wrap"><canvas id="hist-chart"></canvas></div>
+    </div>` : ''}
   `;
 
-  if (pnlByDay.length) renderPnlChart(pnlByDay);
+  if (pnlByDay.length)       renderPnlChart(pnlByDay);
+  if (rollingWinrate.length) renderWinRateChart(rollingWinrate);
+  if (rollingSharp.length)   renderSharpSeriesChart(rollingSharp);
+  if (symbolPnl.length)      renderSymPnlChart(symbolPnl);
+  if (pnlHistogram.length)   renderHistChart(pnlHistogram);
 }
 
-function renderCompareStats() {
-  const addrs = Object.keys(state);
-  const sorted = [...addrs].sort((a,b)=>(state[b]?.return_pct||0)-(state[a]?.return_pct||0));
-  const el = document.getElementById('stats-content');
-  document.getElementById('stats-title').textContent = 'Leaderboard';
+// ── Compare panel (tabs: leaderboard | stats | correlation) ───────────────
+function renderComparePanel() {
+  if (!compareMode) return;
+  renderCmpTabs();
+  document.getElementById('stats-title').textContent = 'Compare';
+  if      (cmpTab === 'leaderboard') renderLeaderboard();
+  else if (cmpTab === 'stats')       renderStatsTable();
+  else if (cmpTab === 'correlation') renderCorrelation();
+}
 
-  el.innerHTML = `<div class="leaderboard">
-    ${sorted.map((addr, i) => {
-      const s   = state[addr];
-      const ret = s.return_pct || 0;
-      const col = clr(addr);
-      return `<div class="lb-row">
-        <span class="lb-rank">#${i+1}</span>
-        <span class="lb-swatch" style="background:${col}"></span>
-        <span class="lb-name">${s.label}</span>
-        <span class="lb-eq mono" style="color:${col}">${fUsd(s.equity)}</span>
-        <span class="lb-ret mono" style="color:${ret>=0?'var(--green)':'var(--red)'}">${fPct(ret)}</span>
-        <span class="lb-wr">${s.win_rate!=null?s.win_rate+'%':''}</span>
-      </div>`;
-    }).join('')}
+function renderCmpTabs() {
+  document.querySelectorAll('.cmp-tab').forEach(b =>
+    b.classList.toggle('on', b.dataset.tab === cmpTab));
+}
+
+function setCmpTab(tab) { cmpTab = tab; renderComparePanel(); }
+
+// -- Sortable leaderboard --
+function colVal(addr, col) {
+  const s = state[addr];
+  if (!s) return null;
+  if (col === 'score')        return statsCache[addr]?.score        ?? null;
+  if (col === 'max_drawdown') return statsCache[addr]?.max_drawdown ?? null;
+  if (col === 'sharpe')       return statsCache[addr]?.sharpe       ?? null;
+  if (col === 'total_trades') return statsCache[addr]?.total_trades ?? s.trades_copied_count ?? 0;
+  return s[col] ?? null;
+}
+
+function setSort(col) {
+  if (sortCol === col) sortDir *= -1; else { sortCol = col; sortDir = -1; }
+  renderLeaderboard();
+}
+
+function renderLeaderboard() {
+  const addrs  = Object.keys(state);
+  const sorted = [...addrs].sort((a, b) => {
+    const va = colVal(a, sortCol) ?? -Infinity;
+    const vb = colVal(b, sortCol) ?? -Infinity;
+    return sortDir * (va - vb);
+  });
+  const cols = [
+    { key: 'score',        label: 'Score'   },
+    { key: 'return_pct',   label: 'Return'  },
+    { key: 'equity',       label: 'Equity'  },
+    { key: 'win_rate',     label: 'Win %'   },
+    { key: 'max_drawdown', label: 'Max DD'  },
+    { key: 'sharpe',       label: 'Sharpe'  },
+    { key: 'total_trades', label: 'Trades'  },
+  ];
+  const arrow = col => col === sortCol ? (sortDir < 0 ? ' ▼' : ' ▲') : '';
+
+  const el = document.getElementById('stats-content');
+  el.innerHTML = `
+  <table class="cmp-lb-tbl">
+    <thead><tr>
+      <th class="lb-name-col">Wallet</th>
+      ${cols.map(c => `<th onclick="setSort('${c.key}')" class="sortable">${c.label}${arrow(c.key)}</th>`).join('')}
+    </tr></thead>
+    <tbody>
+      ${sorted.map(addr => {
+        const s   = state[addr];
+        const ret = s.return_pct || 0;
+        const dim = !compareSelection.has(addr) ? ' style="opacity:0.35"' : '';
+        const col = clr(addr);
+        const dd  = statsCache[addr]?.max_drawdown;
+        const sh  = statsCache[addr]?.sharpe;
+        const sc  = statsCache[addr]?.score;
+        const tr  = statsCache[addr]?.total_trades ?? s.trades_copied_count ?? 0;
+        const scCol = sc==null?'var(--t2)':sc>=70?'var(--green)':sc>=50?'var(--brand)':'var(--red)';
+        return `<tr${dim}>
+          <td><span class="lb-swatch" style="background:${col}"></span><span class="lb-nm">${s.label}</span></td>
+          <td class="mono" style="color:${scCol};font-weight:700">${sc ?? '—'}</td>
+          <td class="mono" style="color:${ret>=0?'var(--green)':'var(--red)'}">${fPct(ret)}</td>
+          <td class="mono" style="color:${col}">${fUsd(s.equity)}</td>
+          <td class="mono">${s.win_rate != null ? s.win_rate + '%' : '—'}</td>
+          <td class="mono" style="color:${dd!=null&&dd<-10?'var(--red)':'var(--t2)'}">${dd != null ? dd + '%' : '—'}</td>
+          <td class="mono" style="color:${sh!=null?sh>1?'var(--green)':sh>0?'var(--warn)':'var(--red)':'var(--t2)'}">${sh ?? '—'}</td>
+          <td class="mono">${tr}</td>
+        </tr>`;
+      }).join('')}
+    </tbody>
+  </table>`;
+}
+
+// -- Side-by-side stats table --
+function renderStatsTable() {
+  const addrs = [...compareSelection].filter(a => state[a]);
+  if (!addrs.length) return;
+  const metrics = [
+    { key: 'win_rate',           label: 'Win Rate',       fmt: v => v != null ? v + '%' : '—',    best: 'max', col: (v, b) => v===b?'var(--green)':null },
+    { key: 'sharpe',             label: 'Sharpe',         fmt: v => v != null ? v : '—',           best: 'max', col: (v, b) => v===b?'var(--green)':v!=null&&v<0?'var(--red)':null },
+    { key: 'max_drawdown',       label: 'Max Drawdown',   fmt: v => v != null ? v + '%' : '—',     best: 'max', col: (v, b) => v===b?'var(--green)':v!=null&&v<-20?'var(--red)':null },
+    { key: 'profit_factor',      label: 'Profit Factor',  fmt: v => v != null ? v + '×' : '—',     best: 'max', col: (v, b) => v===b?'var(--green)':v!=null&&v<1?'var(--red)':null },
+    { key: 'total_realized_pnl', label: 'Total Realized', fmt: v => fUsd(v),                        best: 'max', col: (v, b) => v===b?'var(--green)':v!=null&&v<0?'var(--red)':null },
+    { key: 'expectancy',         label: 'Expectancy',     fmt: v => fUsd(v),                        best: 'max', col: (v, b) => v===b?'var(--green)':v!=null&&v<0?'var(--red)':null },
+    { key: 'avg_win',            label: 'Avg Win',        fmt: v => fUsd(v),                        best: 'max', col: (v, b) => v===b?'var(--green)':null },
+    { key: 'avg_loss',           label: 'Avg Loss',       fmt: v => fUsd(v),                        best: 'max', col: (v, b) => v===b?'var(--green)':null },
+    { key: 'volatility',         label: 'Volatility',     fmt: v => v != null ? v + '%' : '—',     best: 'min', col: () => null },
+    { key: 'total_trades',       label: 'Total Trades',   fmt: v => v ?? '—',                       best: 'max', col: () => null },
+  ];
+
+  const el = document.getElementById('stats-content');
+  el.innerHTML = `
+  <table class="cmp-stats-tbl">
+    <thead><tr>
+      <th>Metric</th>
+      ${addrs.map(a => `<th><span class="lb-swatch" style="background:${clr(a)}"></span>${state[a].label}</th>`).join('')}
+    </tr></thead>
+    <tbody>
+      ${metrics.map(m => {
+        const vals = addrs.map(a => statsCache[a]?.[m.key] ?? null);
+        const numVals = vals.filter(v => v != null);
+        const best = numVals.length ? (m.best === 'max' ? Math.max(...numVals) : Math.min(...numVals)) : null;
+        return `<tr>
+          <td class="metric-lbl">${m.label}</td>
+          ${vals.map(v => {
+            const isBest = v != null && v === best && numVals.length > 1;
+            const cellCol = m.col(v, best);
+            return `<td class="mono${isBest ? ' best-cell' : ''}"${cellCol ? ` style="color:${cellCol}"` : ''}>${m.fmt(v)}</td>`;
+          }).join('')}
+        </tr>`;
+      }).join('')}
+    </tbody>
+  </table>`;
+}
+
+// -- Correlation heatmap --
+function renderCorrelation() {
+  const addrs = [...compareSelection].filter(a => state[a] && (state[a]._history || []).length > 1);
+  if (addrs.length < 2) {
+    document.getElementById('stats-content').innerHTML =
+      '<div class="no-stats">Need at least 2 wallets with history for correlation.</div>';
+    return;
+  }
+
+  // Use return series (equity changes) for better correlation signal
+  const returns = addrs.map(a => {
+    const h = state[a]._history || [];
+    return h.slice(1).map((p, i) => p.equity - h[i].equity);
+  });
+  const n = addrs.length;
+  const matrix = Array.from({length: n}, (_, i) =>
+    Array.from({length: n}, (_, j) => i === j ? 1 : pearson(returns[i], returns[j]))
+  );
+
+  const size = Math.max(36, Math.floor(280 / n));
+  const el = document.getElementById('stats-content');
+  el.innerHTML = `
+  <div style="padding:12px 14px">
+    <div class="stat-section-title" style="margin-bottom:10px">Return Correlation Matrix</div>
+    <div class="corr-wrap" style="overflow-x:auto">
+      <table class="corr-tbl" style="border-collapse:separate;border-spacing:2px">
+        <thead><tr>
+          <th style="width:${size}px"></th>
+          ${addrs.map(a => `<th style="font-size:9px;color:var(--t3);text-align:center;padding:2px;max-width:${size}px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${state[a].label}</th>`).join('')}
+        </tr></thead>
+        <tbody>
+          ${matrix.map((row, i) => `<tr>
+            <td style="font-size:9px;color:var(--t3);padding-right:4px;white-space:nowrap;max-width:${size+10}px;overflow:hidden;text-overflow:ellipsis">${state[addrs[i]].label}</td>
+            ${row.map(r => {
+              const bg = corrColor(r);
+              const txt = r != null ? r.toFixed(2) : '—';
+              return `<td style="background:${bg};border-radius:4px;text-align:center;font-size:10px;font-family:var(--mono);padding:6px 4px;min-width:${size}px;color:var(--t1)">${txt}</td>`;
+            }).join('')}
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+    <div style="margin-top:10px;font-size:10px;color:var(--t3)">Green = moves together · Red = moves opposite · Based on equity return series</div>
   </div>`;
 }
 
@@ -540,6 +898,107 @@ function renderPnlChart(data) {
   });
 }
 
+function renderWinRateChart(data) {
+  const ctx = document.getElementById('wr-chart');
+  if (!ctx) return;
+  if (winRateChart) { winRateChart.destroy(); winRateChart = null; }
+  const c = chartColors();
+  winRateChart = new Chart(ctx.getContext('2d'), {
+    type: 'line',
+    data: { datasets: [{ data: data.map(d=>({ x: d.t.endsWith('Z')?d.t:d.t+'Z', y: d.win_rate })),
+      borderColor:'var(--brand)', backgroundColor:'var(--brand-a)',
+      borderWidth:1.5, pointRadius:0, fill:true, tension:0.3 }] },
+    options: {
+      animation:false, responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{display:false}, tooltip:{ backgroundColor:c.s1, borderColor:c.hr,
+        borderWidth:1, titleColor:c.t1, bodyColor:c.t2,
+        callbacks:{ label: ctx=>` Win Rate: ${ctx.parsed.y.toFixed(1)}%` } }},
+      scales:{
+        x:{ type:'time', ticks:{color:c.t3,font:{size:9},maxTicksLimit:5}, grid:{display:false}, border:{color:c.hr} },
+        y:{ min:0, max:100, ticks:{color:c.t3,font:{size:9},callback:v=>v+'%'}, grid:{color:c.hr+'66'}, border:{color:c.hr} }
+      }
+    }
+  });
+}
+
+function renderSharpSeriesChart(data) {
+  const ctx = document.getElementById('sharpe-ts-chart');
+  if (!ctx) return;
+  if (sharpeSeriesChart) { sharpeSeriesChart.destroy(); sharpeSeriesChart = null; }
+  const c = chartColors();
+  sharpeSeriesChart = new Chart(ctx.getContext('2d'), {
+    type: 'line',
+    data: { datasets: [{ data: data.filter(d=>d.sharpe!=null).map(d=>({ x:d.t, y:d.sharpe })),
+      borderColor:'var(--brand)', backgroundColor:'rgba(124,108,255,0.10)',
+      borderWidth:1.5, pointRadius:0, fill:true, tension:0.3,
+      segment:{ borderColor: ctx => ctx.p1.parsed.y > 0 ? '#16C784' : '#F0506A' } }] },
+    options: {
+      animation:false, responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{display:false}, tooltip:{ backgroundColor:c.s1, borderColor:c.hr,
+        borderWidth:1, titleColor:c.t1, bodyColor:c.t2,
+        callbacks:{ label: ctx=>` Sharpe: ${ctx.parsed.y}` } }},
+      scales:{
+        x:{ type:'time', ticks:{color:c.t3,font:{size:9},maxTicksLimit:5}, grid:{display:false}, border:{color:c.hr} },
+        y:{ ticks:{color:c.t3,font:{size:9}}, grid:{color:c.hr+'66'}, border:{color:c.hr} }
+      }
+    }
+  });
+}
+
+function renderSymPnlChart(data) {
+  const ctx = document.getElementById('sym-pnl-chart');
+  if (!ctx) return;
+  if (symPnlChart) { symPnlChart.destroy(); symPnlChart = null; }
+  const sorted = [...data].sort((a,b)=>a.pnl-b.pnl); // ascending for horizontal bar
+  const c = chartColors();
+  symPnlChart = new Chart(ctx.getContext('2d'), {
+    type: 'bar',
+    data: {
+      labels: sorted.map(d=>d.symbol),
+      datasets:[{ data:sorted.map(d=>d.pnl),
+        backgroundColor: sorted.map(d=>d.pnl>=0?'rgba(22,199,132,0.65)':'rgba(240,80,106,0.65)'),
+        borderRadius:3 }]
+    },
+    options: {
+      indexAxis:'y', animation:false, responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{display:false}, tooltip:{ backgroundColor:c.s1, borderColor:c.hr,
+        borderWidth:1, titleColor:c.t1, bodyColor:c.t2,
+        callbacks:{ label: ctx=>` ${fUsd(ctx.parsed.x)} (${sorted[ctx.dataIndex]?.count} trades)` } }},
+      scales:{
+        x:{ ticks:{color:c.t3,font:{size:9},callback:v=>'$'+Number(v).toLocaleString(undefined,{maximumFractionDigits:0})},
+            grid:{color:c.hr+'66'}, border:{color:c.hr} },
+        y:{ ticks:{color:c.t2,font:{size:10,family:'var(--mono)'}}, grid:{display:false}, border:{color:c.hr} }
+      }
+    }
+  });
+}
+
+function renderHistChart(data) {
+  const ctx = document.getElementById('hist-chart');
+  if (!ctx) return;
+  if (histChart) { histChart.destroy(); histChart = null; }
+  const c = chartColors();
+  histChart = new Chart(ctx.getContext('2d'), {
+    type: 'bar',
+    data: {
+      labels: data.map(d=>'$'+parseFloat(d.label).toFixed(0)),
+      datasets:[{ data:data.map(d=>d.count),
+        backgroundColor: data.map(d=>d.positive?'rgba(22,199,132,0.65)':'rgba(240,80,106,0.65)'),
+        borderRadius:2 }]
+    },
+    options: {
+      animation:false, responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{display:false}, tooltip:{ backgroundColor:c.s1, borderColor:c.hr,
+        borderWidth:1, titleColor:c.t1, bodyColor:c.t2,
+        callbacks:{ label: ctx=>` ${ctx.parsed.y} trades` } }},
+      scales:{
+        x:{ ticks:{color:c.t3,font:{size:8},maxTicksLimit:8}, grid:{display:false}, border:{color:c.hr} },
+        y:{ ticks:{color:c.t3,font:{size:9},precision:0}, grid:{color:c.hr+'66'}, border:{color:c.hr} }
+      }
+    }
+  });
+}
+
 // ── Data loading ───────────────────────────────────────────────────────────
 async function loadHistory(addr) {
   try {
@@ -565,6 +1024,10 @@ function setRange(el) {
   el.classList.add('on');
   rangeHours = parseInt(el.dataset.h)||0;
   rebuildChart();
+  if (showUnderwater) {
+    const cur = activeWallet || Object.keys(state)[0];
+    if (cur) renderUnderwaterChart(cur);
+  }
 }
 
 async function togglePause() {
@@ -617,44 +1080,75 @@ function closeModal() {
   document.getElementById('mbg').classList.remove('open');
   const btn=document.getElementById('m-submit');
   btn.textContent='Start Monitoring'; btn.disabled=false;
+  document.getElementById('m-addr').value='';
+  document.getElementById('m-lbl').value='';
+  document.getElementById('m-bal').value='';
+  document.getElementById('merr').classList.remove('show');
+}
+
+// Parse textarea: "0xabc… optional label, optional_balance" per line
+function parseAddrLines(raw) {
+  return raw.split('\n')
+    .map(l => l.trim()).filter(l => l.length > 0)
+    .map(l => {
+      // split on first comma for optional per-line balance
+      const [addrPart, balPart] = l.split(',').map(s => s.trim());
+      const tokens  = addrPart.split(/\s+/);
+      const address = tokens[0].toLowerCase();
+      const label   = tokens.slice(1).join(' ');
+      const balance = balPart ? parseFloat(balPart) : null;
+      return { address, label, balance };
+    })
+    .filter(e => e.address.startsWith('0x') && e.address.length > 10);
 }
 
 async function addWallet() {
-  const address     = document.getElementById('m-addr').value.trim();
-  const label       = document.getElementById('m-lbl').value.trim();
-  const balRaw      = document.getElementById('m-bal').value.trim();
-  const start_balance = balRaw ? parseFloat(balRaw) : null;
-  const errEl       = document.getElementById('merr');
-  const btn         = document.getElementById('m-submit');
+  const rawText   = document.getElementById('m-addr').value;
+  const labelFld  = document.getElementById('m-lbl').value.trim();
+  const balRaw    = document.getElementById('m-bal').value.trim();
+  const defaultBal = balRaw ? parseFloat(balRaw) : null;
+  const errEl     = document.getElementById('merr');
+  const btn       = document.getElementById('m-submit');
 
   errEl.classList.remove('show');
-  if (!address) { document.getElementById('m-addr').focus(); return; }
-  if (start_balance !== null && (isNaN(start_balance)||start_balance<=0)) {
-    errEl.textContent='Starting balance must be a positive number.'; errEl.classList.add('show'); return;
+  const entries = parseAddrLines(rawText);
+
+  if (!entries.length) {
+    errEl.textContent = 'Enter at least one valid 0x address.';
+    errEl.classList.add('show');
+    return;
+  }
+  if (defaultBal !== null && (isNaN(defaultBal) || defaultBal <= 0)) {
+    errEl.textContent = 'Starting balance must be a positive number.';
+    errEl.classList.add('show');
+    return;
   }
 
-  btn.textContent='Adding…'; btn.disabled=true;
-  try {
-    const r = await fetch('/api/add-wallet', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({address, label, start_balance}),
-    });
-    const d = await r.json();
-    if (d.ok) {
-      closeModal();
-      document.getElementById('m-addr').value='';
-      document.getElementById('m-lbl').value='';
-      document.getElementById('m-bal').value='';
-    } else {
-      errEl.textContent = d.error || 'Failed to add wallet';
-      errEl.classList.add('show');
-      btn.textContent='Start Monitoring'; btn.disabled=false;
-    }
-  } catch(e) {
-    errEl.textContent='Network error — is the server running?';
-    errEl.classList.add('show');
-    btn.textContent='Start Monitoring'; btn.disabled=false;
+  btn.disabled = true;
+  let succeeded = 0, failed = 0;
+
+  for (let i = 0; i < entries.length; i++) {
+    btn.textContent = entries.length > 1 ? `Adding ${i + 1}/${entries.length}…` : 'Adding…';
+    const { address, label: lineLabel, balance: lineBal } = entries[i];
+    // label priority: per-line label > modal label field > auto from address
+    const label = lineLabel || (entries.length === 1 ? labelFld : '') || address.slice(2, 10);
+    const start_balance = lineBal || defaultBal || null;
+    try {
+      const r = await fetch('/api/add-wallet', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ address, label, start_balance }),
+      });
+      const d = await r.json();
+      if (d.ok) succeeded++; else failed++;
+    } catch { failed++; }
   }
+
+  closeModal();
+  const sub = failed > 0 ? `${failed} already monitored or invalid` : '';
+  showToast(
+    succeeded === 1 ? 'Wallet added' : `${succeeded} wallet${succeeded !== 1 ? 's' : ''} added`,
+    sub, '✓'
+  );
 }
 
 // ── SocketIO events ────────────────────────────────────────────────────────
@@ -671,7 +1165,8 @@ socket.on('state_update', s => {
   const isNew = !state[s.address];
   state[s.address] = {...(state[s.address]||{}), ...s};
   if (isNew) {
-    if (!activeWallet) activeWallet = s.address;
+    if (!activeWallet && !compareMode) activeWallet = s.address;
+    if (compareMode) compareSelection.add(s.address);
     loadHistory(s.address).then(()=>rebuildChart());
     loadTrades(s.address);
     loadStats(s.address);
@@ -679,6 +1174,7 @@ socket.on('state_update', s => {
   renderSidebar();
   renderKpis();
   renderPositions();
+  if (compareMode) renderComparePanel();
 });
 
 socket.on('fill', f => {
@@ -703,18 +1199,39 @@ socket.on('position_close', d => {
 });
 
 socket.on('wallet_removed', d => {
-  const addr = d.address;
+  const addr    = d.address;
+  const wasActive = !compareMode && activeWallet === addr;
   delete state[addr];
   delete statsCache[addr];
+  compareSelection.delete(addr);
   if (activeWallet === addr) activeWallet = Object.keys(state)[0] || null;
   renderSidebar();
   renderKpis();
   renderPositions();
   rebuildChart();
+  if (compareMode) renderComparePanel();
+  if (wasActive) {
+    // Clear all tearsheet charts and load next wallet's stats
+    [pnlChart, winRateChart, symPnlChart, histChart, sharpeSeriesChart, underwaterChart]
+      .forEach(c => { if (c) c.destroy(); });
+    pnlChart = winRateChart = symPnlChart = histChart = sharpeSeriesChart = underwaterChart = null;
+    document.getElementById('stats-title').textContent = 'Tearsheet';
+    document.getElementById('stats-content').innerHTML = activeWallet
+      ? '<div class="no-stats">Loading…</div>'
+      : '<div class="no-stats">Select a wallet to see<br>performance stats</div>';
+    if (activeWallet) { loadTrades(activeWallet); loadStats(activeWallet); }
+  }
 });
 
 socket.on('clear', async d => {
   const addr = d && d.address;
+
+  // Destroy all chart instances so stale data never bleeds through after a reset
+  function _destroyCharts() {
+    [pnlChart, winRateChart, symPnlChart, histChart, sharpeSeriesChart, underwaterChart]
+      .forEach(c => { if (c) c.destroy(); });
+    pnlChart = winRateChart = symPnlChart = histChart = sharpeSeriesChart = underwaterChart = null;
+  }
 
   if (addr && state[addr]) {
     // Per-wallet reset.
@@ -724,7 +1241,7 @@ socket.on('clear', async d => {
     // authoritative — no stale periodic-snapshot rows can survive.
     state[addr]._history = [];
     delete statsCache[addr];
-    if (pnlChart) { pnlChart.destroy(); pnlChart = null; }
+    _destroyCharts();
     await loadHistory(addr);
     rebuildChart();
 
@@ -752,7 +1269,7 @@ socket.on('clear', async d => {
     Object.values(state).forEach(s => { s._history = []; });
     statsCache = {};
     chart.data.datasets = []; chart.update('none');
-    if (pnlChart) { pnlChart.destroy(); pnlChart = null; }
+    _destroyCharts();
     document.getElementById('feed-body').innerHTML =
       '<tr id="feed-ph"><td colspan="7" class="no-feed">Waiting for fills…</td></tr>';
     fillCount = 0;
@@ -764,6 +1281,13 @@ socket.on('clear', async d => {
 
   renderKpis();
   renderPositions();
+});
+
+// Hide single-label field when multiple addresses are entered (DOM already loaded — script is at end of body)
+const _addrTa = document.getElementById('m-addr');
+if (_addrTa) _addrTa.addEventListener('input', () => {
+  const lf = document.getElementById('mf-lbl');
+  if (lf) lf.style.display = parseAddrLines(_addrTa.value).length > 1 ? 'none' : '';
 });
 
 // ── Init ───────────────────────────────────────────────────────────────────

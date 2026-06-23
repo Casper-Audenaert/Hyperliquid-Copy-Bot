@@ -118,7 +118,7 @@ def db_record_close(wallet_addr: str, symbol: str, realized_pnl: float):
     with DbSession(_db_engine) as db:
         rec = (db.query(TradeRecord)
                .filter_by(wallet_addr=wallet_addr, symbol=symbol)
-               .filter(TradeRecord.realized_pnl == None)
+               .filter(TradeRecord.realized_pnl.is_(None))
                .order_by(TradeRecord.id.desc())
                .first())
         if rec:
@@ -146,7 +146,7 @@ def db_get_equity_history(wallet_addr: str, hours: int = 24) -> list:
              "balance": r.balance, "upnl": r.upnl} for r in rows]
 
 
-def db_get_trades(wallet_addr: str, limit: int = 50) -> list:
+def db_get_trades(wallet_addr: str, limit: int = 200) -> list:
     with DbSession(_db_engine) as db:
         rows = (db.query(TradeRecord)
                 .filter(TradeRecord.wallet_addr == wallet_addr)

@@ -127,11 +127,7 @@ class Settings(BaseModel):
         labels_env = os.getenv('WALLET_LABELS', '')
         settings.wallet_labels = [l.strip() for l in labels_env.split(',') if l.strip()]
 
-        if not settings.target_wallet and not settings.target_wallets:
-            raise EnvironmentError(
-                "TARGET_WALLET_ADDRESS (or TARGET_WALLETS) is required. Set it in .env or as an environment variable."
-            )
-        # Ensure target_wallet is set for CLI compatibility
+        # Wallets are managed via the GUI/DB — no wallet env var required at startup
         if not settings.target_wallet and settings.target_wallets:
             settings.target_wallet = settings.target_wallets[0]
 

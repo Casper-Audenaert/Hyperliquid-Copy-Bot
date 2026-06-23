@@ -6,7 +6,7 @@ import statistics
 from collections import defaultdict, Counter
 from datetime import date
 
-from web.db import _db_engine, TradeRecord, EquitySnapshot
+from web.db import _db_engine, TradeRecord, EquitySnapshot, Wallet
 from sqlalchemy.orm import Session as DbSession
 
 
@@ -137,9 +137,107 @@ def _activity_stats(trades: list, open_positions: dict) -> dict:
     )
 
 
+def _rolling_winrate(trades: list, window: int = 50) -> list:
+    """Rolling N-trade win-rate over time. O(n) sliding window, capped at 500 pts."""
+    closed = [(t.timestamp, t.realized_pnl) for t in trades
+              if t.realized_pnl is not None and t.timestamp]
+    if len(closed) < window:
+        return []
+    wins = sum(1 for _, p in closed[:window] if p > 0)
+    result = [{"t": closed[window - 1][0].isoformat(),
+               "win_rate": round(wins / window * 100, 1)}]
+    for i in range(window, len(closed)):
+        if closed[i - window][1] > 0:
+            wins -= 1
+        if closed[i][1] > 0:
+            wins += 1
+        result.append({"t": closed[i][0].isoformat(),
+                       "win_rate": round(wins / window * 100, 1)})
+    if len(result) > 500:
+        step = max(1, len(result) // 500)
+        result = result[::step]
+    return result
+
+
+def _symbol_pnl(trades: list) -> list:
+    """Per-symbol realized PnL totals, largest absolute first (max 15)."""
+    pnl_map: dict = defaultdict(float)
+    cnt_map: Counter = Counter()
+    for t in trades:
+        if t.realized_pnl is not None:
+            pnl_map[t.symbol] += t.realized_pnl
+            cnt_map[t.symbol] += 1
+    items = [{"symbol": s, "pnl": round(v, 2), "count": cnt_map[s]}
+             for s, v in pnl_map.items()]
+    return sorted(items, key=lambda x: abs(x["pnl"]), reverse=True)[:15]
+
+
+def _pnl_histogram(closed_pnls: list, buckets: int = 20) -> list:
+    """Bucket trade PnLs into equal-width bins. Returns only non-empty buckets."""
+    if len(closed_pnls) < 5:
+        return []
+    lo, hi = min(closed_pnls), max(closed_pnls)
+    if lo == hi:
+        return [{"label": round(lo, 1), "count": len(closed_pnls), "positive": lo >= 0}]
+    width = (hi - lo) / buckets
+    counts = [0] * buckets
+    for p in closed_pnls:
+        idx = min(int((p - lo) / width), buckets - 1)
+        counts[idx] += 1
+    return [{"label": round(lo + i * width, 1), "count": c,
+             "positive": (lo + i * width) >= 0}
+            for i, c in enumerate(counts) if c > 0]
+
+
+def _rolling_sharpe_series(equity_rows: list, window_days: int = 7) -> list:
+    """Rolling N-day Sharpe from daily equity snapshots."""
+    if len(equity_rows) < 2:
+        return []
+    daily: dict = {}
+    for r in equity_rows:
+        daily[r.timestamp.date()] = r.equity
+    days = sorted(daily.items())
+    if len(days) < window_days + 1:
+        return []
+    rets = [(days[i][0], (days[i][1] - days[i - 1][1]) / days[i - 1][1] if days[i - 1][1] > 0 else 0)
+            for i in range(1, len(days))]
+    ann = 252 ** 0.5
+    result = []
+    for i in range(window_days - 1, len(rets)):
+        w = [r for _, r in rets[i - window_days + 1:i + 1]]
+        mean_r = statistics.mean(w)
+        std_r  = statistics.stdev(w) if len(w) > 1 else 0
+        sharpe = round(mean_r / std_r * ann, 2) if std_r > 0 else None
+        result.append({"t": days[i + 1][0].isoformat(), "sharpe": sharpe})
+    return result
+
+
+def _compute_score(sharpe, calmar, win_rate, rolling_sharpe_data) -> float:
+    """Composite 0-100 wallet quality score (higher = better copy candidate)."""
+    def norm(val, lo, hi):
+        if val is None:
+            return 50.0
+        return max(0.0, min(100.0, (val - lo) / (hi - lo) * 100))
+
+    sharpe_score = norm(sharpe,    -2,  3)   # -2→0, 3→100
+    calmar_score = norm(calmar,    -1,  5)   # -1→0, 5→100
+    wr_score     = norm(win_rate,  30, 70)   # 30%→0, 70%→100
+
+    if rolling_sharpe_data and len(rolling_sharpe_data) >= 3:
+        valid = [x["sharpe"] for x in rolling_sharpe_data if x.get("sharpe") is not None]
+        consistency_score = norm(-statistics.stdev(valid), -4, 0) if len(valid) >= 3 else 50.0
+    else:
+        consistency_score = 50.0
+
+    return round(sharpe_score * 0.35 + calmar_score * 0.25 +
+                 wr_score * 0.20 + consistency_score * 0.20, 1)
+
+
 def compute_stats(wallet_addr: str, open_positions: dict = None) -> dict:
     """Return the full stats dict for one wallet."""
     with DbSession(_db_engine) as db:
+        wallet_row    = db.get(Wallet, wallet_addr)
+        start_balance = wallet_row.start_balance if wallet_row else None
         trades = (db.query(TradeRecord)
                   .filter(TradeRecord.wallet_addr == wallet_addr)
                   .order_by(TradeRecord.timestamp)
@@ -152,12 +250,36 @@ def compute_stats(wallet_addr: str, open_positions: dict = None) -> dict:
     closed_pnls = [t.realized_pnl for t in trades if t.realized_pnl is not None]
     equities    = [r.equity for r in equity_rows]
 
+    win_st  = _win_stats(closed_pnls)
+    dd_st   = _drawdown_stats(equities)
+    risk_st = _risk_stats(equity_rows)
+    rolling_sharpe = _rolling_sharpe_series(equity_rows)
+
+    # Calmar ratio = total return % / abs(max drawdown %)
+    if equities:
+        base = start_balance if start_balance else equities[0]
+        total_ret_pct = (equities[-1] - base) / base * 100 if base > 0 else 0
+    else:
+        total_ret_pct = 0
+    max_dd = dd_st.get("max_drawdown", 0)
+    calmar = round(total_ret_pct / abs(max_dd), 2) if max_dd and max_dd < 0 else None
+
+    score = _compute_score(
+        risk_st.get("sharpe"), calmar, win_st.get("win_rate"), rolling_sharpe
+    )
+
     return {
-        **_win_stats(closed_pnls),
+        **win_st,
         **_profit_stats(closed_pnls),
-        **_drawdown_stats(equities),
-        **_risk_stats(equity_rows),
+        **dd_st,
+        **risk_st,
         **_activity_stats(trades, open_positions),
+        "calmar":          calmar,
+        "rolling_winrate": _rolling_winrate(trades),
+        "symbol_pnl":      _symbol_pnl(trades),
+        "pnl_histogram":   _pnl_histogram(closed_pnls),
+        "rolling_sharpe":  rolling_sharpe,
+        "score":           score,
     }
 
 

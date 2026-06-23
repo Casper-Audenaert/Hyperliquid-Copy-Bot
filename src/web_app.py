@@ -76,7 +76,7 @@ def on_dash_connect():
         emit("state_update", _session_to_dict(s))
 
 
-@app.route("/")
+@app.route("/", methods=["GET", "POST"])
 def index():
     return render_template("index.html")
 
@@ -195,22 +195,17 @@ if __name__ == "__main__":
     while _loop is None or not _loop.is_running():
         time.sleep(0.05)
 
-    # 2. Prune stale equity snapshots (> 30 days)
-    prune_old_snapshots()
+    # 2. Prune equity snapshots older than 90 days (keeps full simulation history)
+    prune_old_snapshots(days=90)
 
-    # 3. Load persisted wallets; seed from .env if DB is empty
+    # 3. Load persisted wallets (added via GUI — no auto-seeding from env)
     db_wallets = list_wallets_from_db()
-    if not db_wallets:
-        for i, addr in enumerate(settings.target_wallets):
-            lbl = (settings.wallet_labels[i] if i < len(settings.wallet_labels)
-                   else f"Wallet {i + 1}")
-            add_wallet_to_db(addr.strip().lower(), lbl, settings.simulated_account_balance)
-        db_wallets = list_wallets_from_db()
 
-    for w in db_wallets:
+    for i, w in enumerate(db_wallets):
         session = _create_session(w.address, w.label, w.start_balance)
-        submit(start_session(session, _safe_emit))
-        logger.info(f"Started: {w.label} ({w.address[:10]}…)")
+        # Stagger starts by 2s each — prevents 429s when many wallets init simultaneously
+        submit(start_session(session, _safe_emit, offset_secs=i * 2))
+        logger.info(f"Queued: {w.label} ({w.address[:10]}…) [start in {i*2}s]")
 
     # 4. Drain the emit queue from a Flask-SocketIO background task
     socketio.start_background_task(_emit_worker)
