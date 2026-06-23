@@ -21,8 +21,16 @@ let showUnderwater   = false;     // toggle underwater sub-chart
 let sortCol          = 'score';
 let sortDir          = -1;        // -1 = desc
 let cmpTab           = 'leaderboard';
+let cmpCardSort      = 'return_pct';
+let hiddenStatsMetrics = new Set();
+let statsTableSort     = { key: null, dir: -1 }; // dir: -1=desc, 1=asc
 
-const PALETTE = ['#7C6CFF','#16C784','#F5A524','#F0506A','#06b6d4','#a855f7','#ff6b35'];
+const PALETTE = [
+  '#7C6CFF','#16C784','#F5A524','#F0506A',
+  '#06b6d4','#a855f7','#ff6b35','#10b981',
+  '#ec4899','#3b82f6','#84cc16','#f59e0b',
+  '#14b8a6','#fb7185','#facc15','#8b5cf6',
+];
 const clr = addr => PALETTE[Object.keys(state).indexOf(addr) % PALETTE.length] || PALETTE[0];
 
 // ── Toast ─────────────────────────────────────────────────────────────────
@@ -355,7 +363,7 @@ function renderSidebar() {
   <div class="wcard-inner">
     <div class="wc-header">
       <span class="wc-rank">#${rank+1}</span>
-      <div class="wc-dot${s.is_paused?' paused':''}"></div>
+      <div class="wc-dot${s.is_paused?' paused':''}" style="background:${s.is_paused?'var(--warn)':clr(addr)}"></div>
       <span class="wc-name" title="${addr}">${s.label}</span>
       ${score != null ? `<span class="score-pill ${scoreCls}">${score}</span>` : ''}
       <div class="wc-actions">
@@ -412,10 +420,7 @@ function toggleCombined() {
 function toggleCompare() {
   compareMode  = !compareMode;
   activeWallet = null;
-  if (compareMode) {
-    compareSelection = new Set(Object.keys(state));
-    cmpTab = 'leaderboard';
-  }
+  if (compareMode) compareSelection = new Set(Object.keys(state));
   document.getElementById('cmp-btn').classList.toggle('on', compareMode);
   document.getElementById('cmp-tabs').style.display = compareMode ? 'flex' : 'none';
   document.getElementById('combined-btn').style.display = compareMode ? '' : 'none';
@@ -425,8 +430,9 @@ function toggleCompare() {
   renderKpis();
   renderPositions();
   rebuildChart();
-  if (compareMode) renderComparePanel();
-  else {
+  if (compareMode) {
+    renderComparePanel();
+  } else {
     const cur = Object.keys(state)[0];
     if (cur) loadStats(cur);
   }
@@ -698,17 +704,94 @@ function renderStats(st) {
   if (pnlHistogram.length)   renderHistChart(pnlHistogram);
 }
 
-// ── Compare panel (tabs: leaderboard | stats | correlation) ───────────────
+// ── Compare panel — wallet stat cards ────────────────────────────────────
 function renderComparePanel() {
   if (!compareMode) return;
-  renderCmpTabs();
   document.getElementById('stats-title').textContent = 'Compare';
-  openCmpModal(cmpTab);
+  renderCmpTabs();
+  // Refresh modal content if open
+  const modal = document.getElementById('cmp-modal');
+  if (modal && modal.open) {
+    const body = document.getElementById('cmp-modal-body');
+    if (cmpTab === 'leaderboard')      renderLeaderboardInto(body);
+    else if (cmpTab === 'stats')       renderStatsTableInto(body);
+    else if (cmpTab === 'correlation') renderCorrelationInto(body);
+  }
+  const el    = document.getElementById('stats-content');
+  const addrs = Object.keys(state);
+  if (!addrs.length) { el.innerHTML = '<div class="no-stats">No wallets to compare</div>'; return; }
+
+  const sortOptions = [
+    { value: 'return_pct',   label: 'Return %' },
+    { value: 'equity',       label: 'Equity'   },
+    { value: 'score',        label: 'Score'     },
+    { value: 'win_rate',     label: 'Win Rate'  },
+    { value: 'sharpe',       label: 'Sharpe'    },
+    { value: 'max_drawdown', label: 'Max DD'    },
+  ];
+  const sortVal = addr => {
+    const s = state[addr]; const st = statsCache[addr] || {};
+    if (cmpCardSort === 'return_pct')   return s.return_pct  ?? -Infinity;
+    if (cmpCardSort === 'equity')       return s.equity      ?? -Infinity;
+    if (cmpCardSort === 'score')        return st.score      ?? -Infinity;
+    if (cmpCardSort === 'win_rate')     return s.win_rate    ?? -Infinity;
+    if (cmpCardSort === 'sharpe')       return st.sharpe     ?? -Infinity;
+    if (cmpCardSort === 'max_drawdown') return st.max_drawdown ?? -Infinity;
+    return -Infinity;
+  };
+  const sorted = [...addrs].sort((a, b) => sortVal(b) - sortVal(a));
+
+  el.innerHTML = `
+  <div class="cmp-sort-bar">
+    Sort by
+    <select onchange="cmpCardSort=this.value;renderComparePanel()">
+      ${sortOptions.map(o => `<option value="${o.value}"${cmpCardSort===o.value?' selected':''}>${o.label}</option>`).join('')}
+    </select>
+  </div>
+  <div class="cmp-cards">${sorted.map(addr => {
+    const s   = state[addr];
+    const st  = statsCache[addr] || {};
+    const col = clr(addr);
+    const ret = s.return_pct || 0;
+    const retColor = ret > 0 ? 'var(--green)' : ret < 0 ? 'var(--red)' : 'var(--t2)';
+    const sc  = st.score;
+    const scColor = sc == null ? 'var(--t2)' : sc >= 70 ? 'var(--green)' : sc >= 50 ? 'var(--brand)' : 'var(--red)';
+    const sh  = st.sharpe;
+    const shColor = sh == null ? 'var(--t2)' : sh > 1 ? 'var(--green)' : sh > 0 ? 'var(--warn)' : 'var(--red)';
+    const dd  = st.max_drawdown;
+    const ddColor = dd != null && dd < -10 ? 'var(--red)' : 'var(--t2)';
+    const wr  = s.win_rate;
+    return `<div class="cmp-card" onclick="selectWallet('${addr}')">
+      <div class="cmp-card-top">
+        <div class="cmp-card-dot" style="background:${col}"></div>
+        <div class="cmp-card-name" title="${s.label}">${s.label}</div>
+        ${sc != null ? `<div class="cmp-card-score" style="color:${scColor}">${sc}</div>` : ''}
+      </div>
+      <div class="cmp-card-eq">${fUsd(s.equity)}</div>
+      <div class="cmp-card-ret" style="color:${retColor}">${ret >= 0 ? '+' : ''}${ret.toFixed(2)}%</div>
+      <div class="cmp-card-metrics">
+        <div class="cmp-card-m">
+          <div class="cmp-card-mlbl">Win%</div>
+          <div class="cmp-card-mval">${wr != null ? wr + '%' : '—'}</div>
+        </div>
+        <div class="cmp-card-m">
+          <div class="cmp-card-mlbl">Sharpe</div>
+          <div class="cmp-card-mval" style="color:${shColor}">${sh ?? '—'}</div>
+        </div>
+        <div class="cmp-card-m">
+          <div class="cmp-card-mlbl">Max DD</div>
+          <div class="cmp-card-mval" style="color:${ddColor}">${dd != null ? dd + '%' : '—'}</div>
+        </div>
+      </div>
+    </div>`;
+  }).join('')}</div>`;
 }
 
+// ── Compare tab buttons → detail modal ────────────────────────────────────
 function renderCmpTabs() {
+  const modalOpen = document.getElementById('cmp-modal')?.open;
   document.querySelectorAll('.cmp-tab').forEach(b =>
-    b.classList.toggle('on', b.dataset.tab === cmpTab));
+    b.classList.toggle('on', !!modalOpen && b.dataset.tab === cmpTab));
 }
 
 function setCmpTab(tab) {
@@ -725,16 +808,21 @@ function openCmpModal(tab) {
   if (tab === 'leaderboard')      renderLeaderboardInto(body);
   else if (tab === 'stats')       renderStatsTableInto(body);
   else if (tab === 'correlation') renderCorrelationInto(body);
-  modal.showModal();
-  modal.onclick = e => { if (e.target === modal) closeCmpModal(); };
+  if (!modal.open) {
+    modal.showModal();
+    modal.onclick = e => { if (e.target === modal) closeCmpModal(); };
+    modal.addEventListener('close', _onCmpModalClose, { once: true });
+  }
+}
+
+function _onCmpModalClose() {
+  cmpTab = 'leaderboard';
+  renderCmpTabs();
 }
 
 function closeCmpModal() {
-  document.getElementById('cmp-modal').close();
-  cmpTab = 'leaderboard';
-  renderCmpTabs();
-  document.getElementById('stats-content').innerHTML =
-    '<div class="no-stats">Click a tab above to open Compare view</div>';
+  const modal = document.getElementById('cmp-modal');
+  if (modal.open) modal.close();
 }
 
 // -- Sortable leaderboard --
@@ -750,12 +838,8 @@ function colVal(addr, col) {
 
 function setSort(col) {
   if (sortCol === col) sortDir *= -1; else { sortCol = col; sortDir = -1; }
-  const modalBody = document.getElementById('cmp-modal-body');
-  if (modalBody && document.getElementById('cmp-modal').open) {
-    renderLeaderboardInto(modalBody);
-  } else {
-    renderLeaderboard();
-  }
+  const modal = document.getElementById('cmp-modal');
+  if (modal && modal.open) renderLeaderboardInto(document.getElementById('cmp-modal-body'));
 }
 
 function renderLeaderboardInto(el) {
@@ -812,39 +896,78 @@ function renderLeaderboardInto(el) {
 function renderLeaderboard() { renderLeaderboardInto(document.getElementById('stats-content')); }
 
 // -- Side-by-side stats table --
+const ALL_STATS_METRICS = [
+  { key: 'win_rate',           label: 'Win Rate',      fmt: v => v != null ? v + '%' : '—',   best: 'max', col: (v, b) => v===b?'var(--green)':null },
+  { key: 'sharpe',             label: 'Sharpe',        fmt: v => v != null ? v : '—',          best: 'max', col: (v, b) => v===b?'var(--green)':v!=null&&v<0?'var(--red)':null },
+  { key: 'max_drawdown',       label: 'Max DD',        fmt: v => v != null ? v + '%' : '—',   best: 'max', col: (v, b) => v===b?'var(--green)':v!=null&&v<-20?'var(--red)':null },
+  { key: 'profit_factor',      label: 'Profit Factor', fmt: v => v != null ? v + '×' : '—',   best: 'max', col: (v, b) => v===b?'var(--green)':v!=null&&v<1?'var(--red)':null },
+  { key: 'total_realized_pnl', label: 'Total PnL',     fmt: v => fUsd(v),                      best: 'max', col: (v, b) => v===b?'var(--green)':v!=null&&v<0?'var(--red)':null },
+  { key: 'expectancy',         label: 'Expectancy',    fmt: v => fUsd(v),                      best: 'max', col: (v, b) => v===b?'var(--green)':v!=null&&v<0?'var(--red)':null },
+  { key: 'avg_win',            label: 'Avg Win',       fmt: v => fUsd(v),                      best: 'max', col: (v, b) => v===b?'var(--green)':null },
+  { key: 'avg_loss',           label: 'Avg Loss',      fmt: v => fUsd(v),                      best: 'max', col: (v, b) => v===b?'var(--green)':null },
+  { key: 'volatility',         label: 'Volatility',    fmt: v => v != null ? v + '%' : '—',   best: 'min', col: () => null },
+  { key: 'total_trades',       label: 'Trades',        fmt: v => v ?? '—',                     best: 'max', col: () => null },
+];
+
+function sortStatsBy(key) {
+  if (statsTableSort.key === key) statsTableSort.dir *= -1;
+  else statsTableSort = { key, dir: -1 };
+  renderStatsTableInto(document.getElementById('cmp-modal-body'));
+}
+
+function toggleStatsMetric(key) {
+  if (hiddenStatsMetrics.has(key)) hiddenStatsMetrics.delete(key);
+  else hiddenStatsMetrics.add(key);
+  renderStatsTableInto(document.getElementById('cmp-modal-body'));
+}
+
 function renderStatsTableInto(el) {
   const addrs = [...compareSelection].filter(a => state[a]);
   if (!addrs.length) return;
-  const metrics = [
-    { key: 'win_rate',           label: 'Win Rate',       fmt: v => v != null ? v + '%' : '—',    best: 'max', col: (v, b) => v===b?'var(--green)':null },
-    { key: 'sharpe',             label: 'Sharpe',         fmt: v => v != null ? v : '—',           best: 'max', col: (v, b) => v===b?'var(--green)':v!=null&&v<0?'var(--red)':null },
-    { key: 'max_drawdown',       label: 'Max Drawdown',   fmt: v => v != null ? v + '%' : '—',     best: 'max', col: (v, b) => v===b?'var(--green)':v!=null&&v<-20?'var(--red)':null },
-    { key: 'profit_factor',      label: 'Profit Factor',  fmt: v => v != null ? v + '×' : '—',     best: 'max', col: (v, b) => v===b?'var(--green)':v!=null&&v<1?'var(--red)':null },
-    { key: 'total_realized_pnl', label: 'Total Realized', fmt: v => fUsd(v),                        best: 'max', col: (v, b) => v===b?'var(--green)':v!=null&&v<0?'var(--red)':null },
-    { key: 'expectancy',         label: 'Expectancy',     fmt: v => fUsd(v),                        best: 'max', col: (v, b) => v===b?'var(--green)':v!=null&&v<0?'var(--red)':null },
-    { key: 'avg_win',            label: 'Avg Win',        fmt: v => fUsd(v),                        best: 'max', col: (v, b) => v===b?'var(--green)':null },
-    { key: 'avg_loss',           label: 'Avg Loss',       fmt: v => fUsd(v),                        best: 'max', col: (v, b) => v===b?'var(--green)':null },
-    { key: 'volatility',         label: 'Volatility',     fmt: v => v != null ? v + '%' : '—',     best: 'min', col: () => null },
-    { key: 'total_trades',       label: 'Total Trades',   fmt: v => v ?? '—',                       best: 'max', col: () => null },
-  ];
+
+  const metrics = ALL_STATS_METRICS.filter(m => !hiddenStatsMetrics.has(m.key));
+
+  // Per-column best value (across wallets = rows)
+  const bestOf = {};
+  for (const m of metrics) {
+    const vals = addrs.map(a => statsCache[a]?.[m.key] ?? null).filter(v => v != null);
+    bestOf[m.key] = vals.length > 1 ? (m.best === 'max' ? Math.max(...vals) : Math.min(...vals)) : null;
+  }
+
+  // Sort wallet rows by selected column
+  const sorted = [...addrs].sort((a, b) => {
+    if (!statsTableSort.key) return 0;
+    const va = statsCache[a]?.[statsTableSort.key] ?? -Infinity;
+    const vb = statsCache[b]?.[statsTableSort.key] ?? -Infinity;
+    return statsTableSort.dir * (vb - va);
+  });
+
+  const arrow = key => statsTableSort.key === key ? (statsTableSort.dir < 0 ? ' ▼' : ' ▲') : '';
 
   el.innerHTML = `
-  <div style="overflow-x:auto">
+  <div class="stats-filter-bar">
+    ${ALL_STATS_METRICS.map(m =>
+      `<button class="stats-chip${hiddenStatsMetrics.has(m.key) ? '' : ' on'}" onclick="toggleStatsMetric('${m.key}')">${m.label}</button>`
+    ).join('')}
+  </div>
+  <div style="overflow-x:auto;margin-top:10px">
   <table class="cmp-stats-tbl">
     <thead><tr>
-      <th>Metric</th>
-      ${addrs.map(a => `<th><span class="lb-swatch" style="background:${clr(a)}"></span>${state[a].label}</th>`).join('')}
+      <th style="text-align:left;min-width:110px">Wallet</th>
+      ${metrics.map(m => `<th class="sortable" onclick="sortStatsBy('${m.key}')" style="cursor:pointer;user-select:none">${m.label}${arrow(m.key)}</th>`).join('')}
     </tr></thead>
     <tbody>
-      ${metrics.map(m => {
-        const vals = addrs.map(a => statsCache[a]?.[m.key] ?? null);
-        const numVals = vals.filter(v => v != null);
-        const best = numVals.length ? (m.best === 'max' ? Math.max(...numVals) : Math.min(...numVals)) : null;
+      ${sorted.map(addr => {
+        const s  = state[addr];
+        const st = statsCache[addr] || {};
         return `<tr>
-          <td class="metric-lbl">${m.label}</td>
-          ${vals.map(v => {
-            const isBest = v != null && v === best && numVals.length > 1;
-            const cellCol = m.col(v, best);
+          <td style="text-align:left;white-space:nowrap;cursor:pointer" title="Open tearsheet" onclick="closeCmpModal();selectWallet('${addr}')">
+            <span class="lb-swatch" style="background:${clr(addr)}"></span><span style="border-bottom:1px dashed var(--t3)">${s.label}</span>
+          </td>
+          ${metrics.map(m => {
+            const v = st[m.key] ?? null;
+            const isBest = v != null && v === bestOf[m.key];
+            const cellCol = m.col(v, bestOf[m.key]);
             return `<td class="mono${isBest ? ' best-cell' : ''}"${cellCol ? ` style="color:${cellCol}"` : ''}>${m.fmt(v)}</td>`;
           }).join('')}
         </tr>`;

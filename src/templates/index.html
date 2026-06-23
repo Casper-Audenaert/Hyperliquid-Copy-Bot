@@ -411,12 +411,50 @@ header{
 .mf textarea{resize:vertical;min-height:72px;line-height:1.5}
 .mhint{font-size:10px;color:var(--t3);margin-top:5px;line-height:1.4}
 .mfoot{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
-/* ── Compare modal ── */
+/* ── Compare cards ── */
+.cmp-cards{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:10px;overflow-y:auto}
+.cmp-card{
+  background:var(--s2);border:1px solid var(--hr);border-radius:var(--r);
+  padding:9px 10px;cursor:pointer;transition:border-color .14s,box-shadow .14s
+}
+.cmp-card:hover{border-color:rgba(255,255,255,.16);box-shadow:0 2px 10px rgba(0,0,0,.25)}
+.cmp-card-top{display:flex;align-items:center;gap:5px;margin-bottom:3px}
+.cmp-card-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.cmp-card-name{font-size:11px;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cmp-card-score{font-size:9px;font-weight:700;padding:1px 5px;border-radius:10px;background:var(--s3);flex-shrink:0}
+.cmp-card-eq{font-size:14px;font-weight:700;font-family:var(--mono);letter-spacing:-.3px;line-height:1.2}
+.cmp-card-ret{font-size:10px;font-family:var(--mono);font-weight:600;margin-bottom:6px}
+.cmp-card-metrics{display:grid;grid-template-columns:1fr 1fr 1fr;gap:2px;padding-top:6px;border-top:1px solid var(--hr)}
+.cmp-card-m{display:flex;flex-direction:column;align-items:center;gap:1px}
+.cmp-card-mlbl{font-size:8px;color:var(--t3);text-transform:uppercase;letter-spacing:.5px}
+.cmp-card-mval{font-size:10px;font-family:var(--mono);font-weight:600}
+/* ── Compare sort bar ── */
+.cmp-sort-bar{
+  display:flex;align-items:center;gap:6px;padding:8px 10px 0;flex-shrink:0;
+  font-size:10px;color:var(--t3)
+}
+.cmp-sort-bar select{
+  background:var(--s2);border:1px solid var(--hr);border-radius:5px;
+  color:var(--t1);font-size:10px;font-family:var(--font);padding:3px 6px;cursor:pointer;outline:none
+}
+.cmp-sort-bar select:focus{border-color:var(--brand)}
+/* ── Stats metric filter chips ── */
+.stats-filter-bar{display:flex;flex-wrap:wrap;gap:5px;padding-bottom:12px;border-bottom:1px solid var(--hr)}
+.stats-chip{
+  padding:3px 10px;border-radius:20px;font-size:10px;font-weight:600;cursor:pointer;
+  border:1px solid var(--hr);background:var(--s2);color:var(--t3);
+  transition:all .12s;font-family:var(--font)
+}
+.stats-chip.on{background:var(--brand-a);border-color:var(--brand-b);color:var(--brand)}
+.stats-chip:hover:not(.on){color:var(--t1);border-color:rgba(255,255,255,.14)}
+/* ── Compare detail modal ── */
 .cmp-modal-dlg{
   width:95vw;max-height:90vh;
+  margin:auto;
   background:var(--s1);border:1px solid var(--hr);border-radius:var(--r2);
-  padding:0;color:var(--t1);overflow:hidden;display:flex;flex-direction:column
+  padding:0;color:var(--t1);overflow:hidden
 }
+.cmp-modal-dlg[open]{display:flex;flex-direction:column}
 .cmp-modal-dlg::backdrop{background:rgba(0,0,0,.65)}
 .cmp-modal-hdr{
   display:flex;align-items:center;justify-content:space-between;
@@ -518,7 +556,7 @@ header{
         <span class="badge" id="stats-badge">All time</span>
       </div>
       <div id="cmp-tabs">
-        <button class="cmp-tab on" data-tab="leaderboard" onclick="setCmpTab('leaderboard')">Leaderboard</button>
+        <button class="cmp-tab" data-tab="leaderboard" onclick="setCmpTab('leaderboard')">Leaderboard</button>
         <button class="cmp-tab"    data-tab="stats"        onclick="setCmpTab('stats')">Stats</button>
         <button class="cmp-tab"    data-tab="correlation"  onclick="setCmpTab('correlation')">Correlation</button>
       </div>
@@ -578,7 +616,7 @@ header{
   </div>
 </div>
 
-<!-- Compare modal (Stats + Correlation tabs) -->
+<!-- Compare detail modal (Leaderboard / Stats / Correlation) -->
 <dialog id="cmp-modal" class="cmp-modal-dlg">
   <div class="cmp-modal-hdr">
     <span id="cmp-modal-title" class="ptitle"></span>
