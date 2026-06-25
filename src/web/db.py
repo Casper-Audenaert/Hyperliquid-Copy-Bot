@@ -60,8 +60,10 @@ try:
     with _db_engine.connect() as conn:
         conn.execute(text("ALTER TABLE web_trades ADD COLUMN fee REAL"))
         conn.commit()
-except Exception:
-    pass  # column already exists
+except Exception as _e:
+    if "duplicate column" not in str(_e).lower() and "already exists" not in str(_e).lower():
+        import logging as _log
+        _log.getLogger(__name__).warning(f"DB migration (fee column): {_e}")
 
 
 # ── Wallet registry ───────────────────────────────────────────────────────────

@@ -104,11 +104,13 @@ def _session_to_dict(s: WalletSession) -> dict:
         total_upnl   += upnl
         total_margin += margin
 
-        # Liquidation price (HL maintenance margin ≈ 0.5% of notional)
-        _MAINT = 0.005
+        # Liquidation price — HL maintenance margin ≈ 1/(2*leverage) of notional,
+        # which approximates the tiered schedule (50x→1%, 20x→2.5%, 10x→5%, etc.).
+        # 1x positions cannot be meaningfully liquidated; return None.
         lev = max(pos.get("leverage", 1), 1)
-        if entry > 0:
-            liq_price = round(entry * (1 - 1/lev + _MAINT), 4) if is_long else round(entry * (1 + 1/lev - _MAINT), 4)
+        if entry > 0 and lev > 1:
+            _maint = 1.0 / (2.0 * lev)
+            liq_price = round(entry * (1 - 1/lev + _maint), 4) if is_long else round(entry * (1 + 1/lev - _maint), 4)
             dist_to_liq_pct = round((current_price - liq_price) / current_price * 100, 1) if is_long and current_price > 0 \
                          else round((liq_price - current_price) / current_price * 100, 1) if current_price > 0 else None
         else:
@@ -131,7 +133,10 @@ def _session_to_dict(s: WalletSession) -> dict:
     total_closed = s.wins + s.losses
     win_rate   = round(s.wins / total_closed * 100, 1) if total_closed > 0 else None
     days_running = uptime_h / 24
-    annualized_return = round(return_pct * 365 / days_running, 1) if days_running >= 1 else None
+    if days_running >= 1 and return_pct > -100:
+        annualized_return = round(((1 + return_pct / 100) ** (365 / days_running) - 1) * 100, 1)
+    else:
+        annualized_return = None
     total_attempted   = s.trades_copied_count + s.skipped_fills_count
     copy_efficiency   = round(s.trades_copied_count / total_attempted * 100, 1) if total_attempted else 100.0
 
@@ -343,14 +348,21 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
 
             pnl_realized = None
 
+            # Guard: if this is a close for a position we never tracked, skip entirely
+            # (happens when target closes a position that pre-dates our session start).
+            # Must check BEFORE the lock and fee deduction to avoid silent balance bleed.
+            if is_closing and not is_flip and symbol not in session.simulated_positions:
+                session._processed_fill_ids.add(fill_id)
+                if len(session._processed_fill_ids) > 50_000:
+                    session._processed_fill_ids.clear()
+                return
+
             async with session._state_lock:
                 session.simulated_balance -= fill_fee
                 session.total_fees_paid   += fill_fee
 
                 # ── Close / Reduce fill ──────────────────────────────────────
                 if is_closing and not is_flip:
-                    if symbol not in session.simulated_positions:
-                        return  # nothing to close on our side
                     pos       = session.simulated_positions[symbol]
                     pos_size  = abs(pos["size"])
                     close_size = min(our_size, pos_size)
@@ -514,7 +526,8 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
 
             total_margin = sum(p.get("margin_used", 0) for p in session.simulated_positions.values())
 
-            # Apply 8h funding pro-rated to this 30s tick (30s / 28800s = 1/960)
+            # HL `funding` field = current predicted 1-hour rate (not 8h).
+            # Pro-rate to this 30s tick: 1h = 3600s → 120 ticks of 30s each.
             try:
                 funding_map = await session.client.get_funding_rates()
                 for sym, pos in session.simulated_positions.items():
@@ -525,7 +538,7 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
                     if px <= 0:
                         continue
                     pos_value = abs(pos["size"]) * px
-                    charge    = pos_value * rate / 960
+                    charge    = pos_value * rate / 120  # 1h rate ÷ 120 thirty-second ticks
                     is_long   = pos.get("side", "").upper() == "LONG"
                     if is_long:
                         session.simulated_balance   -= charge
@@ -715,8 +728,9 @@ async def _reinit_session(session: WalletSession, emit_fn: Callable):
     # Those rows would contain old equity values and corrupt loadHistory on refresh.
     purge_wallet_data(session.address)
 
-    upnl = _upnl(session)
-    eq   = session.simulated_balance + upnl
+    upnl         = _upnl(session)
+    total_margin = sum(p.get("margin_used", 0) for p in session.simulated_positions.values())
+    eq           = session.simulated_balance + total_margin + upnl
     session.equity_history.append({
         "t": datetime.utcnow().isoformat(),
         "equity": round(eq, 2),

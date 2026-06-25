@@ -99,7 +99,7 @@ def _risk_stats(equity_rows: list) -> dict:
 
     mean_r = statistics.mean(rets)
     std_r  = statistics.stdev(rets) if len(rets) > 1 else 0
-    ann    = 252 ** 0.5  # trading-days annualisation
+    ann    = 365 ** 0.5  # crypto trades 365 days/year
     return dict(
         sharpe     = round(mean_r / std_r * ann, 2) if std_r > 0 else None,
         volatility = round(std_r * ann * 100, 2),
@@ -286,12 +286,13 @@ def compute_stats(wallet_addr: str, open_positions: dict = None) -> dict:
     net_pnl            = round(gross_pnl - total_fees, 2)
     avg_fee_per_trade  = round(total_fees / len(trades), 4) if trades else 0.0
     fee_pct_vol        = round(total_fees / total_volume * 100, 4) if total_volume else 0.0
-    fee_drag_pct       = round(total_fees / gross_pnl * 100, 1) if gross_pnl > 0 else None
+    fee_drag_pct       = round(total_fees / gross_pnl * 100, 1) if gross_pnl > total_fees else None
     # Minimum notional to break even on fee (e.g. $0.10 target profit / fee_rate)
     breakeven_notional = round(0.10 / settings.taker_fee_rate, 2)
     # Min capital for real HL trading — only opening fills count, HL's $10 min doesn't apply to closes
     open_notionals   = [t.notional for t in trades if t.notional and t.direction
-                        and ('open' in t.direction.lower() or 'add' in t.direction.lower())]
+                        and ('open' in t.direction.lower() or 'add' in t.direction.lower()
+                             or '>' in t.direction)]  # flip-opens count as new entries
     min_open_notional  = min(open_notionals, default=None)
     min_real_capital   = round(10.0 * start_balance / min_open_notional, 2) if (min_open_notional and start_balance) else None
 
@@ -311,7 +312,10 @@ def compute_stats(wallet_addr: str, open_positions: dict = None) -> dict:
 
     if len(equity_rows) >= 2:
         span_days = (equity_rows[-1].timestamp - equity_rows[0].timestamp).total_seconds() / 86400
-        annualized_return = round(total_ret_pct * 365 / span_days, 1) if span_days >= 1 else None
+        if span_days >= 1 and total_ret_pct > -100:
+            annualized_return = round(((1 + total_ret_pct / 100) ** (365 / span_days) - 1) * 100, 1)
+        else:
+            annualized_return = None
     else:
         annualized_return = None
 

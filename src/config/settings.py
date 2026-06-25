@@ -83,7 +83,7 @@ class Settings(BaseModel):
     log_level: str = "INFO"
     log_file: str = "./logs/trading.log"
     database_url: str = "sqlite:///./data/trading.db"
-    taker_fee_rate: float = 0.00035  # HL standard taker fee (3.5 bps); override via TAKER_FEE_RATE env
+    taker_fee_rate: float = 0.00045  # HL base taker fee Tier 0 (4.5 bps); Tier 2 = 0.00035; override via TAKER_FEE_RATE env
 
     class Config:
         env_file = '.env'
