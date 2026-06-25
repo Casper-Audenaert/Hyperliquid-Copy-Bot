@@ -450,6 +450,8 @@ function renderKpis() {
   const upnl  = sess.reduce((a,s)=>a+(s.upnl||0), 0);
   const eq    = sess.reduce((a,s)=>a+(s.equity||0), 0);
   const pnl   = sess.reduce((a,s)=>a+(s.pnl||0), 0);
+  const fees  = sess.reduce((a,s)=>a+(s.total_fees_paid||0), 0);
+  const netPnl= pnl - fees;
   const trd   = sess.reduce((a,s)=>a+(s.trades_copied_count||0), 0);
   const npos  = sess.reduce((a,s)=>a+(s.positions?.length||0), 0);
   const sb    = sess.reduce((a,s)=>a+(s.start_balance||0), 0);
@@ -465,7 +467,7 @@ function renderKpis() {
   setKpi('b', fUsd(bal),  '', null);
   setKpi('u', fUsd(upnl), fPct(upPct), upnl);
   setKpi('e', fUsd(eq),   fPct(ret)+' total return', ret);
-  setKpi('p', fUsd(pnl),  'realized', pnl);
+  setKpi('p', fUsd(pnl),  fees>0 ? `net ${fUsd(netPnl)} after fees` : 'realized', pnl);
   setKpi('w', wr!=null ? wr.toFixed(1)+'%' : '—', `${wins}W / ${losses}L`, wr!=null ? wr-50 : null);
   setKpi('t', String(trd), npos+' open position'+(npos!==1?'s':''), null);
 
@@ -528,6 +530,8 @@ function renderPositions() {
     <div class="pc-s"><span class="pc-sl">Mark</span><span class="pc-sv mono">$${fPx(mark)}</span></div>
     <div class="pc-s"><span class="pc-sl">Size</span><span class="pc-sv mono">${fNum(p.size)}</span></div>
     <div class="pc-s"><span class="pc-sl">Margin</span><span class="pc-sv mono">$${fPx(p.margin_used)}</span></div>
+    ${p.liq_price!=null?`<div class="pc-s"><span class="pc-sl">Liq</span><span class="pc-sv mono" style="color:var(--red)">$${fPx(p.liq_price)}</span></div>`:''}
+    ${p.dist_to_liq_pct!=null?`<div class="pc-s"><span class="pc-sl">Dist to Liq</span><span class="pc-sv mono" style="color:${p.dist_to_liq_pct<10?'var(--red)':p.dist_to_liq_pct<25?'var(--warn)':'var(--t2)'}">${p.dist_to_liq_pct}%</span></div>`:''}
   </div>
   <div class="pc-pnl ${pnlCls}">
     <span class="pc-pnl-l">UPNL</span>
@@ -572,7 +576,7 @@ function prependFill(f) {
     <td>${pnlH}</td>
     <td class="wlbl">${f.wallet_label||f.label||''}</td>`;
   tbody.prepend(tr);
-  while (tbody.children.length > 60) tbody.removeChild(tbody.lastChild);
+  while (tbody.children.length > 200) tbody.removeChild(tbody.lastChild);
   fillCount++;
   document.getElementById('feed-cnt').textContent = fillCount+' fill'+(fillCount!==1?'s':'');
 }
@@ -603,6 +607,7 @@ function renderStats(st) {
   const scC  = n => n==null?'var(--t2)':n>=70?'var(--green)':n>=50?'var(--brand)':'var(--red)';
 
   const pnlByDay       = st.pnl_by_day      || [];
+  const monthlyPnl     = st.monthly_pnl     || [];
   const topAssets      = st.top_assets       || [];
   const rollingWinrate = st.rolling_winrate  || [];
   const symbolPnl      = st.symbol_pnl       || [];
@@ -614,12 +619,14 @@ function renderStats(st) {
   if (symPnlChart)      { symPnlChart.destroy();      symPnlChart      = null; }
   if (histChart)        { histChart.destroy();        histChart        = null; }
   if (sharpeSeriesChart){ sharpeSeriesChart.destroy();sharpeSeriesChart= null; }
+  if (monthlyPnlChart)  { monthlyPnlChart.destroy();  monthlyPnlChart  = null; }
 
   el.innerHTML = `
     <div class="stat-section">
       <div class="stat-section-title">Performance</div>
       <div class="stat-grid">
         <div class="stat-row"><span class="stat-lbl">Score</span>${sv(st.score!=null?st.score+'/100':'—', scC(st.score))}</div>
+        <div class="stat-row"><span class="stat-lbl">Annualized Return</span>${sv(st.annualized_return!=null?st.annualized_return+'%':'—', pnlC(st.annualized_return))}</div>
         <div class="stat-row"><span class="stat-lbl">Win Rate</span>${sv(st.win_rate!=null?st.win_rate+'%':'—', wrC(st.win_rate))}</div>
         <div class="stat-row"><span class="stat-lbl">Record</span>${sv((st.wins||0)+'W / '+(st.losses||0)+'L','var(--t2)')}</div>
         <div class="stat-row"><span class="stat-lbl">Profit Factor</span>${sv(st.profit_factor!=null?st.profit_factor+'×':'—', pfC(st.profit_factor))}</div>
@@ -651,7 +658,27 @@ function renderStats(st) {
         <div class="stat-row"><span class="stat-lbl">Avg Leverage</span>${sv((st.avg_leverage||0)+'×','var(--t2)')}</div>
         <div class="stat-row"><span class="stat-lbl">Exposure</span>${sv(fUsd(st.current_exposure),'var(--t2)')}</div>
         <div class="stat-row"><span class="stat-lbl">Avg Trade</span>${sv(fUsd(st.avg_trade), pnlC(st.avg_trade))}</div>
+        <div class="stat-row"><span class="stat-lbl">Win Streak</span>${sv(st.longest_win_streak||0,'var(--green)')}</div>
+        <div class="stat-row"><span class="stat-lbl">Loss Streak</span>${sv(st.longest_loss_streak||0,'var(--red)')}</div>
+        <div class="stat-row" title="% of target fills that passed the dust guard and were copied"><span class="stat-lbl">Copy Efficiency</span>${sv((state[activeWallet||Object.keys(state)[0]]?.copy_efficiency_pct??'—')+'%','var(--t2)')}</div>
+        <div class="stat-row" title="Minimum capital to execute all simulated trades on real HL ($10 min order size)"><span class="stat-lbl">Min. Real Capital</span>${sv(st.min_real_capital!=null?fUsd(st.min_real_capital):'—','var(--warn)')}</div>
       </div>
+    </div>
+
+    <div class="stat-section">
+      <div class="stat-section-title">Fees (HL Taker)</div>
+      <div class="stat-grid">
+        <div class="stat-row"><span class="stat-lbl">Taker Fees Paid</span>${sv(fUsd(st.total_fees),'var(--red)')}</div>
+        ${(()=>{const fp=state[activeWallet||Object.keys(state)[0]]?.total_funding_paid??0;return fp!==0?`<div class="stat-row"><span class="stat-lbl">Funding ${fp>0?'Paid':'Earned'}</span>${sv(fUsd(Math.abs(fp)),fp>0?'var(--red)':'var(--green)')}</div>`:'';})()}
+        <div class="stat-row"><span class="stat-lbl">Gross PnL</span>${sv(fUsd(st.gross_realized_pnl), pnlC(st.gross_realized_pnl))}</div>
+        <div class="stat-row"><span class="stat-lbl">Net PnL (fees+funding)</span>${sv(fUsd(st.net_realized_pnl), pnlC(st.net_realized_pnl))}</div>
+        <div class="stat-row"><span class="stat-lbl">Avg Fee / Trade</span>${sv(fUsd(st.avg_fee_per_trade),'var(--red)')}</div>
+        <div class="stat-row"><span class="stat-lbl">Total Volume</span>${sv(fUsd(st.total_volume),'var(--t2)')}</div>
+        <div class="stat-row"><span class="stat-lbl">Fee % of Volume</span>${sv(st.fee_pct_vol!=null?st.fee_pct_vol+'%':'—','var(--t2)')}</div>
+        ${st.fee_drag_pct!=null?`<div class="stat-row"><span class="stat-lbl">Fee Drag</span>${sv(st.fee_drag_pct+'% of gross profit','var(--red)')}</div>`:''}
+        <div class="stat-row" title="Minimum fill notional needed so the expected price move covers the fee"><span class="stat-lbl">Break-even Size</span>${sv(st.breakeven_notional!=null?fUsd(st.breakeven_notional)+' notional':'—','var(--t2)')}</div>
+      </div>
+      <div style="font-size:10px;color:var(--t3);margin-top:4px">* Funding applied pro-rated every 30s from live HL rates. Slippage not modeled.</div>
     </div>
 
     ${topAssets.length ? `
@@ -670,6 +697,12 @@ function renderStats(st) {
     <div class="pnl-chart-section">
       <div class="stat-section-title">Daily PnL</div>
       <div class="pnl-chart-wrap"><canvas id="pnl-chart"></canvas></div>
+    </div>` : ''}
+
+    ${monthlyPnl.length > 1 ? `
+    <div class="pnl-chart-section">
+      <div class="stat-section-title">Monthly PnL</div>
+      <div class="pnl-chart-wrap"><canvas id="monthly-pnl-chart"></canvas></div>
     </div>` : ''}
 
     ${rollingWinrate.length ? `
@@ -697,8 +730,9 @@ function renderStats(st) {
     </div>` : ''}
   `;
 
-  if (pnlByDay.length)       renderPnlChart(pnlByDay);
-  if (rollingWinrate.length) renderWinRateChart(rollingWinrate);
+  if (pnlByDay.length)         renderPnlChart(pnlByDay);
+  if (monthlyPnl.length > 1)  renderMonthlyPnlChart(monthlyPnl);
+  if (rollingWinrate.length)   renderWinRateChart(rollingWinrate);
   if (rollingSharp.length)   renderSharpSeriesChart(rollingSharp);
   if (symbolPnl.length)      renderSymPnlChart(symbolPnl);
   if (pnlHistogram.length)   renderHistChart(pnlHistogram);
@@ -1044,6 +1078,35 @@ function renderPnlChart(data) {
       }},
       scales: {
         x:{ ticks:{color:c.t3,font:{size:9}}, grid:{display:false}, border:{color:c.hr} },
+        y:{ ticks:{color:c.t3,font:{size:9},callback:v=>'$'+v.toLocaleString()}, grid:{color:c.hr+'88'}, border:{color:c.hr} }
+      }
+    }
+  });
+}
+
+let monthlyPnlChart = null;
+function renderMonthlyPnlChart(data) {
+  const ctx = document.getElementById('monthly-pnl-chart');
+  if (!ctx) return;
+  if (monthlyPnlChart) { monthlyPnlChart.destroy(); monthlyPnlChart = null; }
+  const c = chartColors();
+  monthlyPnlChart = new Chart(ctx.getContext('2d'), {
+    type: 'bar',
+    data: {
+      labels: data.map(d=>d.month),
+      datasets: [{ data: data.map(d=>d.pnl),
+        backgroundColor: data.map(d=>d.pnl>=0?'rgba(22,199,132,0.75)':'rgba(240,80,106,0.75)'),
+        borderRadius: 4 }]
+    },
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false,
+      plugins: { legend:{display:false}, tooltip:{
+        backgroundColor:c.s1, borderColor:c.hr, borderWidth:1,
+        titleColor:c.t1, bodyColor:c.t2,
+        callbacks:{ label: ctx=>` ${fUsd(ctx.parsed.y)}` }
+      }},
+      scales: {
+        x:{ ticks:{color:c.t3,font:{size:10}}, grid:{display:false}, border:{color:c.hr} },
         y:{ ticks:{color:c.t3,font:{size:9},callback:v=>'$'+v.toLocaleString()}, grid:{color:c.hr+'88'}, border:{color:c.hr} }
       }
     }

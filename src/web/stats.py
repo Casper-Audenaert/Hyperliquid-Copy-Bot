@@ -8,6 +8,7 @@ from datetime import date
 
 from web.db import _db_engine, TradeRecord, EquitySnapshot, Wallet
 from sqlalchemy.orm import Session as DbSession
+from config.settings import settings
 
 
 def _win_stats(closed_pnls: list) -> dict:
@@ -128,13 +129,16 @@ def _activity_stats(trades: list, open_positions: dict) -> dict:
     levs = [t.leverage for t in trades if t.leverage]
     avg_leverage = round(sum(levs) / len(levs), 1) if levs else 0
 
-    # Longest winning streak
-    streak = best_streak = 0
+    # Longest winning + losing streaks
+    streak = best_streak = loss_streak = best_loss_streak = 0
     for p in closed_pnls:
         if p > 0:
             streak += 1
             best_streak = max(best_streak, streak)
+            loss_streak = 0
         else:
+            loss_streak += 1
+            best_loss_streak = max(best_loss_streak, loss_streak)
             streak = 0
 
     # Current margin exposure from open sim positions
@@ -142,12 +146,22 @@ def _activity_stats(trades: list, open_positions: dict) -> dict:
         sum(p.get("margin_used", 0) for p in (open_positions or {}).values()), 2
     )
 
+    # Monthly PnL
+    pnl_by_month: dict = defaultdict(float)
+    for t in trades:
+        if t.realized_pnl and t.timestamp:
+            pnl_by_month[t.timestamp.strftime("%Y-%m")] += t.realized_pnl
+    monthly_pnl = [{"month": k, "pnl": round(v, 2)}
+                   for k, v in sorted(pnl_by_month.items())]
+
     return dict(
-        pnl_by_day       = pnl_by_day_list,
-        top_assets       = top_assets,
-        avg_leverage     = avg_leverage,
-        longest_win_streak = best_streak,
-        current_exposure = current_exposure,
+        pnl_by_day         = pnl_by_day_list,
+        monthly_pnl        = monthly_pnl,
+        top_assets         = top_assets,
+        avg_leverage       = avg_leverage,
+        longest_win_streak  = best_streak,
+        longest_loss_streak = best_loss_streak,
+        current_exposure   = current_exposure,
     )
 
 
@@ -264,6 +278,23 @@ def compute_stats(wallet_addr: str, open_positions: dict = None) -> dict:
     closed_pnls = [t.realized_pnl for t in trades if t.realized_pnl is not None]
     equities    = [r.equity for r in equity_rows]
 
+    # ── Fee stats ──────────────────────────────────────────────────────────────
+    all_notionals      = [t.notional for t in trades if t.notional]
+    total_fees         = round(sum(t.fee for t in trades if t.fee is not None), 2)
+    total_volume       = round(sum(all_notionals), 2)
+    gross_pnl          = round(sum(closed_pnls), 2)
+    net_pnl            = round(gross_pnl - total_fees, 2)
+    avg_fee_per_trade  = round(total_fees / len(trades), 4) if trades else 0.0
+    fee_pct_vol        = round(total_fees / total_volume * 100, 4) if total_volume else 0.0
+    fee_drag_pct       = round(total_fees / gross_pnl * 100, 1) if gross_pnl > 0 else None
+    # Minimum notional to break even on fee (e.g. $0.10 target profit / fee_rate)
+    breakeven_notional = round(0.10 / settings.taker_fee_rate, 2)
+    # Min capital for real HL trading — only opening fills count, HL's $10 min doesn't apply to closes
+    open_notionals   = [t.notional for t in trades if t.notional and t.direction
+                        and ('open' in t.direction.lower() or 'add' in t.direction.lower())]
+    min_open_notional  = min(open_notionals, default=None)
+    min_real_capital   = round(10.0 * start_balance / min_open_notional, 2) if (min_open_notional and start_balance) else None
+
     win_st  = _win_stats(closed_pnls)
     dd_st   = _drawdown_stats(equities)
     risk_st = _risk_stats(equity_rows)
@@ -278,6 +309,12 @@ def compute_stats(wallet_addr: str, open_positions: dict = None) -> dict:
     max_dd = dd_st.get("max_drawdown", 0)
     calmar = round(total_ret_pct / abs(max_dd), 2) if max_dd and max_dd < 0 else None
 
+    if len(equity_rows) >= 2:
+        span_days = (equity_rows[-1].timestamp - equity_rows[0].timestamp).total_seconds() / 86400
+        annualized_return = round(total_ret_pct * 365 / span_days, 1) if span_days >= 1 else None
+    else:
+        annualized_return = None
+
     score = _compute_score(
         risk_st.get("sharpe"), calmar, win_st.get("win_rate"), rolling_sharpe
     )
@@ -288,12 +325,23 @@ def compute_stats(wallet_addr: str, open_positions: dict = None) -> dict:
         **dd_st,
         **risk_st,
         **_activity_stats(trades, open_positions),
-        "calmar":          calmar,
-        "rolling_winrate": _rolling_winrate(trades),
-        "symbol_pnl":      _symbol_pnl(trades),
-        "pnl_histogram":   _pnl_histogram(closed_pnls),
-        "rolling_sharpe":  rolling_sharpe,
-        "score":           score,
+        "calmar":             calmar,
+        "annualized_return":  annualized_return,
+        "rolling_winrate":    _rolling_winrate(trades),
+        "symbol_pnl":         _symbol_pnl(trades),
+        "pnl_histogram":      _pnl_histogram(closed_pnls),
+        "rolling_sharpe":     rolling_sharpe,
+        "score":              score,
+        # Fee stats
+        "total_fees":         total_fees,
+        "gross_realized_pnl": gross_pnl,
+        "net_realized_pnl":   net_pnl,
+        "avg_fee_per_trade":  avg_fee_per_trade,
+        "total_volume":       total_volume,
+        "fee_pct_vol":        fee_pct_vol,
+        "fee_drag_pct":       fee_drag_pct,
+        "breakeven_notional": breakeven_notional,
+        "min_real_capital":   min_real_capital,
     }
 
 

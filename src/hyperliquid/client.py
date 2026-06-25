@@ -204,6 +204,24 @@ class HyperliquidClient:
             logger.error(f"Failed to get all mids: {e}")
         return all_mids
 
+    async def get_funding_rates(self) -> Dict[str, float]:
+        """Returns {symbol: 8h_funding_rate} for all assets across all DEXs."""
+        rates: Dict[str, float] = {}
+        for dex in self.dexs:
+            try:
+                resp = await self._post(self.info_url, {"type": "metaAndAssetCtxs", "dex": dex})
+                if not resp or len(resp) < 2:
+                    continue
+                universe = resp[0].get("universe", [])
+                ctxs     = resp[1]
+                for i, asset in enumerate(universe):
+                    sym = asset.get("name", "")
+                    if sym and i < len(ctxs) and sym not in rates:
+                        rates[sym] = float(ctxs[i].get("funding", 0))
+            except Exception:
+                continue
+        return rates
+
     async def get_market_price(self, symbol: str) -> Optional[float]:
         """Get current market price for a symbol"""
         try:

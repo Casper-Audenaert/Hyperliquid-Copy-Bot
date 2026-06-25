@@ -38,6 +38,7 @@ class TradeRecord(Base):
     notional     = Column(Float)
     leverage     = Column(Integer)
     realized_pnl = Column(Float, nullable=True)
+    fee          = Column(Float, nullable=True)
     is_simulated = Column(Boolean, default=True)
     timestamp    = Column(DateTime, default=datetime.utcnow)
     fill_id      = Column(String, unique=True)
@@ -54,6 +55,13 @@ class EquitySnapshot(Base):
 
 
 Base.metadata.create_all(_db_engine)
+
+try:
+    with _db_engine.connect() as conn:
+        conn.execute(text("ALTER TABLE web_trades ADD COLUMN fee REAL"))
+        conn.commit()
+except Exception:
+    pass  # column already exists
 
 
 # ── Wallet registry ───────────────────────────────────────────────────────────
@@ -99,7 +107,8 @@ def prune_old_snapshots(days: int = 30):
 # ── Trade records ─────────────────────────────────────────────────────────────
 
 def db_record_fill(wallet_addr: str, wallet_label: str, fill_id, symbol: str,
-                   direction: str, side: str, size: float, price: float, leverage: int):
+                   direction: str, side: str, size: float, price: float, leverage: int,
+                   fee: float = 0.0):
     notional = size * price
     with DbSession(_db_engine) as db:
         if db.query(TradeRecord).filter_by(fill_id=str(fill_id)).first():
@@ -108,7 +117,7 @@ def db_record_fill(wallet_addr: str, wallet_label: str, fill_id, symbol: str,
             wallet_addr=wallet_addr, wallet_label=wallet_label,
             symbol=symbol, side=side, direction=direction,
             size=size, price=price, notional=notional,
-            leverage=int(leverage), is_simulated=True, fill_id=str(fill_id),
+            leverage=int(leverage), fee=fee, is_simulated=True, fill_id=str(fill_id),
         ))
         db.commit()
 

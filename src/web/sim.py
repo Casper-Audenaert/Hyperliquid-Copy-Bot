@@ -5,6 +5,7 @@ Design decisions baked in:
   • copy_ratio stored per-session (not a global) — prevents cross-wallet ratio bleed
   • Fixed ratio sizing (target_notional * ratio) — no drift as free balance shrinks
   • $0.01 dust guard only, no $10 minimum — sim doesn't have Hyperliquid order minimums
+  • Taker fee deducted from balance on every fill via settings.taker_fee_rate (double for flips)
   • Positions seeded at current mark price ("copy from now")
   • on_new_position is a no-op — fills are the authoritative copy signal
   • Close/reduce fills realize PnL at fill price (not a snapshot price)
@@ -51,7 +52,10 @@ class WalletSession:
     simulated_balance: float = 10_000.0
     start_balance: float = 10_000.0
     simulated_positions: dict = field(default_factory=dict)
-    simulated_pnl: float = 0.0       # cumulative realized PnL
+    simulated_pnl: float = 0.0        # cumulative realized PnL (gross, pre-fee)
+    total_fees_paid: float = 0.0      # cumulative taker fees deducted from balance
+    total_funding_paid: float = 0.0   # cumulative funding charges (positive = paid, negative = earned)
+    skipped_fills_count: int = 0      # fills skipped by dust guard (for copy efficiency)
     wins: int = 0
     losses: int = 0
     equity_history: list = field(default_factory=list)
@@ -99,11 +103,23 @@ def _session_to_dict(s: WalletSession) -> dict:
         margin  = pos.get("margin_used", 0)
         total_upnl   += upnl
         total_margin += margin
+
+        # Liquidation price (HL maintenance margin ≈ 0.5% of notional)
+        _MAINT = 0.005
+        lev = max(pos.get("leverage", 1), 1)
+        if entry > 0:
+            liq_price = round(entry * (1 - 1/lev + _MAINT), 4) if is_long else round(entry * (1 + 1/lev - _MAINT), 4)
+            dist_to_liq_pct = round((current_price - liq_price) / current_price * 100, 1) if is_long and current_price > 0 \
+                         else round((liq_price - current_price) / current_price * 100, 1) if current_price > 0 else None
+        else:
+            liq_price = dist_to_liq_pct = None
+
         positions.append({
             "symbol": sym, "side": pos.get("side", "LONG"),
             "size": size, "entry_price": entry, "current_price": current_price,
             "leverage": pos.get("leverage", 1), "value": val,
             "margin_used": margin, "upnl": round(upnl, 4), "pnl_pct": round(pnl_pct, 2),
+            "liq_price": liq_price, "dist_to_liq_pct": dist_to_liq_pct,
         })
 
     # equity = free_cash + locked_margin + unrealized_pnl
@@ -114,23 +130,33 @@ def _session_to_dict(s: WalletSession) -> dict:
     uptime_h   = (datetime.now() - s.bot_start_time).total_seconds() / 3600 if s.bot_start_time else 0
     total_closed = s.wins + s.losses
     win_rate   = round(s.wins / total_closed * 100, 1) if total_closed > 0 else None
+    days_running = uptime_h / 24
+    annualized_return = round(return_pct * 365 / days_running, 1) if days_running >= 1 else None
+    total_attempted   = s.trades_copied_count + s.skipped_fills_count
+    copy_efficiency   = round(s.trades_copied_count / total_attempted * 100, 1) if total_attempted else 100.0
 
     return {
         "address": s.address, "label": s.label,
         "is_paused": s.is_paused,
         "trades_copied_count": s.trades_copied_count,
+        "skipped_fills_count": s.skipped_fills_count,
+        "copy_efficiency_pct": copy_efficiency,
         "balance": round(s.simulated_balance, 2),
         "start_balance": round(s.start_balance, 2),
         "upnl": round(total_upnl, 2),
         "equity": round(equity, 2),
         "pnl": round(s.simulated_pnl, 2),
         "return_pct": round(return_pct, 2),
+        "annualized_return": annualized_return,
         "uptime_h": round(uptime_h, 2),
         "positions": positions,
         "total_margin": round(total_margin, 2),
         "copy_ratio": s.copy_ratio,
         # compact stats available without an extra API call
         "wins": s.wins, "losses": s.losses, "win_rate": win_rate,
+        "total_fees_paid": round(s.total_fees_paid, 4),
+        "total_funding_paid": round(s.total_funding_paid, 4),
+        "net_pnl": round(s.simulated_pnl - s.total_fees_paid - s.total_funding_paid, 2),
     }
 
 
@@ -292,7 +318,12 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
             our_notional = our_size * price
 
             if our_notional < DUST_GUARD:
+                session.skipped_fills_count += 1
                 return
+
+            # Taker fee — double for flips (close old + open new = 2 fills on HL)
+            is_flip_check = ">" in direction
+            fill_fee = our_notional * settings.taker_fee_rate * (2 if is_flip_check else 1)
 
             # Leverage from target's current position
             target_leverage = 1.0
@@ -313,6 +344,8 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
             pnl_realized = None
 
             async with session._state_lock:
+                session.simulated_balance -= fill_fee
+                session.total_fees_paid   += fill_fee
 
                 # ── Close / Reduce fill ──────────────────────────────────────
                 if is_closing and not is_flip:
@@ -344,7 +377,8 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
                         pos["value"]       = new_size * entry
 
                     db_record_fill(session.address, session.label, fill_id, symbol,
-                                   direction, position_side.value, close_size, price, our_leverage)
+                                   direction, position_side.value, close_size, price, our_leverage,
+                                   fee=fill_fee)
                     db_record_close(session.address, symbol, pnl)
                     session._processed_fill_ids.add(fill_id)
                     if len(session._processed_fill_ids) > 50_000:
@@ -400,7 +434,8 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
                     session.simulated_balance -= margin_req
 
                     db_record_fill(session.address, session.label, fill_id, symbol,
-                                   direction, position_side.value, our_size, price, our_leverage)
+                                   direction, position_side.value, our_size, price, our_leverage,
+                                   fee=fill_fee)
                     session._processed_fill_ids.add(fill_id)
                     if len(session._processed_fill_ids) > 50_000:
                         session._processed_fill_ids.clear()
@@ -478,6 +513,29 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
                                else size * (entry - px))
 
             total_margin = sum(p.get("margin_used", 0) for p in session.simulated_positions.values())
+
+            # Apply 8h funding pro-rated to this 30s tick (30s / 28800s = 1/960)
+            try:
+                funding_map = await session.client.get_funding_rates()
+                for sym, pos in session.simulated_positions.items():
+                    rate = funding_map.get(sym, 0)
+                    if rate == 0:
+                        continue
+                    px = price_map.get(sym, 0)
+                    if px <= 0:
+                        continue
+                    pos_value = abs(pos["size"]) * px
+                    charge    = pos_value * rate / 960
+                    is_long   = pos.get("side", "").upper() == "LONG"
+                    if is_long:
+                        session.simulated_balance   -= charge
+                        session.total_funding_paid  += charge
+                    else:
+                        session.simulated_balance   += charge
+                        session.total_funding_paid  -= charge
+            except Exception as e:
+                logger.warning(f"[{session.label}] funding rate fetch failed, skipping: {e}")
+
             equity = session.simulated_balance + total_margin + total_upnl
             db_snapshot_equity(session.address, equity, session.simulated_balance, total_upnl)
             session.equity_history.append({
