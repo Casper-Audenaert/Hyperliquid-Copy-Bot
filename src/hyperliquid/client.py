@@ -7,13 +7,14 @@ from loguru import logger
 from .models import Position, Order, UserState, PositionSide, OrderSide
 
 # Shared across ALL client instances — prevents 429s when many wallets fire simultaneously.
-# ponytail: 4 concurrent; raise to 8 if Hyperliquid increases their rate limit
+# Raised from 4→10: fill handler no longer makes REST calls, so steady-state load is much lower;
+# the semaphore now only throttles periodic state + equity snapshot calls.
 _api_sem: Optional[asyncio.Semaphore] = None
 
 def _get_sem() -> asyncio.Semaphore:
     global _api_sem
     if _api_sem is None:
-        _api_sem = asyncio.Semaphore(4)
+        _api_sem = asyncio.Semaphore(10)
     return _api_sem
 
 

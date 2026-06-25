@@ -11,6 +11,13 @@ from config.settings import settings
 os.makedirs("./data", exist_ok=True)
 _db_engine = create_engine(settings.database_url, connect_args={"check_same_thread": False})
 
+# WAL mode: prevents DB corruption on crash by using write-ahead logging.
+# Must be set per-connection; SQLAlchemy's connect event is the right hook.
+from sqlalchemy import event as _sa_event
+@_sa_event.listens_for(_db_engine, "connect")
+def _set_wal_mode(conn, _):
+    conn.execute("PRAGMA journal_mode=WAL")
+
 
 class Base(DeclarativeBase):
     pass
@@ -40,6 +47,7 @@ class TradeRecord(Base):
     realized_pnl = Column(Float, nullable=True)
     fee          = Column(Float, nullable=True)
     is_simulated = Column(Boolean, default=True)
+    is_seed      = Column(Boolean, default=False)   # True = seeded at session start, not a live copied fill
     timestamp    = Column(DateTime, default=datetime.utcnow)
     fill_id      = Column(String, unique=True)
 
@@ -64,6 +72,15 @@ except Exception as _e:
     if "duplicate column" not in str(_e).lower() and "already exists" not in str(_e).lower():
         import logging as _log
         _log.getLogger(__name__).warning(f"DB migration (fee column): {_e}")
+
+try:
+    with _db_engine.connect() as conn:
+        conn.execute(text("ALTER TABLE web_trades ADD COLUMN is_seed INTEGER DEFAULT 0"))
+        conn.commit()
+except Exception as _e:
+    if "duplicate column" not in str(_e).lower() and "already exists" not in str(_e).lower():
+        import logging as _log
+        _log.getLogger(__name__).warning(f"DB migration (is_seed column): {_e}")
 
 
 # ── Wallet registry ───────────────────────────────────────────────────────────
@@ -110,7 +127,7 @@ def prune_old_snapshots(days: int = 30):
 
 def db_record_fill(wallet_addr: str, wallet_label: str, fill_id, symbol: str,
                    direction: str, side: str, size: float, price: float, leverage: int,
-                   fee: float = 0.0):
+                   fee: float = 0.0, is_seed: bool = False):
     notional = size * price
     with DbSession(_db_engine) as db:
         if db.query(TradeRecord).filter_by(fill_id=str(fill_id)).first():
@@ -119,7 +136,8 @@ def db_record_fill(wallet_addr: str, wallet_label: str, fill_id, symbol: str,
             wallet_addr=wallet_addr, wallet_label=wallet_label,
             symbol=symbol, side=side, direction=direction,
             size=size, price=price, notional=notional,
-            leverage=int(leverage), fee=fee, is_simulated=True, fill_id=str(fill_id),
+            leverage=int(leverage), fee=fee, is_simulated=True,
+            is_seed=is_seed, fill_id=str(fill_id),
         ))
         db.commit()
 
@@ -157,13 +175,24 @@ def db_get_equity_history(wallet_addr: str, hours: int = 24) -> list:
              "balance": r.balance, "upnl": r.upnl} for r in rows]
 
 
-def db_get_trades(wallet_addr: str, limit: int = 200) -> list:
+def db_get_trades(wallet_addr: str, limit: int = 200,
+                  from_date: str = None, to_date: str = None) -> list:
+    from datetime import datetime as _dt
     with DbSession(_db_engine) as db:
-        rows = (db.query(TradeRecord)
-                .filter(TradeRecord.wallet_addr == wallet_addr)
-                .order_by(TradeRecord.id.desc())
-                .limit(limit)
-                .all())
+        q = (db.query(TradeRecord)
+             .filter(TradeRecord.wallet_addr == wallet_addr))
+        if from_date:
+            try:
+                q = q.filter(TradeRecord.timestamp >= _dt.fromisoformat(from_date))
+            except ValueError:
+                pass
+        if to_date:
+            try:
+                q = q.filter(TradeRecord.timestamp <= _dt.fromisoformat(to_date + "T23:59:59"))
+            except ValueError:
+                pass
+        effective_limit = 2000 if (from_date or to_date) else limit
+        rows = q.order_by(TradeRecord.id.desc()).limit(effective_limit).all()
     return [{"symbol": r.symbol, "side": r.side, "direction": r.direction,
              "size": r.size, "price": r.price, "notional": r.notional,
              "leverage": r.leverage, "realized_pnl": r.realized_pnl,

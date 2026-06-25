@@ -359,13 +359,15 @@ function renderSidebar() {
     const score    = statsCache[addr]?.score;
     const scoreCls = score == null ? '' : score >= 70 ? 'good' : score >= 50 ? 'ok' : 'bad';
     const shortAddr = addr.slice(0,6) + '…' + addr.slice(-4);
+    const npnl = s.net_pnl ?? null;
+    const npnlCls = npnl == null ? 'z' : npnl > 0 ? 'pos' : npnl < 0 ? 'neg' : 'z';
     return `<div class="wcard${cardCls}" onclick="${clickFn}">
   <div class="wcard-inner">
     <div class="wc-header">
       <span class="wc-rank">#${rank+1}</span>
       <div class="wc-dot${s.is_paused?' paused':''}" style="background:${s.is_paused?'var(--warn)':clr(addr)}"></div>
       <span class="wc-name" title="${addr}">${s.label}</span>
-      ${score != null ? `<span class="score-pill ${scoreCls}">${score}</span>` : ''}
+      ${s.liquidation_risk ? `<span class="score-pill bad" title="A position is within 5% of its liquidation price">⚠ LIQ</span>` : (score != null ? `<span class="score-pill ${scoreCls}">${score}</span>` : '')}
       <div class="wc-actions">
         <button class="wc-act-btn rst" onclick="event.stopPropagation();resetWallet('${addr}')" title="Reset">⟳</button>
         <button class="wc-act-btn del" onclick="event.stopPropagation();removeWallet('${addr}')" title="Remove">✕</button>
@@ -376,6 +378,7 @@ function renderSidebar() {
     </div>
     <div class="wc-eq mono">${fUsd(eq)}</div>
     <div class="wc-ret mono ${pos?'pos':neg?'neg':'z'}">${pos?'▲':neg?'▼':'─'} ${fPct(Math.abs(ret),false)} from start</div>
+    ${npnl != null ? `<div class="wc-npnl mono ${npnlCls}" title="Realized net PnL after fees &amp; funding">${npnl>=0?'+':''}${fUsd(npnl)} net</div>` : ''}
     <div class="wc-bottom">
       <span id="spark-${addr}">${sparklineSvg(addr)}</span>
       <span class="wc-wr">${wr}</span>
@@ -431,6 +434,8 @@ function toggleCompare() {
   renderPositions();
   rebuildChart();
   if (compareMode) {
+    // Pre-fetch stats for all wallets so Decision tab is populated immediately
+    Promise.all([...compareSelection].map(addr => loadStats(addr))).then(() => renderComparePanel());
     renderComparePanel();
   } else {
     const cur = Object.keys(state)[0];
@@ -449,9 +454,9 @@ function renderKpis() {
   const bal   = sess.reduce((a,s)=>a+(s.balance||0), 0);
   const upnl  = sess.reduce((a,s)=>a+(s.upnl||0), 0);
   const eq    = sess.reduce((a,s)=>a+(s.equity||0), 0);
-  const pnl   = sess.reduce((a,s)=>a+(s.pnl||0), 0);
-  const fees  = sess.reduce((a,s)=>a+(s.total_fees_paid||0), 0);
-  const netPnl= pnl - fees;
+  const grossPnl = sess.reduce((a,s)=>a+(s.pnl||0), 0);
+  const netPnl   = sess.reduce((a,s)=>a+(s.net_pnl||0), 0);  // already deducts fees+funding
+  const fees     = sess.reduce((a,s)=>a+(s.total_fees_paid||0), 0);
   const trd   = sess.reduce((a,s)=>a+(s.trades_copied_count||0), 0);
   const npos  = sess.reduce((a,s)=>a+(s.positions?.length||0), 0);
   const sb    = sess.reduce((a,s)=>a+(s.start_balance||0), 0);
@@ -467,9 +472,10 @@ function renderKpis() {
   setKpi('b', fUsd(bal),  '', null);
   setKpi('u', fUsd(upnl), fPct(upPct), upnl);
   setKpi('e', fUsd(eq),   fPct(ret)+' total return', ret);
-  setKpi('p', fUsd(pnl),  fees>0 ? `net ${fUsd(netPnl)} after fees` : 'realized', pnl);
-  setKpi('w', wr!=null ? wr.toFixed(1)+'%' : '—', `${wins}W / ${losses}L`, wr!=null ? wr-50 : null);
-  setKpi('t', String(trd), npos+' open position'+(npos!==1?'s':''), null);
+  setKpi('p', fUsd(netPnl), grossPnl !== netPnl ? `gross ${fUsd(grossPnl)} before fees` : 'realized net', netPnl);
+  const wrColor = wr==null ? null : wr>=55 ? 1 : wr>=40 ? 0 : -1;
+  setKpi('w', wr!=null ? wr.toFixed(1)+'%' : '—', `${wins}W / ${losses}L`, wrColor);
+  setKpi('t', String(wins + losses), npos+' open position'+(npos!==1?'s':''), null);
 
   // Header
   const paused = sess.some(s=>s.is_paused);
@@ -478,6 +484,14 @@ function renderKpis() {
   document.getElementById('btn-pause').textContent = paused ? '▶ Resume' : '⏸ Pause';
 
   const uptime = Math.max(0, ...sess.map(s => s.uptime_h || 0));
+  // Auto-advance default range so users see full history after extended runs
+  if (rangeHours === 24 && uptime > 168) {       // > 7 days running → show ALL
+    rangeHours = 0;
+    document.querySelectorAll('.rp').forEach(r => r.classList.toggle('on', r.dataset.h === '0'));
+  } else if (rangeHours === 24 && uptime > 24) { // > 1 day running → show 7D
+    rangeHours = 168;
+    document.querySelectorAll('.rp').forEach(r => r.classList.toggle('on', r.dataset.h === '168'));
+  }
   const total  = Object.keys(state).length;
   const selN   = compareMode ? compareSelection.size : 0;
   document.getElementById('uptime-lbl').textContent =
@@ -595,8 +609,11 @@ async function loadStats(addr) {
 
 function renderStats(st) {
   if (!st) return;
-  const el = document.getElementById('stats-content');
-  document.getElementById('stats-title').textContent = 'Tearsheet';
+  const el   = document.getElementById('stats-content');
+  const addr = activeWallet || Object.keys(state)[0] || '';
+  document.getElementById('stats-title').innerHTML =
+    `Tearsheet <a href="/api/export/trades/${addr}" download style="font-size:10px;font-weight:400;color:var(--t3);margin-left:8px;text-decoration:none" title="Download trades CSV">⬇ trades</a>` +
+    `<a href="/api/export/equity/${addr}" download style="font-size:10px;font-weight:400;color:var(--t3);margin-left:6px;text-decoration:none" title="Download equity CSV">⬇ equity</a>`;
 
   const sv   = (val, col) => `<span class="stat-val mono"${col?` style="color:${col}"`:''}>${val??'—'}</span>`;
   const pnlC = n => n==null?'':n>0?'var(--green)':n<0?'var(--red)':'var(--t2)';
@@ -606,10 +623,13 @@ function renderStats(st) {
   const shC  = n => n==null?'var(--t2)':n>1?'var(--green)':n>0?'var(--warn)':'var(--red)';
   const scC  = n => n==null?'var(--t2)':n>=70?'var(--green)':n>=50?'var(--brand)':'var(--red)';
 
-  const pnlByDay       = st.pnl_by_day      || [];
-  const monthlyPnl     = st.monthly_pnl     || [];
-  const topAssets      = st.top_assets       || [];
-  const rollingWinrate = st.rolling_winrate  || [];
+  const pnlByDay         = st.pnl_by_day           || [];
+  const monthlyPnl       = st.monthly_pnl           || [];
+  const weeklyPnl        = st.weekly_pnl            || [];
+  const dailyTradeCounts = st.daily_trade_counts    || [];
+  const topAssets        = st.top_assets             || [];
+  const symbolStats      = st.symbol_stats           || [];
+  const rollingWinrate   = st.rolling_winrate        || [];
   const symbolPnl      = st.symbol_pnl       || [];
   const pnlHistogram   = st.pnl_histogram    || [];
   const rollingSharp   = st.rolling_sharpe   || [];
@@ -647,7 +667,9 @@ function renderStats(st) {
         <div class="stat-row"><span class="stat-lbl">Sharpe</span>${sv(st.sharpe??'—', shC(st.sharpe))}</div>
         <div class="stat-row"><span class="stat-lbl">Calmar</span>${sv(st.calmar!=null?st.calmar+'×':'—', shC(st.calmar))}</div>
         <div class="stat-row"><span class="stat-lbl">Volatility</span>${sv(st.volatility!=null?st.volatility+'%':'—','var(--t2)')}</div>
-        <div class="stat-row"><span class="stat-lbl">Win Streak</span>${sv(st.longest_win_streak||0,'var(--t2)')}</div>
+        <div class="stat-row" title="Gross profit / gross loss — above 1.0 means wins outweigh losses in dollar terms"><span class="stat-lbl">Profit Factor</span>${sv(st.profit_factor!=null?st.profit_factor+'×':'—', st.profit_factor!=null?(st.profit_factor>=1?'var(--green)':'var(--red)'):'var(--t2)')}</div>
+        ${st.max_drawdown_duration_days!=null?`<div class="stat-row" title="Days from equity peak to the worst trough (how long the drawdown lasted)"><span class="stat-lbl">DD Duration</span>${sv(st.max_drawdown_duration_days+'d','var(--red)')}</div>`:''}
+        ${st.max_loss_streak_days>0?`<div class="stat-row" title="Longest run of consecutive calendar days with negative PnL"><span class="stat-lbl">Max Loss Streak</span>${sv(st.max_loss_streak_days+' days','var(--red)')}</div>`:''}
       </div>
     </div>
 
@@ -660,10 +682,52 @@ function renderStats(st) {
         <div class="stat-row"><span class="stat-lbl">Avg Trade</span>${sv(fUsd(st.avg_trade), pnlC(st.avg_trade))}</div>
         <div class="stat-row"><span class="stat-lbl">Win Streak</span>${sv(st.longest_win_streak||0,'var(--green)')}</div>
         <div class="stat-row"><span class="stat-lbl">Loss Streak</span>${sv(st.longest_loss_streak||0,'var(--red)')}</div>
-        <div class="stat-row" title="% of target fills that passed the dust guard and were copied"><span class="stat-lbl">Copy Efficiency</span>${sv((state[activeWallet||Object.keys(state)[0]]?.copy_efficiency_pct??'—')+'%','var(--t2)')}</div>
-        <div class="stat-row" title="Minimum capital to execute all simulated trades on real HL ($10 min order size)"><span class="stat-lbl">Min. Real Capital</span>${sv(st.min_real_capital!=null?fUsd(st.min_real_capital):'—','var(--warn)')}</div>
+        <div class="stat-row" title="% of trader fills your capital could execute on real HL ($10 min notional). 100% = no skipped trades at your ratio."><span class="stat-lbl">Copy Efficiency</span>${sv((state[activeWallet||Object.keys(state)[0]]?.copy_efficiency_pct??'—')+'%','var(--t2)')}</div>
+        ${st.trades_per_day_avg!=null?`<div class="stat-row" title="Mean closed trades per trading day"><span class="stat-lbl">Trades / Day</span>${sv(st.trades_per_day_avg,'var(--t2)')}</div>`:''}
+        ${st.trades_per_day_cv!=null?`<div class="stat-row" title="Coefficient of variation of daily trade count — lower = more consistent frequency"><span class="stat-lbl">Freq. Stability</span>${sv(st.trades_per_day_cv+'% CV',st.trades_per_day_cv<30?'var(--green)':st.trades_per_day_cv<60?'var(--warn)':'var(--red)')}</div>`:''}
+        ${st.best_week?`<div class="stat-row" title="Best calendar week by PnL"><span class="stat-lbl">Best Week</span>${sv(fUsd(st.best_week.pnl)+' ('+st.best_week.week+')','var(--green)')}</div>`:''}
+        ${st.worst_week?`<div class="stat-row" title="Worst calendar week by PnL"><span class="stat-lbl">Worst Week</span>${sv(fUsd(st.worst_week.pnl)+' ('+st.worst_week.week+')','var(--red)')}</div>`:''}
+        ${st.consistency_pct!=null?`<div class="stat-row" title="% of active trading days that ended with positive PnL"><span class="stat-lbl">Consistency</span>${sv(st.consistency_pct+'%  ('+st.days_profitable+' of '+st.days_active+' days)','var(--t2)')}</div>`:''}
+        ${st.sample_confidence?`<div class="stat-row" title="Statistical confidence based on number of completed round-trips"><span class="stat-lbl">Sample Size</span>${sv(st.sample_confidence.charAt(0).toUpperCase()+st.sample_confidence.slice(1)+' ('+st.total_trades+' round-trips)',st.sample_confidence==='high'?'var(--green)':st.sample_confidence==='medium'?'var(--warn)':'var(--red)')}</div>`:''}
+        ${st.pnl_trend?`<div class="stat-row" title="W1 vs W2 PnL trend — are returns improving or declining?"><span class="stat-lbl">W1 → W2 Trend</span>${sv((st.prior_7d_pnl!=null?fUsd(st.prior_7d_pnl):'-')+' → '+(st.recent_7d_pnl!=null?fUsd(st.recent_7d_pnl):'-')+' '+(st.pnl_trend==='improving'?'↑':st.pnl_trend==='declining'?'↓':'→'),st.pnl_trend==='improving'?'var(--green)':st.pnl_trend==='declining'?'var(--red)':'var(--t2)')}</div>`:''}
       </div>
     </div>
+
+    ${st.decision ? `
+    <div class="stat-section">
+      <div class="stat-section-title">Evaluation</div>
+      <div class="stat-grid">
+        <div class="stat-row"><span class="stat-lbl">Decision</span>${sv(st.decision,st.decision==='COPY'?'var(--green)':st.decision==='MONITOR'?'var(--warn)':st.decision==='SKIP'?'var(--red)':'var(--t3)')}</div>
+      </div>
+      <ul style="margin:6px 0 0;padding-left:18px;font-size:11px;color:var(--t2)">
+        ${(st.decision_reasons||[]).map(r=>`<li>${r}</li>`).join('')}
+      </ul>
+    </div>` : ''}
+
+    ${(()=>{
+      const cb = st.capital_brackets;
+      if (!cb) return '';
+      const fRatio = r => r > 0 ? '1:'+Math.round(1/r) : '—';
+      const row = (lbl, cap, ratio, color, tip) =>
+        `<div class="stat-row" title="${tip}">
+          <span class="stat-lbl">${lbl}</span>
+          <span style="display:flex;gap:6px;align-items:baseline">
+            ${sv(fUsd(cap), color)}
+            <span style="font-size:10px;color:var(--t3)">${fRatio(ratio)}</span>
+          </span>
+        </div>`;
+      return `
+    <div class="stat-section">
+      <div class="stat-section-title">Copy Capital Guide</div>
+      <div style="font-size:10px;color:var(--t3);margin-bottom:6px">Real capital needed to mirror this trader on HL (proportional ratio). HL minimum order = $10 notional.</div>
+      <div class="stat-grid">
+        ${row('Min (floor)', cb.min, cb.ratio_min, 'var(--warn)', 'Bare minimum — smallest trade hits the $10 HL floor exactly')}
+        ${row('Suggested', cb.suggested, cb.ratio_suggested, 'var(--t1)', 'Comfortable floor — smallest trade = $50 (5× headroom)')}
+        ${row('Optimal', cb.optimal, cb.ratio_optimal, 'var(--green)', 'Good resolution — smallest trade = $100, P&L moves are meaningful')}
+        ${row('1:1 Follow', cb.one_to_one, cb.ratio_one_to_one, 'var(--brand)', 'Mirror the trader at exact scale')}
+      </div>
+    </div>`;
+    })()}
 
     <div class="stat-section">
       <div class="stat-section-title">Fees (HL Taker)</div>
@@ -672,7 +736,8 @@ function renderStats(st) {
         ${(()=>{const fp=state[activeWallet||Object.keys(state)[0]]?.total_funding_paid??0;return fp!==0?`<div class="stat-row"><span class="stat-lbl">Funding ${fp>0?'Paid':'Earned'}</span>${sv(fUsd(Math.abs(fp)),fp>0?'var(--red)':'var(--green)')}</div>`:'';})()}
         <div class="stat-row"><span class="stat-lbl">Gross PnL</span>${sv(fUsd(st.gross_realized_pnl), pnlC(st.gross_realized_pnl))}</div>
         <div class="stat-row"><span class="stat-lbl">Net PnL (fees+funding)</span>${sv(fUsd(st.net_realized_pnl), pnlC(st.net_realized_pnl))}</div>
-        <div class="stat-row"><span class="stat-lbl">Avg Fee / Trade</span>${sv(fUsd(st.avg_fee_per_trade),'var(--red)')}</div>
+        <div class="stat-row" title="Fee per individual fill (open or close)"><span class="stat-lbl">Avg Fee / Fill</span>${sv(fUsd(st.avg_fee_per_fill),'var(--red)')}</div>
+        <div class="stat-row" title="Fee per completed round-trip (open + close combined) — roughly 2× per-fill"><span class="stat-lbl">Avg Fee / Round-trip</span>${sv(fUsd(st.avg_fee_per_roundtrip),'var(--red)')}</div>
         <div class="stat-row"><span class="stat-lbl">Total Volume</span>${sv(fUsd(st.total_volume),'var(--t2)')}</div>
         <div class="stat-row"><span class="stat-lbl">Fee % of Volume</span>${sv(st.fee_pct_vol!=null?st.fee_pct_vol+'%':'—','var(--t2)')}</div>
         ${st.fee_drag_pct!=null?`<div class="stat-row"><span class="stat-lbl">Fee Drag</span>${sv(st.fee_drag_pct+'% of gross profit','var(--red)')}</div>`:''}
@@ -680,6 +745,23 @@ function renderStats(st) {
       </div>
       <div style="font-size:10px;color:var(--t3);margin-top:4px">* Funding applied pro-rated every 30s from live HL rates. Slippage not modeled.</div>
     </div>
+
+    ${symbolStats.length ? `
+    <div class="stat-section">
+      <div class="stat-section-title">Per-Symbol Win Rate</div>
+      <table style="width:100%;border-collapse:collapse;font-size:11px">
+        <thead><tr style="color:var(--t3);text-align:left">
+          <th style="padding:2px 4px">Symbol</th><th>Trades</th><th>W/L</th><th>Win%</th><th style="text-align:right">PnL</th>
+        </tr></thead>
+        <tbody>${symbolStats.map(s=>`<tr style="border-top:1px solid var(--border)">
+          <td style="padding:3px 4px;font-weight:600">${s.symbol}</td>
+          <td class="mono">${s.count}</td>
+          <td class="mono" style="color:var(--t3)">${s.wins}/${s.losses}</td>
+          <td class="mono" style="color:${s.win_rate>=50?'var(--green)':'var(--red)'}">${s.win_rate!=null?s.win_rate+'%':'—'}</td>
+          <td class="mono" style="text-align:right;color:${s.pnl>=0?'var(--green)':'var(--red)'}">${fUsd(s.pnl)}</td>
+        </tr>`).join('')}</tbody>
+      </table>
+    </div>` : ''}
 
     ${topAssets.length ? `
     <div class="top-assets-section">
@@ -693,16 +775,34 @@ function renderStats(st) {
       </div>
     </div>` : ''}
 
+    ${pnlByDay.length >= 3 ? `
+    <div class="pnl-chart-section">
+      <div class="stat-section-title">Daily PnL Calendar</div>
+      <div id="pnl-heatmap" style="overflow-x:auto;padding:4px 0">${_renderPnlHeatmap(pnlByDay)}</div>
+    </div>` : ''}
+
     ${pnlByDay.length ? `
     <div class="pnl-chart-section">
       <div class="stat-section-title">Daily PnL</div>
       <div class="pnl-chart-wrap"><canvas id="pnl-chart"></canvas></div>
     </div>` : ''}
 
+    ${weeklyPnl.length > 1 ? `
+    <div class="pnl-chart-section">
+      <div class="stat-section-title">Weekly PnL</div>
+      <div class="pnl-chart-wrap"><canvas id="weekly-pnl-chart"></canvas></div>
+    </div>` : ''}
+
     ${monthlyPnl.length > 1 ? `
     <div class="pnl-chart-section">
       <div class="stat-section-title">Monthly PnL</div>
       <div class="pnl-chart-wrap"><canvas id="monthly-pnl-chart"></canvas></div>
+    </div>` : ''}
+
+    ${dailyTradeCounts.length > 1 ? `
+    <div class="pnl-chart-section">
+      <div class="stat-section-title">Daily Trade Count</div>
+      <div class="pnl-chart-wrap" style="height:80px"><canvas id="daily-trades-chart"></canvas></div>
     </div>` : ''}
 
     ${rollingWinrate.length ? `
@@ -730,12 +830,14 @@ function renderStats(st) {
     </div>` : ''}
   `;
 
-  if (pnlByDay.length)         renderPnlChart(pnlByDay);
-  if (monthlyPnl.length > 1)  renderMonthlyPnlChart(monthlyPnl);
-  if (rollingWinrate.length)   renderWinRateChart(rollingWinrate);
-  if (rollingSharp.length)   renderSharpSeriesChart(rollingSharp);
-  if (symbolPnl.length)      renderSymPnlChart(symbolPnl);
-  if (pnlHistogram.length)   renderHistChart(pnlHistogram);
+  if (pnlByDay.length)              renderPnlChart(pnlByDay);
+  if (weeklyPnl.length > 1)        renderWeeklyPnlChart(weeklyPnl);
+  if (monthlyPnl.length > 1)       renderMonthlyPnlChart(monthlyPnl);
+  if (dailyTradeCounts.length > 1)  renderDailyTradeCountChart(dailyTradeCounts);
+  if (rollingWinrate.length)        renderWinRateChart(rollingWinrate);
+  if (rollingSharp.length)          renderSharpSeriesChart(rollingSharp);
+  if (symbolPnl.length)             renderSymPnlChart(symbolPnl);
+  if (pnlHistogram.length)          renderHistChart(pnlHistogram);
 }
 
 // ── Compare panel — wallet stat cards ────────────────────────────────────
@@ -750,6 +852,7 @@ function renderComparePanel() {
     if (cmpTab === 'leaderboard')      renderLeaderboardInto(body);
     else if (cmpTab === 'stats')       renderStatsTableInto(body);
     else if (cmpTab === 'correlation') renderCorrelationInto(body);
+    else if (cmpTab === 'decision')    renderDecisionTabInto(body);
   }
   const el    = document.getElementById('stats-content');
   const addrs = Object.keys(state);
@@ -837,11 +940,12 @@ function setCmpTab(tab) {
 function openCmpModal(tab) {
   const modal = document.getElementById('cmp-modal');
   const body  = document.getElementById('cmp-modal-body');
-  const titles = { leaderboard: 'Leaderboard', stats: 'Side-by-Side Stats', correlation: 'Return Correlation Matrix' };
+  const titles = { leaderboard: 'Leaderboard', stats: 'Side-by-Side Stats', correlation: 'Return Correlation Matrix', decision: '2-Week Evaluation — Decision Sheet' };
   document.getElementById('cmp-modal-title').textContent = titles[tab] || 'Compare';
   if (tab === 'leaderboard')      renderLeaderboardInto(body);
   else if (tab === 'stats')       renderStatsTableInto(body);
   else if (tab === 'correlation') renderCorrelationInto(body);
+  else if (tab === 'decision')    renderDecisionTabInto(body);
   if (!modal.open) {
     modal.showModal();
     modal.onclick = e => { if (e.target === modal) closeCmpModal(); };
@@ -876,6 +980,87 @@ function setSort(col) {
   if (modal && modal.open) renderLeaderboardInto(document.getElementById('cmp-modal-body'));
 }
 
+// ── Decision tab state ────────────────────────────────────────────────────
+let decisionBudget = null;  // user's capital budget for affordability filter
+
+function renderDecisionTabInto(el) {
+  const addrs = [...Object.keys(state)].sort((a, b) => {
+    const sa = statsCache[a]?.score ?? -1;
+    const sb = statsCache[b]?.score ?? -1;
+    return sb - sa;
+  });
+
+  const decChip = (dec) => {
+    const map = { 'COPY': 'var(--green)', 'MONITOR': 'var(--warn)', 'SKIP': 'var(--red)', 'INSUFFICIENT DATA': 'var(--t3)' };
+    const c = map[dec] || 'var(--t3)';
+    return `<span style="color:${c};font-weight:700;font-size:11px;cursor:pointer">${dec ?? '—'}</span>`;
+  };
+
+  const trendIcon = t => t === 'improving' ? '↑' : t === 'declining' ? '↓' : t === 'stable' ? '→' : '—';
+  const trendCol  = t => t === 'improving' ? 'var(--green)' : t === 'declining' ? 'var(--red)' : 'var(--t2)';
+
+  const budgetAffordable = (minC) => {
+    if (decisionBudget == null || minC == null) return null;
+    return decisionBudget >= minC;
+  };
+
+  const rows = addrs.map(addr => {
+    const s   = state[addr];
+    const st  = statsCache[addr] || {};
+    const dec = st.decision ?? '—';
+    const minC = st.capital_brackets?.min;
+    const aff  = budgetAffordable(minC);
+    const affBadge = aff === true  ? `<span style="color:var(--green);font-size:10px">✓ affordable</span>`
+                   : aff === false ? `<span style="color:var(--t3);font-size:10px">✗ +${fUsd(minC - decisionBudget)}</span>`
+                   : '';
+    const reasons = (st.decision_reasons || []).map(r => `<li>${r}</li>`).join('');
+    return `
+      <tr class="dec-row" onclick="selectWallet('${addr}');closeCmpModal()">
+        <td><span class="lb-swatch" style="background:${clr(addr)}"></span><b>${s.label}</b></td>
+        <td class="mono" style="color:${st.score>=70?'var(--green)':st.score>=50?'var(--brand)':'var(--red)'};font-weight:700">${st.score ?? '—'}</td>
+        <td onclick="event.stopPropagation();this.nextElementSibling.style.display=this.nextElementSibling.style.display?'':'table-row'">
+          ${decChip(st.decision)}
+        </td>
+        <td class="mono" style="color:${(s.return_pct||0)>=0?'var(--green)':'var(--red)'}">${fPct(s.return_pct||0)}</td>
+        <td class="mono" style="color:${trendCol(st.pnl_trend)}">${trendIcon(st.pnl_trend)}</td>
+        <td class="mono">${st.sharpe ?? '—'}</td>
+        <td class="mono" style="color:${st.max_drawdown!=null&&st.max_drawdown<-20?'var(--red)':'var(--t2)'}">${st.max_drawdown != null ? st.max_drawdown + '%' : '—'}</td>
+        <td class="mono">${st.consistency_pct != null ? st.consistency_pct + '%' : '—'}</td>
+        <td class="mono">${st.total_trades ?? '—'}</td>
+        <td class="mono" style="color:var(--warn)">${minC != null ? fUsd(minC) : '—'}<br>${affBadge}</td>
+      </tr>
+      <tr class="dec-reasons" style="display:none"><td colspan="10" style="padding:6px 12px;background:var(--card);border-bottom:1px solid var(--border)">
+        <ul style="margin:0;padding-left:18px;font-size:11px;color:var(--t2)">${reasons || '<li>No data yet</li>'}</ul>
+      </td></tr>`;
+  }).join('');
+
+  const budgetVal = decisionBudget != null ? decisionBudget : '';
+  const affordable = decisionBudget != null ? addrs.filter(a => {
+    const m = statsCache[a]?.capital_brackets?.min;
+    return m != null && decisionBudget >= m;
+  }).length : null;
+
+  el.innerHTML = `
+    <div style="padding:12px 16px 8px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <span style="font-size:12px;color:var(--t2)">My budget:</span>
+      <input id="dec-budget" type="number" placeholder="e.g. 5000" value="${budgetVal}"
+        style="width:120px;padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--t1);font-size:12px"
+        oninput="decisionBudget=this.value?Number(this.value):null;renderDecisionTabInto(document.getElementById('cmp-modal-body'))">
+      ${affordable != null ? `<span style="font-size:12px;color:var(--t2)">${affordable} of ${addrs.length} wallets affordable at ${fUsd(decisionBudget)}</span>` : ''}
+    </div>
+    <div style="overflow-x:auto">
+    <table class="cmp-lb-tbl" style="min-width:700px">
+      <thead><tr>
+        <th>Wallet</th><th>Score</th><th>Decision ▾</th><th>Net PnL%</th>
+        <th title="W1→W2 trend">Trend</th><th>Sharpe</th><th>Max DD</th>
+        <th title="% profitable days">Consistency</th><th>Trades</th><th>Min Capital</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    </div>
+    <div style="font-size:10px;color:var(--t3);padding:8px 16px">Click a Decision badge to expand reasoning. Click a row to open that wallet's tearsheet.</div>`;
+}
+
 function renderLeaderboardInto(el) {
   const addrs  = Object.keys(state);
   const sorted = [...addrs].sort((a, b) => {
@@ -884,13 +1069,15 @@ function renderLeaderboardInto(el) {
     return sortDir * (va - vb);
   });
   const cols = [
-    { key: 'score',        label: 'Score'   },
-    { key: 'return_pct',   label: 'Return'  },
-    { key: 'equity',       label: 'Equity'  },
-    { key: 'win_rate',     label: 'Win %'   },
-    { key: 'max_drawdown', label: 'Max DD'  },
-    { key: 'sharpe',       label: 'Sharpe'  },
-    { key: 'total_trades', label: 'Trades'  },
+    { key: 'score',        label: 'Score'      },
+    { key: 'decision',     label: 'Decision',  noSort: true },
+    { key: 'return_pct',   label: 'Return'     },
+    { key: 'equity',       label: 'Equity'     },
+    { key: 'win_rate',     label: 'Win %'      },
+    { key: 'max_drawdown', label: 'Max DD'     },
+    { key: 'sharpe',       label: 'Sharpe'     },
+    { key: 'total_trades', label: 'Trades'     },
+    { key: 'min_capital',  label: 'Min Capital', noSort: true },
   ];
   const arrow = col => col === sortCol ? (sortDir < 0 ? ' ▼' : ' ▲') : '';
 
@@ -899,28 +1086,34 @@ function renderLeaderboardInto(el) {
   <table class="cmp-lb-tbl">
     <thead><tr>
       <th class="lb-name-col">Wallet</th>
-      ${cols.map(c => `<th onclick="setSort('${c.key}')" class="sortable">${c.label}${arrow(c.key)}</th>`).join('')}
+      ${cols.map(c => c.noSort ? `<th>${c.label}</th>` : `<th onclick="setSort('${c.key}')" class="sortable">${c.label}${arrow(c.key)}</th>`).join('')}
     </tr></thead>
     <tbody>
       ${sorted.map(addr => {
-        const s   = state[addr];
-        const ret = s.return_pct || 0;
-        const dim = !compareSelection.has(addr) ? ' style="opacity:0.35"' : '';
-        const col = clr(addr);
-        const dd  = statsCache[addr]?.max_drawdown;
-        const sh  = statsCache[addr]?.sharpe;
-        const sc  = statsCache[addr]?.score;
-        const tr  = statsCache[addr]?.total_trades ?? s.trades_copied_count ?? 0;
-        const scCol = sc==null?'var(--t2)':sc>=70?'var(--green)':sc>=50?'var(--brand)':'var(--red)';
+        const s    = state[addr];
+        const ret  = s.return_pct || 0;
+        const dim  = !compareSelection.has(addr) ? ' style="opacity:0.35"' : '';
+        const col  = clr(addr);
+        const st   = statsCache[addr] || {};
+        const dd   = st.max_drawdown;
+        const sh   = st.sharpe;
+        const sc   = st.score;
+        const tr   = st.total_trades ?? s.trades_copied_count ?? 0;
+        const dec  = st.decision;
+        const minC = st.capital_brackets?.min;
+        const scCol  = sc==null?'var(--t2)':sc>=70?'var(--green)':sc>=50?'var(--brand)':'var(--red)';
+        const decCol = dec==='COPY'?'var(--green)':dec==='MONITOR'?'var(--warn)':dec==='SKIP'?'var(--red)':'var(--t3)';
         return `<tr${dim}>
           <td><span class="lb-swatch" style="background:${col}"></span><span class="lb-nm">${s.label}</span></td>
           <td class="mono" style="color:${scCol};font-weight:700">${sc ?? '—'}</td>
+          <td class="mono" style="color:${decCol};font-size:10px;font-weight:600">${dec ?? '—'}</td>
           <td class="mono" style="color:${ret>=0?'var(--green)':'var(--red)'}">${fPct(ret)}</td>
           <td class="mono" style="color:${col}">${fUsd(s.equity)}</td>
           <td class="mono">${s.win_rate != null ? s.win_rate + '%' : '—'}</td>
           <td class="mono" style="color:${dd!=null&&dd<-10?'var(--red)':'var(--t2)'}">${dd != null ? dd + '%' : '—'}</td>
           <td class="mono" style="color:${sh!=null?sh>1?'var(--green)':sh>0?'var(--warn)':'var(--red)':'var(--t2)'}">${sh ?? '—'}</td>
           <td class="mono">${tr}</td>
+          <td class="mono" style="color:var(--warn);font-size:11px">${minC != null ? fUsd(minC) : '—'}</td>
         </tr>`;
       }).join('')}
     </tbody>
@@ -1055,6 +1248,85 @@ function renderCorrelationInto(el) {
   </div>`;
 }
 function renderCorrelation() { renderCorrelationInto(document.getElementById('stats-content')); }
+
+// ── PnL Calendar Heatmap (pure SVG/DOM — no Chart.js) ─────────────────────
+function _renderPnlHeatmap(pnlByDay) {
+  if (!pnlByDay.length) return '';
+  const map = Object.fromEntries(pnlByDay.map(d => [d.date, d.pnl]));
+  const dates = pnlByDay.map(d => new Date(d.date + 'T00:00:00'));
+  const first = new Date(dates[0]); first.setDate(first.getDate() - first.getDay()); // align to Sunday
+  const last  = dates[dates.length - 1];
+  const maxAbs = Math.max(...pnlByDay.map(d => Math.abs(d.pnl)), 1);
+  const CELL = 14, GAP = 2, days = ['S','M','T','W','T','F','S'];
+  let weeks = [], cur = new Date(first);
+  while (cur <= last) {
+    let week = [];
+    for (let d = 0; d < 7; d++) {
+      const key = cur.toISOString().slice(0, 10);
+      const pnl = map[key];
+      const inRange = cur >= dates[0] && cur <= last;
+      week.push({ key, pnl, inRange });
+      cur.setDate(cur.getDate() + 1);
+    }
+    weeks.push(week);
+  }
+  const W = weeks.length * (CELL + GAP) + 24;
+  const H = 7 * (CELL + GAP) + 18;
+  const cells = weeks.flatMap((week, wi) =>
+    week.map((day, di) => {
+      if (!day.inRange) return `<rect x="${24+wi*(CELL+GAP)}" y="${18+di*(CELL+GAP)}" width="${CELL}" height="${CELL}" rx="2" fill="var(--border)" opacity="0.3"/>`;
+      if (day.pnl == null) return `<rect x="${24+wi*(CELL+GAP)}" y="${18+di*(CELL+GAP)}" width="${CELL}" height="${CELL}" rx="2" fill="var(--card2)"/>`;
+      const intensity = Math.min(Math.abs(day.pnl) / maxAbs, 1);
+      const alpha = 0.2 + intensity * 0.8;
+      const col   = day.pnl >= 0 ? `rgba(52,211,153,${alpha.toFixed(2)})` : `rgba(248,113,113,${alpha.toFixed(2)})`;
+      return `<rect x="${24+wi*(CELL+GAP)}" y="${18+di*(CELL+GAP)}" width="${CELL}" height="${CELL}" rx="2" fill="${col}"><title>${day.key}: ${day.pnl >= 0 ? '+' : ''}$${day.pnl?.toFixed(2)}</title></rect>`;
+    })
+  ).join('');
+  const labels = days.map((d, i) =>
+    `<text x="20" y="${18+i*(CELL+GAP)+CELL/2+4}" text-anchor="end" font-size="9" fill="var(--t3)">${d}</text>`
+  ).join('');
+  return `<svg width="${W}" height="${H}" style="display:block">${labels}${cells}</svg>`;
+}
+
+// ── Weekly PnL chart ────────────────────────────────────────────────────────
+let weeklyPnlChartInst = null;
+function renderWeeklyPnlChart(data) {
+  const ctx = document.getElementById('weekly-pnl-chart');
+  if (!ctx) return;
+  if (weeklyPnlChartInst) { weeklyPnlChartInst.destroy(); weeklyPnlChartInst = null; }
+  weeklyPnlChartInst = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: data.map(d => d.week),
+      datasets: [{ data: data.map(d => d.pnl),
+        backgroundColor: data.map(d => d.pnl >= 0 ? 'rgba(52,211,153,0.7)' : 'rgba(248,113,113,0.7)'),
+        borderRadius: 3 }],
+    },
+    options: { responsive: true, maintainAspectRatio: true,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => '$' + c.raw.toFixed(2) } } },
+      scales: { x: { ticks: { color: 'var(--t3)', font: { size: 9 } }, grid: { display: false } },
+                y: { ticks: { color: 'var(--t3)', font: { size: 9 } }, grid: { color: 'var(--border)' } } } },
+  });
+}
+
+// ── Daily trade count chart ─────────────────────────────────────────────────
+let dailyTradesChartInst = null;
+function renderDailyTradeCountChart(data) {
+  const ctx = document.getElementById('daily-trades-chart');
+  if (!ctx) return;
+  if (dailyTradesChartInst) { dailyTradesChartInst.destroy(); dailyTradesChartInst = null; }
+  dailyTradesChartInst = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: data.map(d => d.date.slice(5)),  // MM-DD
+      datasets: [{ data: data.map(d => d.count), backgroundColor: 'rgba(124,108,255,0.6)', borderRadius: 2 }],
+    },
+    options: { responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => c.raw + ' trades' } } },
+      scales: { x: { ticks: { color: 'var(--t3)', font: { size: 9 } }, grid: { display: false } },
+                y: { ticks: { color: 'var(--t3)', font: { size: 9 } }, grid: { color: 'var(--border)' } } } },
+  });
+}
 
 function renderPnlChart(data) {
   const ctx = document.getElementById('pnl-chart');
@@ -1223,14 +1495,27 @@ async function loadHistory(addr) {
   } catch(e) { console.warn('loadHistory', e); }
 }
 
-async function loadTrades(addr) {
+async function loadTrades(addr, from='', to='') {
   try {
-    const r    = await fetch(`/api/trades/${addr}`);
+    let url = `/api/trades/${addr}`;
+    const params = [];
+    if (from) params.push(`from=${from}`);
+    if (to)   params.push(`to=${to}`);
+    if (params.length) url += '?' + params.join('&');
+    const r    = await fetch(url);
     const rows = await r.json();
-    if (!rows.length) return;
     document.getElementById('feed-body').innerHTML=''; fillCount=0;
+    if (!rows.length) return;
     rows.slice().reverse().forEach(t=>prependFill({...t,wallet_label:state[addr]?.label||''}));
   } catch(e) { console.warn('loadTrades', e); }
+}
+
+function filterFeed() {
+  const addr = activeWallet || Object.keys(state)[0];
+  if (!addr) return;
+  const from = document.getElementById('feed-from')?.value || '';
+  const to   = document.getElementById('feed-to')?.value   || '';
+  loadTrades(addr, from, to);
 }
 
 // ── Controls ───────────────────────────────────────────────────────────────

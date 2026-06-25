@@ -3,14 +3,19 @@ HL Sim Desk — Flask + SocketIO entry point.
 Only routes, the asyncio bridge, and startup live here.
 All simulation logic is in web/sim.py; DB in web/db.py; stats in web/stats.py.
 """
+import csv
+import io
 import os
 import sys
 import time
 import queue
 import threading
+from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, render_template, jsonify, request
+import requests as _requests
+
+from flask import Flask, render_template, jsonify, request, Response
 from flask_socketio import SocketIO, emit
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -94,16 +99,19 @@ def api_history(wallet):
 
 @app.route("/api/trades/<wallet>")
 def api_trades(wallet):
-    s  = _sessions.get(wallet.lower())
-    db = db_get_trades(wallet.lower())
+    s        = _sessions.get(wallet.lower())
+    from_dt  = request.args.get("from")  # optional YYYY-MM-DD
+    to_dt    = request.args.get("to")
+    db       = db_get_trades(wallet.lower(), from_date=from_dt, to_date=to_dt)
     return jsonify(db if db else (s.recent_fills if s else []))
 
 
 @app.route("/api/stats/<wallet>")
 def api_stats(wallet):
-    s        = _sessions.get(wallet.lower())
-    open_pos = s.simulated_positions if s else {}
-    return jsonify(compute_stats(wallet.lower(), open_pos))
+    s          = _sessions.get(wallet.lower())
+    open_pos   = s.simulated_positions if s else {}
+    copy_ratio = s.copy_ratio if s else 1.0
+    return jsonify(compute_stats(wallet.lower(), open_pos, copy_ratio=copy_ratio))
 
 
 @app.route("/api/add-wallet", methods=["POST"])
@@ -186,6 +194,97 @@ def api_resume(wallet):
     s.is_paused = False
     _safe_emit("state_update", _session_to_dict(s))
     return jsonify({"ok": True})
+
+
+# ── Telegram alerting ─────────────────────────────────────────────────────────
+
+def _send_telegram(msg: str):
+    """Send a message via Telegram Bot API. No-op if token/chat_id not configured."""
+    tok  = settings.telegram.bot_token
+    chat = settings.telegram.chat_id
+    if not tok or not chat:
+        return
+    try:
+        _requests.post(
+            f"https://api.telegram.org/bot{tok}/sendMessage",
+            json={"chat_id": chat, "text": msg, "parse_mode": "HTML"},
+            timeout=5,
+        )
+    except Exception as e:
+        logger.warning(f"Telegram send failed: {e}")
+
+
+# ── Health endpoint ────────────────────────────────────────────────────────────
+
+_server_start = time.time()
+
+
+@app.route("/api/health")
+def api_health():
+    wallets = {}
+    for addr, s in _sessions.items():
+        ws_ok = getattr(s.monitor, "is_connected", None)
+        uptime = (datetime.now() - s.bot_start_time).total_seconds() / 3600 if s.bot_start_time else 0
+        wallets[addr] = {
+            "label":          s.label,
+            "is_paused":      s.is_paused,
+            "uptime_h":       round(uptime, 2),
+            "trades_copied":  s.trades_copied_count,
+            "ws_connected":   ws_ok,
+        }
+    return jsonify({
+        "status":          "ok",
+        "server_uptime_h": round((time.time() - _server_start) / 3600, 2),
+        "wallets":         wallets,
+    })
+
+
+# ── CSV export endpoints ───────────────────────────────────────────────────────
+
+@app.route("/api/export/trades/<wallet>")
+def api_export_trades(wallet):
+    from web.db import _db_engine, TradeRecord
+    from sqlalchemy.orm import Session as DbSession
+    addr = wallet.lower()
+    with DbSession(_db_engine) as db:
+        rows = (db.query(TradeRecord)
+                .filter(TradeRecord.wallet_addr == addr, TradeRecord.is_seed == False)  # noqa: E712
+                .order_by(TradeRecord.timestamp)
+                .all())
+    buf = io.StringIO()
+    w   = csv.writer(buf)
+    w.writerow(["timestamp", "symbol", "direction", "side", "size", "price",
+                "notional", "leverage", "fee", "realized_pnl", "fill_id"])
+    for r in rows:
+        w.writerow([r.timestamp, r.symbol, r.direction, r.side, r.size, r.price,
+                    r.notional, r.leverage, r.fee, r.realized_pnl, r.fill_id])
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=trades_{addr[:8]}.csv"},
+    )
+
+
+@app.route("/api/export/equity/<wallet>")
+def api_export_equity(wallet):
+    from web.db import _db_engine, EquitySnapshot
+    from sqlalchemy.orm import Session as DbSession
+    addr = wallet.lower()
+    with DbSession(_db_engine) as db:
+        rows = (db.query(EquitySnapshot)
+                .filter(EquitySnapshot.wallet_addr == addr)
+                .order_by(EquitySnapshot.timestamp)
+                .all())
+    buf = io.StringIO()
+    w   = csv.writer(buf)
+    w.writerow(["timestamp", "equity", "balance", "upnl"])
+    for r in rows:
+        w.writerow([r.timestamp, r.equity, r.balance, r.upnl])
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=equity_{addr[:8]}.csv"},
+    )
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

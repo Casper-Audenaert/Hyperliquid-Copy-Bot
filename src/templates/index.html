@@ -149,8 +149,10 @@ header{
 .copy-flash{color:var(--green) !important}
 
 .wc-eq{font-size:17px;font-weight:700;font-family:var(--mono);letter-spacing:-.4px;margin-bottom:1px}
-.wc-ret{font-size:11px;font-family:var(--mono);font-weight:600;margin-bottom:6px}
+.wc-ret{font-size:11px;font-family:var(--mono);font-weight:600;margin-bottom:1px}
 .wc-ret.pos{color:var(--green)}.wc-ret.neg{color:var(--red)}.wc-ret.z{color:var(--t3)}
+.wc-npnl{font-size:10px;font-family:var(--mono);margin-bottom:5px;opacity:.85}
+.wc-npnl.pos{color:var(--green)}.wc-npnl.neg{color:var(--red)}.wc-npnl.z{color:var(--t3)}
 .wc-bottom{display:flex;align-items:center;justify-content:space-between}
 .sparkline{display:block}
 .wc-wr{font-size:10px;font-family:var(--mono);color:var(--t2)}
@@ -559,6 +561,7 @@ header{
         <button class="cmp-tab" data-tab="leaderboard" onclick="setCmpTab('leaderboard')">Leaderboard</button>
         <button class="cmp-tab"    data-tab="stats"        onclick="setCmpTab('stats')">Stats</button>
         <button class="cmp-tab"    data-tab="correlation"  onclick="setCmpTab('correlation')">Correlation</button>
+        <button class="cmp-tab"    data-tab="decision"     onclick="setCmpTab('decision')">🎯 Decision</button>
       </div>
       <div class="stats-scroll" id="stats-content">
         <div class="no-stats">Select a wallet to see<br>performance stats</div>
@@ -579,6 +582,11 @@ header{
       <div class="phdr">
         <span class="ptitle">Trade Feed</span>
         <span class="badge" id="feed-cnt">0 fills</span>
+        <span style="display:flex;gap:4px;align-items:center;margin-left:auto">
+          <input type="date" id="feed-from" style="font-size:10px;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:var(--card);color:var(--t1)" oninput="filterFeed()">
+          <span style="font-size:10px;color:var(--t3)">to</span>
+          <input type="date" id="feed-to" style="font-size:10px;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:var(--card);color:var(--t1)" oninput="filterFeed()">
+        </span>
       </div>
       <div class="feed-scroll">
         <table class="ftbl">

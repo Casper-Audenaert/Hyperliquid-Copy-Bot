@@ -4,7 +4,7 @@ from typing import Callable, Optional, List
 from loguru import logger
 from hyperliquid.client import HyperliquidClient
 from hyperliquid.websocket import HyperliquidWebSocket
-from hyperliquid.models import Position, Order, UserState, WebSocketUpdate
+from hyperliquid.models import Position, Order, UserState, WebSocketUpdate, PositionSide
 
 
 class WalletMonitor:
@@ -51,6 +51,10 @@ class WalletMonitor:
         # Wire up reconnect-based fill-gap recovery
         self.ws.on_reconnect = self._replay_missed_fills
 
+        # Background state refresh — decoupled from fill events so high-frequency
+        # fills (thousands/hour) don't trigger REST calls on every message.
+        asyncio.create_task(self._periodic_state_refresh())
+
         # userEvents carries fills + positions + orders in one message.
         # We do NOT subscribe to orderUpdates — it would double-trigger on_new_order (Bug 5).
         await self.ws.subscribe_user_events(self.target_address, self._handle_user_event)
@@ -59,6 +63,21 @@ class WalletMonitor:
     async def stop_monitoring(self):
         logger.info("Stopping wallet monitoring")
         await self.ws.stop()
+
+    async def _periodic_state_refresh(self):
+        """Refresh current_state every ~60s independent of fill events.
+        Automated bots trade thousands/hour — one REST call per fill per wallet
+        causes 429 storms. State is refreshed here; the fill handler reads cache.
+        Wide jitter (0-30s) keeps 15 wallets spread across a 30s window."""
+        import random
+        await asyncio.sleep(random.uniform(0, 30))  # initial stagger on startup
+        while True:
+            await asyncio.sleep(50 + random.uniform(0, 20))  # 50-70s jitter
+            try:
+                await self.get_current_state()
+                logger.debug(f"State refreshed for {self.target_address[:10]}…")
+            except Exception as e:
+                logger.warning(f"Periodic state refresh failed: {e}")
 
     # ── Main event handler ────────────────────────────────────────────────────
 
@@ -69,10 +88,13 @@ class WalletMonitor:
                 return
             data = update.data["data"]
 
-            # ONE state refresh per event (was 3×, each hitting 9 dexes = 27 calls).
-            # ponytail: one refresh per event; add per-symbol price cache if rate limits bite
-            await self.get_current_state()
+            # No get_current_state() here — state is kept fresh by _periodic_state_refresh()
+            # AND by patching current_state in-place from WS position updates below.
+            # Removes 9 REST calls per fill per wallet, critical for high-frequency bots.
 
+            # Fills first: on_order_fill removes closed positions from simulated_positions,
+            # so the position snapshot's on_position_close returns early (no get_all_mids call).
+            # _handle_positions still patches current_state leverage for SUBSEQUENT messages.
             if "fills" in data:
                 await self._handle_fills(data["fills"])
             if "positions" in data:
@@ -136,15 +158,59 @@ class WalletMonitor:
         """Detect open/close/update transitions from the position snapshot.
         New positions: on_new_position is a no-op (fills are the authoritative copy signal).
         Close/update: still trigger callbacks for safety-net close handling.
+
+        Also patches current_state.positions in-place from WebSocket data so that
+        the fill handler always has accurate leverage without a REST call.
         """
         from config.settings import settings
         for pos_data in positions:
             symbol = pos_data.get("coin", "").upper()
-            size = float(pos_data.get("szi", 0))
+            size   = float(pos_data.get("szi", 0))
 
             if symbol in settings.copy_rules.blocked_assets:
                 continue
 
+            # ── Patch current_state from WS position data ─────────────────────
+            # WS sends leverage, entryPx, positionValue etc. alongside coin/szi.
+            # Update current_state so fill handler reads correct leverage immediately.
+            lev_raw    = pos_data.get("leverage", {})
+            leverage   = float(lev_raw.get("value", 1) if isinstance(lev_raw, dict) else lev_raw or 1)
+            entry_px   = float(pos_data.get("entryPx") or 0)
+            pos_val    = float(pos_data.get("positionValue") or 0)
+            curr_px    = (pos_val / abs(size)) if size != 0 else entry_px
+            upnl       = float(pos_data.get("unrealizedPnl") or 0)
+            liq_raw    = pos_data.get("liquidationPx")
+            liq_px     = float(liq_raw) if liq_raw else None
+            margin     = float(pos_data.get("marginUsed") or 0)
+
+            if self.current_state is not None:
+                side = PositionSide.LONG if size > 0 else PositionSide.SHORT
+                if size != 0 and entry_px > 0:
+                    # Update or insert position in current_state
+                    updated = False
+                    for i, p in enumerate(self.current_state.positions):
+                        if p.symbol == symbol:
+                            self.current_state.positions[i] = Position(
+                                symbol=symbol, side=side, size=abs(size),
+                                entry_price=entry_px, current_price=curr_px,
+                                leverage=leverage, unrealized_pnl=upnl,
+                                liquidation_price=liq_px, margin=margin,
+                            )
+                            updated = True
+                            break
+                    if not updated:
+                        self.current_state.positions.append(Position(
+                            symbol=symbol, side=side, size=abs(size),
+                            entry_price=entry_px, current_price=curr_px,
+                            leverage=leverage, unrealized_pnl=upnl,
+                            liquidation_price=liq_px, margin=margin,
+                        ))
+                elif size == 0:
+                    self.current_state.positions = [
+                        p for p in self.current_state.positions if p.symbol != symbol
+                    ]
+
+            # ── Transition callbacks ──────────────────────────────────────────
             existing = next((p for p in self.last_positions if p.symbol == symbol), None)
 
             if existing and size == 0:

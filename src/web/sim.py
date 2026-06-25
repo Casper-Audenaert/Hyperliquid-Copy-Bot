@@ -4,7 +4,7 @@ Simulation engine: per-wallet session state, copy callbacks, lifecycle.
 Design decisions baked in:
   • copy_ratio stored per-session (not a global) — prevents cross-wallet ratio bleed
   • Fixed ratio sizing (target_notional * ratio) — no drift as free balance shrinks
-  • $0.01 dust guard only, no $10 minimum — sim doesn't have Hyperliquid order minimums
+  • $10 dust guard matches HL's real minimum order notional — skipped fills count against Copy Efficiency
   • Taker fee deducted from balance on every fill via settings.taker_fee_rate (double for flips)
   • Positions seeded at current mark price ("copy from now")
   • on_new_position is a no-op — fills are the authoritative copy signal
@@ -14,6 +14,8 @@ Design decisions baked in:
 """
 import asyncio
 import aiohttp
+import random
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, date
 from typing import Optional, Callable
@@ -34,7 +36,40 @@ from web.db import (
 # Shared session registry (keyed by lowercase address)
 _sessions: dict = {}
 
-DUST_GUARD = 0.01  # notional below this is skipped (not $10 — this is simulation)
+DUST_GUARD = 10.0  # HL's real minimum order notional — fills below this are skipped (same as live trading)
+
+# Shared caches — all market-wide data is identical across wallets.
+# Without caching: 15 wallets × 9 DEX calls each = 135 calls/30s per metric.
+# With caching: 9 calls per TTL window, shared by all wallets.
+_funding_cache: dict = {}
+_funding_cache_ts: float = 0.0
+_FUNDING_TTL = 35.0
+
+_mids_cache: dict = {}
+_mids_cache_ts: float = 0.0
+_MIDS_TTL = 10.0  # 10s is fresh enough for equity snapshots and safety-net closes
+
+
+async def _get_shared_funding_rates(client: HyperliquidClient) -> dict:
+    global _funding_cache, _funding_cache_ts
+    now = time.monotonic()
+    if _funding_cache and (now - _funding_cache_ts) < _FUNDING_TTL:
+        return _funding_cache
+    rates = await client.get_funding_rates()
+    _funding_cache    = rates
+    _funding_cache_ts = now
+    return rates
+
+
+async def _get_shared_mids(client: HyperliquidClient) -> dict:
+    global _mids_cache, _mids_cache_ts
+    now = time.monotonic()
+    if _mids_cache and (now - _mids_cache_ts) < _MIDS_TTL:
+        return _mids_cache
+    mids = await client.get_all_mids()
+    _mids_cache    = mids
+    _mids_cache_ts = now
+    return mids
 
 
 @dataclass
@@ -127,7 +162,11 @@ def _session_to_dict(s: WalletSession) -> dict:
     # equity = free_cash + locked_margin + unrealized_pnl
     # Margin is collateral, not spent — excluding it causes the chart to drop every time
     # a position opens. total_margin already computed above in the positions loop.
-    equity     = s.simulated_balance + total_margin + total_upnl
+    equity          = s.simulated_balance + total_margin + total_upnl
+    liquidation_risk = any(
+        p.get("dist_to_liq_pct") is not None and abs(p["dist_to_liq_pct"]) < 5.0
+        for p in positions
+    )
     return_pct = (equity - s.start_balance) / s.start_balance * 100 if s.start_balance > 0 else 0
     uptime_h   = (datetime.now() - s.bot_start_time).total_seconds() / 3600 if s.bot_start_time else 0
     total_closed = s.wins + s.losses
@@ -162,6 +201,8 @@ def _session_to_dict(s: WalletSession) -> dict:
         "total_fees_paid": round(s.total_fees_paid, 4),
         "total_funding_paid": round(s.total_funding_paid, 4),
         "net_pnl": round(s.simulated_pnl - s.total_fees_paid - s.total_funding_paid, 2),
+        "liquidation_risk": liquidation_risk,
+        "ws_connected": bool(s.monitor and s.monitor.ws and getattr(s.monitor.ws, "is_running", False)),
     }
 
 
@@ -241,13 +282,18 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
         if symbol not in session.simulated_positions:
             return  # already handled by fill handler
 
-        # Get current price via all_mids as best available approximation
+        # Use cached current_state prices first — avoids a REST call on every close.
         price = 0.0
-        try:
-            mids  = await session.client.get_all_mids()
-            price = mids.get(symbol, 0)
-        except Exception:
-            pass
+        if session.monitor.current_state:
+            price_map = {p.symbol: p.current_price
+                         for p in session.monitor.current_state.positions if p.current_price > 0}
+            price = price_map.get(symbol, 0)
+        if price <= 0:
+            try:
+                mids  = await _get_shared_mids(session.client)
+                price = mids.get(symbol, 0)
+            except Exception:
+                pass
 
         if price <= 0:
             logger.warning(f"[{session.label}] on_position_close: no price for {symbol}, skipping PnL")
@@ -275,6 +321,11 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
             if pnl < 0 and _record_loss(session, abs(pnl)):
                 session.is_paused = True
                 logger.error(f"[{session.label}] Daily loss limit reached — paused")
+                try:
+                    from web_app import _send_telegram
+                    _send_telegram(f"⏸ <b>PAUSED</b> — {session.label}\nDaily loss limit reached")
+                except Exception:
+                    pass
 
         emit_fn("position_close", {"wallet": session.address, "symbol": symbol, "pnl": round(pnl, 2)})
         emit_fn("state_update",   _session_to_dict(session))
@@ -400,6 +451,11 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
                     if pnl < 0 and _record_loss(session, abs(pnl)):
                         session.is_paused = True
                         logger.error(f"[{session.label}] Daily loss limit reached — paused")
+                try:
+                    from web_app import _send_telegram
+                    _send_telegram(f"⏸ <b>PAUSED</b> — {session.label}\nDaily loss limit reached")
+                except Exception:
+                    pass
 
                 # ── Open / Add / Flip fill ──────────────────────────────────
                 else:
@@ -498,7 +554,7 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
 async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
     while True:
         try:
-            await asyncio.sleep(30)
+            await asyncio.sleep(25 + random.uniform(0, 10))  # jitter: 25-35s, prevents all wallets syncing
             if session.address not in _sessions:
                 logger.debug(f"[{session.label}] Snapshot task exiting — wallet removed")
                 return
@@ -511,7 +567,7 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
                              for p in session.monitor.current_state.positions if p.current_price > 0}
             missing = [s for s in session.simulated_positions if s not in price_map or price_map[s] <= 0]
             if missing:
-                mids = await session.client.get_all_mids()
+                mids = await _get_shared_mids(session.client)
                 price_map.update(mids)
 
             total_upnl = 0.0
@@ -529,7 +585,7 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
             # HL `funding` field = current predicted 1-hour rate (not 8h).
             # Pro-rate to this 30s tick: 1h = 3600s → 120 ticks of 30s each.
             try:
-                funding_map = await session.client.get_funding_rates()
+                funding_map = await _get_shared_funding_rates(session.client)
                 for sym, pos in session.simulated_positions.items():
                     rate = funding_map.get(sym, 0)
                     if rate == 0:
@@ -550,6 +606,49 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
                 logger.warning(f"[{session.label}] funding rate fetch failed, skipping: {e}")
 
             equity = session.simulated_balance + total_margin + total_upnl
+
+            # Liquidation simulation: close any position whose mark price crossed its liq_price,
+            # then pause the session if equity goes deeply negative (total loss).
+            for sym in list(session.simulated_positions.keys()):
+                pos     = session.simulated_positions[sym]
+                px      = price_map.get(sym, 0)
+                if px <= 0:
+                    continue
+                lev     = max(pos.get("leverage", 1), 1)
+                entry   = pos.get("entry_price", 0)
+                is_long = pos.get("side", "").upper() == "LONG"
+                if entry <= 0 or lev <= 1:
+                    continue
+                _maint  = 1.0 / (2.0 * lev)
+                liq_px  = entry * (1 - 1/lev + _maint) if is_long else entry * (1 + 1/lev - _maint)
+                liquidated = (is_long and px <= liq_px) or (not is_long and px >= liq_px)
+                if liquidated:
+                    size   = abs(pos["size"])
+                    pnl    = size * (liq_px - entry) if is_long else size * (entry - liq_px)
+                    margin = pos.get("margin_used", 0)
+                    session.simulated_balance += margin + pnl  # margin mostly lost
+                    session.simulated_pnl     += pnl
+                    if pnl < 0:
+                        session.losses += 1
+                    del session.simulated_positions[sym]
+                    db_record_close(session.address, sym, pnl)
+                    logger.warning(f"[{session.label}] LIQUIDATED {sym} at ${liq_px:,.4f} PnL={pnl:.2f}")
+                    emit_fn("margin_call", {
+                        "wallet": session.address, "symbol": sym,
+                        "liq_price": round(liq_px, 4), "pnl": round(pnl, 2),
+                    })
+
+            if equity <= 0 and not session.is_paused:
+                session.is_paused = True
+                msg = f"[{session.label}] Account equity = ${equity:.2f} — session paused (simulated liquidation)"
+                logger.error(msg)
+                emit_fn("liquidated", {"wallet": session.address, "equity": round(equity, 2)})
+                try:
+                    from web_app import _send_telegram  # late import to avoid circular
+                    _send_telegram(f"🚨 <b>LIQUIDATED</b> — {session.label}\nEquity: ${equity:.2f}")
+                except Exception:
+                    pass
+
             db_snapshot_equity(session.address, equity, session.simulated_balance, total_upnl)
             session.equity_history.append({
                 "t": datetime.utcnow().isoformat(),
@@ -611,7 +710,7 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
         # Seed existing positions at CURRENT mark price ("copy from now")
         if state.positions:
             try:
-                all_mids = await session.client.get_all_mids()
+                all_mids = await _get_shared_mids(session.client)
             except Exception:
                 all_mids = {}
 
@@ -628,18 +727,34 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
                 if pos_value < DUST_GUARD:
                     continue
 
+                is_long  = pos.size > 0
+                seed_fee = pos_value * settings.taker_fee_rate
+
                 session.simulated_positions[pos.symbol] = {
-                    "size":        your_size if pos.size > 0 else -your_size,
+                    "size":        your_size if is_long else -your_size,
                     "entry_price": current_px,   # mark price, not historical entry
                     "leverage":    your_lev,
-                    "side":        "LONG" if pos.size > 0 else "SHORT",
+                    "side":        "LONG" if is_long else "SHORT",
                     "value":       pos_value,
                     "margin_used": margin,
                 }
-                session.simulated_balance -= margin
+                session.simulated_balance -= margin + seed_fee
+                session.total_fees_paid   += seed_fee
+
+                ts_ms = int(datetime.now().timestamp() * 1000)
+                db_record_fill(
+                    session.address, session.label,
+                    f"seed_{pos.symbol}_{session.address[:8]}_{ts_ms}",
+                    pos.symbol,
+                    "Open Long" if is_long else "Open Short",
+                    "LONG" if is_long else "SHORT",
+                    your_size, current_px, your_lev,
+                    fee=seed_fee, is_seed=True,
+                )
                 logger.info(
                     f"[{session.label}] Seeded {pos.symbol} "
-                    f"{'LONG' if pos.size > 0 else 'SHORT'} {your_size:.4f} @ ${current_px:,.4f}"
+                    f"{'LONG' if is_long else 'SHORT'} {your_size:.4f} @ ${current_px:,.4f} "
+                    f"fee=${seed_fee:.4f}"
                 )
 
     # Pull historical fills for the feed
@@ -696,7 +811,7 @@ async def _reinit_session(session: WalletSession, emit_fn: Callable):
 
         if state.positions:
             try:
-                all_mids = await session.client.get_all_mids()
+                all_mids = await _get_shared_mids(session.client)
             except Exception:
                 all_mids = {}
 
@@ -711,15 +826,28 @@ async def _reinit_session(session: WalletSession, emit_fn: Callable):
                 margin    = pos_value / max(your_lev, 1)
                 if pos_value < DUST_GUARD:
                     continue
+                is_long  = pos.size > 0
+                seed_fee = pos_value * settings.taker_fee_rate
                 session.simulated_positions[pos.symbol] = {
-                    "size":        your_size if pos.size > 0 else -your_size,
+                    "size":        your_size if is_long else -your_size,
                     "entry_price": current_px,
                     "leverage":    your_lev,
-                    "side":        "LONG" if pos.size > 0 else "SHORT",
+                    "side":        "LONG" if is_long else "SHORT",
                     "value":       pos_value,
                     "margin_used": margin,
                 }
-                session.simulated_balance -= margin
+                session.simulated_balance -= margin + seed_fee
+                session.total_fees_paid   += seed_fee
+                ts_ms = int(datetime.now().timestamp() * 1000)
+                db_record_fill(
+                    session.address, session.label,
+                    f"seed_{pos.symbol}_{session.address[:8]}_{ts_ms}",
+                    pos.symbol,
+                    "Open Long" if is_long else "Open Short",
+                    "LONG" if is_long else "SHORT",
+                    your_size, current_px, your_lev,
+                    fee=seed_fee, is_seed=True,
+                )
 
     session.recent_fills = await _fetch_target_fills(session)
 
