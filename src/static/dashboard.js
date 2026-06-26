@@ -1,5 +1,15 @@
 ﻿'use strict';
 
+// ── Mobile sidebar ─────────────────────────────────────────────────────────
+function toggleSidebar() {
+  document.querySelector('.sidebar').classList.toggle('sb-open');
+  document.getElementById('sb-overlay').classList.toggle('sb-open');
+}
+function closeSidebar() {
+  document.querySelector('.sidebar').classList.remove('sb-open');
+  document.getElementById('sb-overlay').classList.remove('sb-open');
+}
+
 // ── State ──────────────────────────────────────────────────────────────────
 const socket = io({ transports: ['websocket'] });
 let state        = {};      // addr → session dict
@@ -389,6 +399,7 @@ function renderSidebar() {
 }
 
 function selectWallet(addr) {
+  closeSidebar();
   compareMode  = false;
   activeWallet = addr;
   document.getElementById('cmp-btn').classList.remove('on');

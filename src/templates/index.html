@@ -468,12 +468,95 @@ header{
 }
 .cmp-modal-close:hover{color:var(--t1);background:var(--s2)}
 .cmp-modal-body{flex:1;overflow:auto;padding:16px}
+
+/* ── Hamburger button (desktop: hidden) ── */
+.ham-btn{
+  display:none;width:30px;height:30px;border-radius:8px;border:1px solid var(--hr);
+  background:var(--s2);color:var(--t2);cursor:pointer;font-size:16px;
+  align-items:center;justify-content:center;transition:all .14s;flex-shrink:0;
+  font-family:var(--font)
+}
+.ham-btn:hover{color:var(--t1)}
+
+/* Sidebar tap-to-close overlay (desktop: inert) */
+.sb-overlay{display:none;position:fixed;inset:0;z-index:49;background:rgba(0,0,0,.5)}
+.sb-overlay.sb-open{display:block}
+
+/* ── Mobile — 768px ── */
+@media(max-width:768px){
+  /* Allow body to scroll vertically */
+  html,body{height:auto;overflow:auto}
+  /* Collapse sidebar column — sidebar becomes a fixed overlay */
+  body{grid-template-columns:1fr;grid-template-rows:52px 1fr}
+
+  /* Show hamburger */
+  .ham-btn{display:flex}
+
+  /* Sidebar: slide-in drawer */
+  .sidebar{
+    position:fixed;left:0;top:52px;bottom:0;
+    width:80%;max-width:280px;
+    transform:translateX(-100%);transition:transform .25s ease;
+    z-index:50;box-shadow:4px 0 24px rgba(0,0,0,.5)
+  }
+  .sidebar.sb-open{transform:translateX(0)}
+
+  /* Header: icon-only, no overflow */
+  .uptime-lbl,.pill-sim,#live-txt,.conn-dot{display:none}
+  header>.vsep{display:none}
+  .h-right .vsep{display:none}
+  .btn-label{display:none}
+  header{gap:8px;padding:0 12px}
+  .h-right{gap:6px}
+
+  /* KPI bar: 3 columns */
+  .kpi-bar{grid-template-columns:repeat(3,1fr)}
+  .kpi{padding:10px 12px}
+  .kpi-val{font-size:15px}
+  .kpi-lbl{font-size:8px}
+  .kpi-sub{font-size:9px}
+
+  /* Main: scrollable column */
+  .main{overflow-y:auto;grid-row:2}
+
+  /* Content grid: single column, fixed panel heights */
+  .content-grid{
+    grid-template-columns:1fr;
+    grid-template-rows:320px 420px 280px 340px;
+    gap:10px;padding:10px
+  }
+  .chart-panel{grid-column:1;grid-row:1}
+  .stats-panel{grid-column:1;grid-row:2}
+  .pos-panel  {grid-column:1;grid-row:3}
+  .feed-panel {grid-column:1;grid-row:4}
+
+  /* Trade feed: horizontal scroll for wide table */
+  .feed-scroll{overflow-x:auto}
+  .ftbl{min-width:520px}
+
+  /* Feed header date filter: wrap to avoid overflow */
+  .phdr{flex-wrap:wrap;gap:6px}
+
+  /* Modals: full width */
+  .mbox{width:calc(100vw - 32px);padding:20px 16px}
+
+  /* Compare modal: full width already (95vw), just trim padding */
+  .cmp-modal-body{padding:10px}
+}
+
+/* ── Mobile — 480px (small phones) ── */
+@media(max-width:480px){
+  /* KPI bar: 2 columns */
+  .kpi-bar{grid-template-columns:repeat(2,1fr)}
+  .kpi-val{font-size:13px}
+}
 </style>
 </head>
 <body>
 
 <!-- ── Header ── -->
 <header>
+  <button class="ham-btn" onclick="toggleSidebar()" aria-label="Menu">☰</button>
   <div class="logo">
     <div class="logo-mark">HL</div>
     <span class="logo-text">Sim Desk</span>
@@ -489,9 +572,9 @@ header{
     <span class="uptime-lbl" id="uptime-lbl"></span>
     <div class="vsep"></div>
     <button class="theme-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle theme">☀</button>
-    <button class="btn" id="btn-pause" onclick="togglePause()">⏸ Pause</button>
-    <button class="btn" onclick="openTestModal()">⚗ Test Wallets</button>
-    <button class="btn btn-brand" onclick="openModal()">＋ Add Wallet</button>
+    <button class="btn" id="btn-pause" onclick="togglePause()">⏸ <span class="btn-label">Pause</span></button>
+    <button class="btn" onclick="openTestModal()">⚗ <span class="btn-label">Test Wallets</span></button>
+    <button class="btn btn-brand" onclick="openModal()">＋ <span class="btn-label">Add Wallet</span></button>
   </div>
 </header>
 
@@ -507,6 +590,7 @@ header{
     <div class="add-btn" onclick="openModal()"><span>＋</span><span>Add Wallet</span></div>
   </div>
 </aside>
+<div class="sb-overlay" id="sb-overlay" onclick="closeSidebar()"></div>
 
 <!-- ── Main ── -->
 <div class="main">
