@@ -450,9 +450,10 @@ function toggleCompare() {
     // Pre-fetch stats for all wallets so Decision tab is populated immediately
     Promise.all([...compareSelection].map(addr => loadStats(addr))).then(() => renderComparePanel());
     renderComparePanel();
+    reloadFeedForCompare();
   } else {
     const cur = Object.keys(state)[0];
-    if (cur) loadStats(cur);
+    if (cur) { loadStats(cur); loadTrades(cur); }
   }
 }
 
@@ -494,7 +495,7 @@ function renderKpis() {
   const paused = sess.some(s=>s.is_paused);
   document.getElementById('pdot').className       = 'pulse-dot'+(paused?' paused':'');
   document.getElementById('live-txt').textContent = paused ? 'PAUSED' : 'LIVE';
-  document.getElementById('btn-pause').textContent = paused ? '▶ Resume' : '⏸ Pause';
+  const _pb = document.getElementById('btn-pause'); if (_pb) _pb.textContent = paused ? '▶ Resume' : '⏸ Pause';
 
   const uptime = Math.max(0, ...sess.map(s => s.uptime_h || 0));
   // Auto-advance default range so users see full history after extended runs
@@ -1521,6 +1522,25 @@ async function loadTrades(addr, from='', to='') {
     if (!rows.length) return;
     rows.slice().reverse().forEach(t=>prependFill({...t,wallet_label:state[addr]?.label||''}));
   } catch(e) { console.warn('loadTrades', e); }
+}
+
+function reloadFeedForCompare() {
+  document.getElementById('feed-body').innerHTML = '';
+  fillCount = 0;
+  document.getElementById('feed-cnt').textContent = '0 fills';
+  const addrs = [...compareSelection];
+  Promise.all(addrs.map(addr =>
+    fetch(`/api/trades/${addr}`)
+      .then(r => r.json())
+      .then(rows => rows.map(t => ({...t, wallet_label: state[addr]?.label || ''})))
+      .catch(() => [])
+  )).then(groups => {
+    const all = groups.flat().sort((a, b) => new Date(a.timestamp||0) - new Date(b.timestamp||0));
+    all.slice(-200).reverse().forEach(t => prependFill(t));
+    if (!all.length)
+      document.getElementById('feed-body').innerHTML =
+        '<tr id="feed-ph"><td colspan="7" class="no-feed">No fills yet…</td></tr>';
+  });
 }
 
 function filterFeed() {
