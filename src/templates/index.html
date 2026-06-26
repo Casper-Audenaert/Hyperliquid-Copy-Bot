@@ -490,7 +490,7 @@ header{
     <div class="vsep"></div>
     <button class="theme-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle theme">☀</button>
     <button class="btn" id="btn-pause" onclick="togglePause()">⏸ Pause</button>
-    <button class="btn btn-danger" onclick="clearSelected()">⟳ Clear Data</button>
+    <button class="btn" onclick="openTestModal()">⚗ Test Wallets</button>
     <button class="btn btn-brand" onclick="openModal()">＋ Add Wallet</button>
   </div>
 </header>
@@ -620,6 +620,24 @@ header{
     <div class="mfoot">
       <button class="btn" onclick="closeModal()">Cancel</button>
       <button class="btn btn-brand" id="m-submit" onclick="addWallet()">Start Monitoring</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Test Wallets Modal ── -->
+<div class="mbg" id="tw-mbg" onclick="if(event.target===this)closeTestModal()">
+  <div class="mbox">
+    <h2>Test Wallets</h2>
+    <p class="msub">Pre-loaded wallets from .env. Set a starting balance and click Add All.</p>
+    <div class="merr" id="tw-merr"></div>
+    <div class="mf">
+      <label>Wallet Addresses</label>
+      <textarea id="tw-addrs" rows="7" readonly style="opacity:.7;cursor:default;font-size:11px;line-height:1.6"></textarea>
+    </div>
+    <div class="mf"><label>Starting Balance ($)</label><input id="tw-bal" type="number" min="1" step="100" placeholder="10000" autocomplete="off"></div>
+    <div class="mfoot">
+      <button class="btn" onclick="closeTestModal()">Cancel</button>
+      <button class="btn btn-brand" id="tw-submit" onclick="addTestWallets()">Add All</button>
     </div>
   </div>
 </div>

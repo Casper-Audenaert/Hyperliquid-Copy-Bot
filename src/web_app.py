@@ -239,6 +239,13 @@ def api_health():
     })
 
 
+@app.route("/api/test-wallets")
+def api_test_wallets():
+    raw = os.getenv("TEST_WALLETS", "")
+    wallets = [w.strip() for w in raw.split(",") if w.strip()]
+    return jsonify({"wallets": wallets})
+
+
 # ── CSV export endpoints ───────────────────────────────────────────────────────
 
 @app.route("/api/export/trades/<wallet>")

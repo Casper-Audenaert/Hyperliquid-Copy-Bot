@@ -1651,6 +1651,56 @@ async function addWallet() {
   );
 }
 
+// ── Test Wallets Modal ────────────────────────────────────────────────────
+async function openTestModal() {
+  const res = await fetch('/api/test-wallets');
+  const { wallets } = await res.json();
+  document.getElementById('tw-addrs').value = wallets.join('\n');
+  document.getElementById('tw-bal').value = '';
+  document.getElementById('tw-merr').classList.remove('show');
+  document.getElementById('tw-mbg').classList.add('open');
+  setTimeout(() => document.getElementById('tw-bal').focus(), 60);
+}
+function closeTestModal() {
+  document.getElementById('tw-mbg').classList.remove('open');
+  const btn = document.getElementById('tw-submit');
+  btn.textContent = 'Add All'; btn.disabled = false;
+}
+async function addTestWallets() {
+  const addrs = document.getElementById('tw-addrs').value.trim().split('\n').filter(Boolean);
+  const balRaw = document.getElementById('tw-bal').value.trim();
+  const errEl = document.getElementById('tw-merr');
+  const btn = document.getElementById('tw-submit');
+  const defaultBal = balRaw ? parseFloat(balRaw) : null;
+
+  errEl.classList.remove('show');
+  if (defaultBal !== null && (isNaN(defaultBal) || defaultBal <= 0)) {
+    errEl.textContent = 'Starting balance must be a positive number.';
+    errEl.classList.add('show');
+    return;
+  }
+
+  btn.disabled = true;
+  let succeeded = 0, failed = 0;
+  for (let i = 0; i < addrs.length; i++) {
+    btn.textContent = `Adding ${i + 1}/${addrs.length}…`;
+    const address = addrs[i].toLowerCase();
+    const label = address.slice(2, 10);
+    try {
+      const r = await fetch('/api/add-wallet', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ address, label, start_balance: defaultBal }),
+      });
+      const d = await r.json();
+      if (d.ok) succeeded++; else failed++;
+    } catch { failed++; }
+  }
+
+  closeTestModal();
+  const sub = failed > 0 ? `${failed} already monitored or invalid` : '';
+  showToast(`${succeeded} wallet${succeeded !== 1 ? 's' : ''} added`, sub, '✓');
+}
+
 // ── SocketIO events ────────────────────────────────────────────────────────
 socket.on('connect', () => {
   const el=document.getElementById('conn-dot');
