@@ -479,14 +479,12 @@ header{
 .ham-btn:hover{color:var(--t1)}
 
 /* Sidebar tap-to-close overlay (desktop: inert) */
-.sb-overlay{display:none;position:fixed;inset:0;z-index:49;background:rgba(0,0,0,.5)}
+.sb-overlay{display:none;position:fixed;top:52px;left:0;right:0;bottom:0;z-index:49;background:rgba(0,0,0,.5)}
 .sb-overlay.sb-open{display:block}
 
 /* ── Mobile — 768px ── */
 @media(max-width:768px){
-  /* Allow body to scroll vertically */
-  html,body{height:auto;overflow:auto}
-  /* Collapse sidebar column — sidebar becomes a fixed overlay */
+  /* Keep body fixed at 100vh — .main scrolls internally */
   body{grid-template-columns:1fr;grid-template-rows:52px 1fr}
 
   /* Show hamburger */

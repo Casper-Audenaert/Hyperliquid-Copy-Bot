@@ -2,12 +2,14 @@
 
 // ── Mobile sidebar ─────────────────────────────────────────────────────────
 function toggleSidebar() {
-  document.querySelector('.sidebar').classList.toggle('sb-open');
+  const isOpen = document.querySelector('.sidebar').classList.toggle('sb-open');
   document.getElementById('sb-overlay').classList.toggle('sb-open');
+  document.querySelector('.main').style.overflowY = isOpen ? 'hidden' : '';
 }
 function closeSidebar() {
   document.querySelector('.sidebar').classList.remove('sb-open');
   document.getElementById('sb-overlay').classList.remove('sb-open');
+  document.querySelector('.main').style.overflowY = '';
 }
 
 // ── State ──────────────────────────────────────────────────────────────────
