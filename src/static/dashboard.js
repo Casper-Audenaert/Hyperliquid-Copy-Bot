@@ -16,6 +16,12 @@ function closeSidebar() {
 const socket = io({ transports: ['websocket'] });
 let state        = {};      // addr → session dict
 let activeWallet = null;
+// ponytail: sorted fallback so page-load default matches sidebar rank #1
+function curWallet() {
+  if (activeWallet) return activeWallet;
+  const addrs = Object.keys(state);
+  return [...addrs].sort((a, b) => (state[b]?.return_pct || 0) - (state[a]?.return_pct || 0))[0] || null;
+}
 let compareMode  = false;
 let rangeHours   = 24;
 let chart        = null;
@@ -73,7 +79,7 @@ function applyTheme(theme) {
   if (symPnlChart)      { symPnlChart.destroy();      symPnlChart      = null; }
   if (histChart)        { histChart.destroy();        histChart        = null; }
   if (sharpeSeriesChart){ sharpeSeriesChart.destroy();sharpeSeriesChart= null; }
-  const cur = activeWallet || Object.keys(state)[0];
+  const cur = curWallet();
   if (cur && statsCache[cur]) renderStats(statsCache[cur]);
   if (showUnderwater && cur) renderUnderwaterChart(cur);
 }
@@ -214,7 +220,7 @@ function toggleSubChart(which) {
   document.getElementById('dd-section').classList.toggle('visible', showUnderwater);
   document.getElementById('btn-underwater').classList.toggle('on', showUnderwater);
   if (showUnderwater) {
-    const cur = activeWallet || Object.keys(state)[0];
+    const cur = curWallet();
     if (cur) renderUnderwaterChart(cur);
   } else {
     if (underwaterChart) { underwaterChart.destroy(); underwaterChart = null; }
@@ -269,7 +275,7 @@ function corrColor(r) {
 
 function rebuildChart() {
   if (!chart) return;
-  const cur   = activeWallet || Object.keys(state)[0];
+  const cur   = curWallet();
   const addrs = compareMode ? [...compareSelection] : (cur ? [cur] : []);
   const c     = chartColors();
   const ctx   = document.getElementById('chart-canvas').getContext('2d');
@@ -328,7 +334,7 @@ function addEquityPoint(addr, pt) {
   const el = document.getElementById(`spark-${addr}`);
   if (el) el.innerHTML = sparklineSvg(addr);
 
-  const cur = activeWallet || Object.keys(state)[0];
+  const cur = curWallet();
   if (!compareMode && cur !== addr) return;
 
   const ds = chart.data.datasets.find(d => d.label === state[addr].label);
@@ -347,7 +353,7 @@ function addEquityPoint(addr, pt) {
 function renderSidebar() {
   const el    = document.getElementById('wlist');
   const addrs = Object.keys(state);
-  const cur   = activeWallet || addrs[0];
+  const cur   = curWallet();
 
   if (!addrs.length) {
     el.innerHTML = '<div style="font-size:11px;color:var(--t3);padding:4px 2px">No wallets yet</div>';
@@ -452,14 +458,14 @@ function toggleCompare() {
     renderComparePanel();
     reloadFeedForCompare();
   } else {
-    const cur = Object.keys(state)[0];
+    const cur = curWallet();
     if (cur) { loadStats(cur); loadTrades(cur); }
   }
 }
 
 // ── KPI cards ──────────────────────────────────────────────────────────────
 function renderKpis() {
-  const cur   = activeWallet || Object.keys(state)[0];
+  const cur   = curWallet();
   const sess  = compareMode
     ? [...compareSelection].filter(a => state[a]).map(a => state[a])
     : (state[cur] ? [state[cur]] : []);
@@ -530,7 +536,7 @@ function setKpi(id, val, sub, num) {
 
 // ── Positions ──────────────────────────────────────────────────────────────
 function renderPositions() {
-  const cur  = activeWallet || Object.keys(state)[0];
+  const cur  = curWallet();
   const sess = compareMode ? Object.values(state) : (state[cur] ? [state[cur]] : []);
   const all  = sess.flatMap(s=>(s.positions||[]).map(p=>({...p,_lbl:s.label})));
   document.getElementById('pos-cnt').textContent = all.length;
@@ -624,7 +630,7 @@ async function loadStats(addr) {
 function renderStats(st) {
   if (!st) return;
   const el   = document.getElementById('stats-content');
-  const addr = activeWallet || Object.keys(state)[0] || '';
+  const addr = curWallet() || '';
   document.getElementById('stats-title').innerHTML =
     `Tearsheet <a href="/api/export/trades/${addr}" download style="font-size:10px;font-weight:400;color:var(--t3);margin-left:8px;text-decoration:none" title="Download trades CSV">⬇ trades</a>` +
     `<a href="/api/export/equity/${addr}" download style="font-size:10px;font-weight:400;color:var(--t3);margin-left:6px;text-decoration:none" title="Download equity CSV">⬇ equity</a>`;
@@ -1544,7 +1550,7 @@ function reloadFeedForCompare() {
 }
 
 function filterFeed() {
-  const addr = activeWallet || Object.keys(state)[0];
+  const addr = curWallet();
   if (!addr) return;
   const from = document.getElementById('feed-from')?.value || '';
   const to   = document.getElementById('feed-to')?.value   || '';
@@ -1558,20 +1564,20 @@ function setRange(el) {
   rangeHours = parseInt(el.dataset.h)||0;
   rebuildChart();
   if (showUnderwater) {
-    const cur = activeWallet || Object.keys(state)[0];
+    const cur = curWallet();
     if (cur) renderUnderwaterChart(cur);
   }
 }
 
 async function togglePause() {
-  const addr = activeWallet || Object.keys(state)[0];
+  const addr = curWallet();
   if (!addr) return;
   const action = state[addr]?.is_paused ? 'resume' : 'pause';
   await fetch(`/api/${action}/${addr}`, {method:'POST'});
 }
 
 async function clearSelected() {
-  const addr = activeWallet || Object.keys(state)[0];
+  const addr = curWallet();
   if (!addr) return;
   const lbl = state[addr]?.label || addr;
   if (!confirm(`Clear all data for "${lbl}"?\n\nThis permanently removes all trade history and equity snapshots from the database and resets the simulated balance to ${fUsd(state[addr]?.start_balance)}.`)) return;
@@ -1748,7 +1754,6 @@ socket.on('state_update', s => {
   const isNew = !state[s.address];
   state[s.address] = {...(state[s.address]||{}), ...s};
   if (isNew) {
-    if (!activeWallet && !compareMode) activeWallet = s.address;
     if (compareMode) compareSelection.add(s.address);
     loadHistory(s.address).then(()=>rebuildChart());
     loadTrades(s.address);
@@ -1761,7 +1766,7 @@ socket.on('state_update', s => {
 });
 
 socket.on('fill', f => {
-  const cur = activeWallet || Object.keys(state)[0];
+  const cur = curWallet();
   if (compareMode || !cur || cur === f.wallet) {
     prependFill({...f, timestamp: f.timestamp || new Date().toISOString()});
   }
@@ -1787,7 +1792,7 @@ socket.on('wallet_removed', d => {
   delete state[addr];
   delete statsCache[addr];
   compareSelection.delete(addr);
-  if (activeWallet === addr) activeWallet = Object.keys(state)[0] || null;
+  if (activeWallet === addr) activeWallet = null;
   renderSidebar();
   renderKpis();
   renderPositions();
@@ -1828,7 +1833,7 @@ socket.on('clear', async d => {
     await loadHistory(addr);
     rebuildChart();
 
-    const cur = activeWallet || Object.keys(state)[0];
+    const cur = curWallet();
     if (cur === addr) {
       document.getElementById('feed-body').innerHTML =
         '<tr id="feed-ph"><td colspan="7" class="no-feed">Waiting for fills…</td></tr>';
