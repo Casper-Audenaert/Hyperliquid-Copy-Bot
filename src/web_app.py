@@ -99,11 +99,9 @@ def api_history(wallet):
 
 @app.route("/api/trades/<wallet>")
 def api_trades(wallet):
-    s        = _sessions.get(wallet.lower())
-    from_dt  = request.args.get("from")  # optional YYYY-MM-DD
-    to_dt    = request.args.get("to")
-    db       = db_get_trades(wallet.lower(), from_date=from_dt, to_date=to_dt)
-    return jsonify(db if db else (s.recent_fills if s else []))
+    from_dt = request.args.get("from")  # optional YYYY-MM-DD
+    to_dt   = request.args.get("to")
+    return jsonify(db_get_trades(wallet.lower(), from_date=from_dt, to_date=to_dt))
 
 
 @app.route("/api/stats/<wallet>")

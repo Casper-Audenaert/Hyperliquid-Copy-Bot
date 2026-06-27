@@ -176,7 +176,7 @@ def db_get_equity_history(wallet_addr: str, hours: int = 24) -> list:
 
 
 def db_get_trades(wallet_addr: str, limit: int = 200,
-                  from_date: str = None, to_date: str = None) -> list:
+                  from_date: str | None = None, to_date: str | None = None) -> list:
     from datetime import datetime as _dt
     with DbSession(_db_engine) as db:
         q = (db.query(TradeRecord)

@@ -262,7 +262,20 @@ async def _fetch_target_fills(session: WalletSession, limit: int = 50) -> list:
         logger.warning(f"[{session.label}] Could not fetch fills: {e}")
 
     fills = sorted(result, key=lambda f: f.get("timestamp", ""), reverse=True)
-    return fills[:limit]
+    fills = fills[:limit]
+
+    # Seed DB so /api/trades always has data from session start, not just after first live fill
+    for f in fills:
+        fid = f.get("fill_id", "")
+        if fid and fid not in session._processed_fill_ids:
+            db_record_fill(
+                session.address, session.label, fid,
+                f["symbol"], f["direction"], f["side"],
+                f["size"], f["price"], 1,
+                fee=0.0, is_seed=True,
+            )
+
+    return fills
 
 
 # ── Callbacks ─────────────────────────────────────────────────────────────────
@@ -372,6 +385,7 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
             # Scale size by fixed copy_ratio (not live balance — prevents drift)
             our_size    = target_size * session.copy_ratio
             our_notional = our_size * price
+            emit_size   = our_size  # overridden to close_size for capped partial closes
 
             if our_notional < DUST_GUARD:
                 session.skipped_fills_count += 1
@@ -417,6 +431,7 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
                     pos       = session.simulated_positions[symbol]
                     pos_size  = abs(pos["size"])
                     close_size = min(our_size, pos_size)
+                    emit_size  = close_size  # use actual processed size, not full our_size
                     is_long   = pos.get("side", "").upper() == "LONG"
                     entry     = pos.get("entry_price", 0)
                     pnl       = close_size * (price - entry) if is_long else close_size * (entry - price)
@@ -451,11 +466,11 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
                     if pnl < 0 and _record_loss(session, abs(pnl)):
                         session.is_paused = True
                         logger.error(f"[{session.label}] Daily loss limit reached — paused")
-                try:
-                    from web_app import _send_telegram
-                    _send_telegram(f"⏸ <b>PAUSED</b> — {session.label}\nDaily loss limit reached")
-                except Exception:
-                    pass
+                        try:
+                            from web_app import _send_telegram
+                            _send_telegram(f"⏸ <b>PAUSED</b> — {session.label}\nDaily loss limit reached")
+                        except Exception:
+                            pass
 
                 # ── Open / Add / Flip fill ──────────────────────────────────
                 else:
@@ -523,7 +538,7 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
             emit_fn("fill", {
                 "wallet": session.address, "label": session.label,
                 "symbol": symbol, "side": position_side.value,
-                "direction": direction, "size": our_size, "price": price,
+                "direction": direction, "size": emit_size, "price": price,
                 "notional": round(our_notional, 2), "leverage": our_leverage,
                 "realized_pnl": round(pnl_realized, 4) if pnl_realized is not None else None,
                 "timestamp": datetime.utcnow().isoformat(),

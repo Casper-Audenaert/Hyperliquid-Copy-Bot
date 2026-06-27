@@ -32,6 +32,7 @@ let symPnlChart        = null;
 let histChart          = null;
 let sharpeSeriesChart  = null;
 let fillCount    = 0;
+const recentFillsBuffer = []; // ponytail: ring buffer — all wallet fills regardless of compareMode
 let statsCache   = {};      // addr → stats dict (cached from /api/stats)
 let compareSelection = new Set(); // addrs visible in compare mode
 let showCombined     = false;     // overlay combined portfolio curve
@@ -1530,18 +1531,33 @@ async function loadTrades(addr, from='', to='') {
   } catch(e) { console.warn('loadTrades', e); }
 }
 
-function reloadFeedForCompare() {
+let _cmpReloadGen = 0;
+function reloadFeedForCompare(from = '', to = '') {
+  const gen = ++_cmpReloadGen;
   document.getElementById('feed-body').innerHTML = '';
   fillCount = 0;
   document.getElementById('feed-cnt').textContent = '0 fills';
   const addrs = [...compareSelection];
-  Promise.all(addrs.map(addr =>
-    fetch(`/api/trades/${addr}`)
+  Promise.all(addrs.map(addr => {
+    const qs = new URLSearchParams();
+    if (from) qs.set('from', from);
+    if (to)   qs.set('to', to);
+    const url = `/api/trades/${addr}` + (qs.size ? '?' + qs : '');
+    return fetch(url)
       .then(r => r.json())
-      .then(rows => rows.map(t => ({...t, wallet_label: state[addr]?.label || ''})))
-      .catch(() => [])
-  )).then(groups => {
-    const all = groups.flat().sort((a, b) => new Date(a.timestamp||0) - new Date(b.timestamp||0));
+      .then(rows => rows.map(t => ({...t, wallet_label: state[addr]?.label || '', wallet: addr})))
+      .catch(() => []);
+  })).then(groups => {
+    if (gen !== _cmpReloadGen) return; // stale — a newer reload started
+    const dbFills = groups.flat();
+    // Merge recent socket fills not yet in DB (buffer always captures all wallets)
+    const bufFills = recentFillsBuffer.filter(f => compareSelection.has(f.wallet));
+    const seen = new Set(dbFills.map(t => t.timestamp + '|' + t.symbol + '|' + (t.wallet || '')));
+    const merged = [
+      ...dbFills,
+      ...bufFills.filter(f => !seen.has(f.timestamp + '|' + f.symbol + '|' + (f.wallet || ''))),
+    ];
+    const all = merged.sort((a, b) => new Date(a.timestamp||0) - new Date(b.timestamp||0));
     all.slice(-200).reverse().forEach(t => prependFill(t));
     if (!all.length)
       document.getElementById('feed-body').innerHTML =
@@ -1550,10 +1566,11 @@ function reloadFeedForCompare() {
 }
 
 function filterFeed() {
-  const addr = curWallet();
-  if (!addr) return;
   const from = document.getElementById('feed-from')?.value || '';
   const to   = document.getElementById('feed-to')?.value   || '';
+  if (compareMode) { reloadFeedForCompare(from, to); return; }
+  const addr = curWallet();
+  if (!addr) return;
   loadTrades(addr, from, to);
 }
 
@@ -1766,9 +1783,12 @@ socket.on('state_update', s => {
 });
 
 socket.on('fill', f => {
+  const fill = {...f, timestamp: f.timestamp || new Date().toISOString()};
+  recentFillsBuffer.unshift(fill);
+  if (recentFillsBuffer.length > 500) recentFillsBuffer.pop();
   const cur = curWallet();
   if (compareMode || !cur || cur === f.wallet) {
-    prependFill({...f, timestamp: f.timestamp || new Date().toISOString()});
+    prependFill(fill);
   }
   // Refresh stats after a fill (PnL may have changed)
   const addr = f.wallet;
