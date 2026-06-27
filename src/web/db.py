@@ -62,6 +62,21 @@ class EquitySnapshot(Base):
     timestamp   = Column(DateTime, default=datetime.utcnow)
 
 
+class SimulatedPosition(Base):
+    """Persists open simulated positions across server restarts."""
+    __tablename__ = "simulated_positions"
+    id          = Column(Integer, primary_key=True)
+    wallet_addr = Column(String, index=True)
+    symbol      = Column(String)
+    side        = Column(String)        # LONG / SHORT
+    size        = Column(Float)         # absolute value
+    entry_price = Column(Float)
+    leverage    = Column(Integer)
+    margin_used = Column(Float)
+    copy_ratio  = Column(Float)         # ratio locked at open time
+    updated_at  = Column(DateTime, default=datetime.utcnow)
+
+
 Base.metadata.create_all(_db_engine)
 
 try:
@@ -109,6 +124,7 @@ def purge_wallet_data(address: str):
     with DbSession(_db_engine) as db:
         db.query(TradeRecord).filter(TradeRecord.wallet_addr == address).delete()
         db.query(EquitySnapshot).filter(EquitySnapshot.wallet_addr == address).delete()
+        db.query(SimulatedPosition).filter(SimulatedPosition.wallet_addr == address).delete()
         db.commit()
 
 
@@ -170,6 +186,57 @@ def db_get_latest_equity_snapshot(wallet_addr: str) -> dict | None:
     if not row:
         return None
     return {"equity": row.equity, "balance": row.balance, "upnl": row.upnl}
+
+
+def db_upsert_position(wallet_addr: str, symbol: str, pos: dict):
+    """Insert or update one open simulated position row."""
+    with DbSession(_db_engine) as db:
+        row = db.query(SimulatedPosition).filter_by(wallet_addr=wallet_addr, symbol=symbol).first()
+        if row:
+            row.side        = pos.get("side", "LONG")
+            row.size        = abs(pos.get("size", 0))
+            row.entry_price = pos.get("entry_price", 0)
+            row.leverage    = int(pos.get("leverage", 1))
+            row.margin_used = pos.get("margin_used", 0)
+            row.copy_ratio  = pos.get("copy_ratio", 1.0)
+            row.updated_at  = datetime.utcnow()
+        else:
+            db.add(SimulatedPosition(
+                wallet_addr=wallet_addr, symbol=symbol,
+                side=pos.get("side", "LONG"),
+                size=abs(pos.get("size", 0)),
+                entry_price=pos.get("entry_price", 0),
+                leverage=int(pos.get("leverage", 1)),
+                margin_used=pos.get("margin_used", 0),
+                copy_ratio=pos.get("copy_ratio", 1.0),
+            ))
+        db.commit()
+
+
+def db_delete_position(wallet_addr: str, symbol: str):
+    """Remove a fully-closed simulated position row."""
+    with DbSession(_db_engine) as db:
+        db.query(SimulatedPosition).filter_by(wallet_addr=wallet_addr, symbol=symbol).delete()
+        db.commit()
+
+
+def db_load_positions(wallet_addr: str) -> dict:
+    """Return {symbol: pos_dict} of all open simulated positions for a wallet."""
+    with DbSession(_db_engine) as db:
+        rows = db.query(SimulatedPosition).filter_by(wallet_addr=wallet_addr).all()
+    result = {}
+    for r in rows:
+        signed_size = r.size if r.side == "LONG" else -r.size
+        result[r.symbol] = {
+            "size":        signed_size,
+            "entry_price": r.entry_price,
+            "leverage":    r.leverage,
+            "side":        r.side,
+            "value":       r.size * r.entry_price,
+            "margin_used": r.margin_used,
+            "copy_ratio":  r.copy_ratio,
+        }
+    return result
 
 
 def db_restore_session_counters(wallet_addr: str) -> dict:

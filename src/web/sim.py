@@ -32,6 +32,7 @@ from web.db import (
     db_record_fill, db_record_close, db_snapshot_equity,
     db_get_trades, purge_wallet_data,
     db_get_latest_equity_snapshot, db_restore_session_counters,
+    db_upsert_position, db_delete_position, db_load_positions,
 )
 
 # Shared session registry (keyed by lowercase address)
@@ -330,7 +331,8 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
             elif pnl < 0:
                 session.losses += 1
             del session.simulated_positions[symbol]
-            db_record_close(session.address, symbol, pnl)
+            await asyncio.to_thread(db_delete_position, session.address, symbol)
+            await asyncio.to_thread(db_record_close, session.address, symbol, pnl)
 
             if pnl < 0 and _record_loss(session, abs(pnl)):
                 session.is_paused = True
@@ -392,9 +394,14 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
                 session.skipped_fills_count += 1
                 return
 
-            # Taker fee — double for flips (close old + open new = 2 fills on HL)
+            # Taker fee: close-old + open-new for flips, using actual simulated sizes.
+            # The 2× shortcut was wrong when copy_ratio drifted between open and flip.
             is_flip_check = ">" in direction
-            fill_fee = our_notional * settings.taker_fee_rate * (2 if is_flip_check else 1)
+            if is_flip_check and symbol in session.simulated_positions:
+                _old_sz  = abs(session.simulated_positions[symbol].get("size", our_size))
+                fill_fee = (_old_sz + our_size) * price * settings.taker_fee_rate
+            else:
+                fill_fee = our_notional * settings.taker_fee_rate * (2 if is_flip_check else 1)
 
             # Leverage from target's current position
             target_leverage = 1.0
@@ -423,20 +430,45 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
                     session._processed_fill_ids.clear()
                 return
 
+            # Snapshot target's current position size BEFORE the lock so we can calculate
+            # the close fraction accurately. current_state still has the pre-close size here
+            # because _handle_positions runs AFTER _handle_fills in the same WS message.
+            target_pos_size = 0.0
+            if is_closing and not is_flip and session.monitor.current_state:
+                for _p in session.monitor.current_state.positions:
+                    if _p.symbol == symbol:
+                        target_pos_size = _p.size
+                        break
+
             async with session._state_lock:
                 session.simulated_balance -= fill_fee
                 session.total_fees_paid   += fill_fee
 
                 # ── Close / Reduce fill ──────────────────────────────────────
                 if is_closing and not is_flip:
-                    pos       = session.simulated_positions[symbol]
-                    pos_size  = abs(pos["size"])
-                    close_size = min(our_size, pos_size)
-                    emit_size  = close_size  # use actual processed size, not full our_size
+                    pos      = session.simulated_positions[symbol]
+                    pos_size = abs(pos["size"])
+
+                    # Use the same fraction the target closed, not a ratio-scaled size.
+                    # This stays accurate even if copy_ratio drifted since the position opened.
+                    if target_pos_size > 0:
+                        fraction = min(target_size / target_pos_size, 1.0)
+                    else:
+                        fraction = 1.0  # can't determine fraction; assume full close
+                    close_size = pos_size * fraction
+                    emit_size  = close_size
+
+                    # Correct the fee: it was pre-charged on our_size but the actual
+                    # notional closed is close_size (may differ if ratio drifted).
+                    close_fee = close_size * price * settings.taker_fee_rate
+                    fee_delta = close_fee - fill_fee   # positive = owe more, negative = refund
+                    session.simulated_balance -= fee_delta
+                    session.total_fees_paid   += fee_delta
+                    fill_fee = close_fee  # carry corrected fee into DB record
+
                     is_long   = pos.get("side", "").upper() == "LONG"
                     entry     = pos.get("entry_price", 0)
                     pnl       = close_size * (price - entry) if is_long else close_size * (entry - price)
-                    fraction  = close_size / pos_size if pos_size > 0 else 1.0
                     margin_cr = pos.get("margin_used", 0) * fraction
 
                     session.simulated_balance += margin_cr + pnl
@@ -450,15 +482,18 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
                     new_size = pos_size - close_size
                     if new_size < 1e-8:
                         del session.simulated_positions[symbol]
+                        await asyncio.to_thread(db_delete_position, session.address, symbol)
                     else:
-                        pos["size"]       = new_size if pos["size"] > 0 else -new_size
+                        pos["size"]        = new_size if pos["size"] > 0 else -new_size
                         pos["margin_used"] = pos.get("margin_used", 0) - margin_cr
                         pos["value"]       = new_size * entry
+                        await asyncio.to_thread(db_upsert_position, session.address, symbol, pos)
 
-                    db_record_fill(session.address, session.label, fill_id, symbol,
-                                   direction, position_side.value, close_size, price, our_leverage,
-                                   fee=fill_fee)
-                    db_record_close(session.address, symbol, pnl)
+                    await asyncio.to_thread(
+                        db_record_fill, session.address, session.label, fill_id, symbol,
+                        direction, position_side.value, close_size, price, our_leverage, fill_fee,
+                    )
+                    await asyncio.to_thread(db_record_close, session.address, symbol, pnl)
                     session._processed_fill_ids.add(fill_id)
                     if len(session._processed_fill_ids) > 50_000:
                         session._processed_fill_ids.clear()
@@ -493,7 +528,7 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
                             elif opnl < 0:
                                 session.losses += 1
                             del session.simulated_positions[symbol]
-                            db_record_close(session.address, symbol, opnl)
+                            await asyncio.to_thread(db_record_close, session.address, symbol, opnl)
                             pnl_realized = opnl  # flip close realizes PnL
 
                     # Open / add to position
@@ -504,6 +539,7 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
                         session.simulated_positions[symbol] = {
                             "size": 0, "entry_price": 0, "leverage": our_leverage,
                             "side": position_side.value, "value": 0.0, "margin_used": 0.0,
+                            "copy_ratio": session.copy_ratio,  # locked at open time
                         }
 
                     pos     = session.simulated_positions[symbol]
@@ -517,9 +553,11 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
                     pos["leverage"]    = our_leverage
                     session.simulated_balance -= margin_req
 
-                    db_record_fill(session.address, session.label, fill_id, symbol,
-                                   direction, position_side.value, our_size, price, our_leverage,
-                                   fee=fill_fee)
+                    await asyncio.to_thread(db_upsert_position, session.address, symbol, pos)
+                    await asyncio.to_thread(
+                        db_record_fill, session.address, session.label, fill_id, symbol,
+                        direction, position_side.value, our_size, price, our_leverage, fill_fee,
+                    )
                     session._processed_fill_ids.add(fill_id)
                     if len(session._processed_fill_ids) > 50_000:
                         session._processed_fill_ids.clear()
@@ -535,6 +573,8 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
                 "balance": round(session.simulated_balance, 2),
                 "upnl": round(upnl, 2),
             })
+            if len(session.equity_history) > 2000:
+                session.equity_history = session.equity_history[-2000:]
 
             emit_fn("fill", {
                 "wallet": session.address, "label": session.label,
@@ -576,6 +616,10 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
                 return
             if not session.simulated_positions:
                 continue
+
+            # Keep copy_ratio current — target's account balance drifts over weeks of trading
+            if session.monitor.current_state and session.monitor.current_state.balance > 0:
+                session.copy_ratio = session.start_balance / session.monitor.current_state.balance
 
             price_map: dict = {}
             if session.monitor and session.monitor.current_state:
@@ -647,7 +691,7 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
                     if pnl < 0:
                         session.losses += 1
                     del session.simulated_positions[sym]
-                    db_record_close(session.address, sym, pnl)
+                    await asyncio.to_thread(db_record_close, session.address, sym, pnl)
                     logger.warning(f"[{session.label}] LIQUIDATED {sym} at ${liq_px:,.4f} PnL={pnl:.2f}")
                     emit_fn("margin_call", {
                         "wallet": session.address, "symbol": sym,
@@ -665,13 +709,15 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
                 except Exception:
                     pass
 
-            db_snapshot_equity(session.address, equity, session.simulated_balance, total_upnl)
+            await asyncio.to_thread(db_snapshot_equity, session.address, equity, session.simulated_balance, total_upnl)
             session.equity_history.append({
                 "t": datetime.utcnow().isoformat(),
                 "equity": round(equity, 2),
                 "balance": round(session.simulated_balance, 2),
                 "upnl": round(total_upnl, 2),
             })
+            if len(session.equity_history) > 2000:
+                session.equity_history = session.equity_history[-2000:]
             emit_fn("equity_tick", {"wallet": session.address,
                                     "t": datetime.utcnow().isoformat(),
                                     "equity": round(equity, 2)})
@@ -712,11 +758,32 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
         await asyncio.sleep(offset_secs)
     session._state_lock = asyncio.Lock()
 
-    # Restore balance and stat counters from DB so they survive a server restart
-    _snap = db_get_latest_equity_snapshot(session.address)
-    if _snap:
-        session.simulated_balance = _snap["equity"]  # equity = cash + margin + upnl; seeding re-deducts margin
-        logger.info(f"[{session.label}] Restored balance ${_snap['equity']:.2f} from last snapshot")
+    # ── Restart recovery ──────────────────────────────────────────────────────
+    _saved_positions = db_load_positions(session.address)
+    _snap            = db_get_latest_equity_snapshot(session.address)
+
+    if _saved_positions and _snap:
+        # Full restore: use the exact cash balance from the snapshot (margin is already
+        # accounted for — no re-seeding means no double deduction), restore positions
+        # with original entry prices and locked copy_ratios, restore stat counters.
+        session.simulated_balance   = _snap["balance"]
+        session.simulated_positions = _saved_positions
+        logger.info(
+            f"[{session.label}] Restored {len(_saved_positions)} position(s) "
+            f"and balance ${_snap['balance']:.2f} from DB"
+        )
+        _ctrs = db_restore_session_counters(session.address)
+        session.simulated_pnl       = _ctrs["simulated_pnl"]
+        session.total_fees_paid     = _ctrs["total_fees_paid"]
+        session.wins                = _ctrs["wins"]
+        session.losses              = _ctrs["losses"]
+        session.trades_copied_count = _ctrs["trades_copied_count"]
+
+    elif _snap:
+        # Balance exists but no positions (all were closed cleanly).
+        # Use equity as start since we're about to re-seed from target.
+        session.simulated_balance = _snap["equity"]
+        logger.info(f"[{session.label}] Restored balance ${_snap['equity']:.2f} (no open positions)")
         _ctrs = db_restore_session_counters(session.address)
         session.simulated_pnl       = _ctrs["simulated_pnl"]
         session.total_fees_paid     = _ctrs["total_fees_paid"]
@@ -735,8 +802,10 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
             f"ratio 1:{int(1/session.copy_ratio)} ({session.copy_ratio*100:.4f}%)"
         )
 
-        # Seed existing positions at CURRENT mark price ("copy from now")
-        if state.positions:
+        # Only seed from target when there is no saved simulation state.
+        # With saved positions we have the original entry prices — re-seeding at the
+        # current mark price would corrupt them and double-deduct margin.
+        if not _saved_positions and state.positions:
             try:
                 all_mids = await _get_shared_mids(session.client)
             except Exception:
@@ -758,17 +827,20 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
                 is_long  = pos.size > 0
                 seed_fee = pos_value * settings.taker_fee_rate
 
-                session.simulated_positions[pos.symbol] = {
+                seed_pos = {
                     "size":        your_size if is_long else -your_size,
-                    "entry_price": current_px,   # mark price, not historical entry
+                    "entry_price": current_px,
                     "leverage":    your_lev,
                     "side":        "LONG" if is_long else "SHORT",
                     "value":       pos_value,
                     "margin_used": margin,
+                    "copy_ratio":  session.copy_ratio,
                 }
+                session.simulated_positions[pos.symbol] = seed_pos
                 session.simulated_balance -= margin + seed_fee
                 session.total_fees_paid   += seed_fee
 
+                db_upsert_position(session.address, pos.symbol, seed_pos)
                 ts_ms = int(datetime.now().timestamp() * 1000)
                 db_record_fill(
                     session.address, session.label,
@@ -856,16 +928,19 @@ async def _reinit_session(session: WalletSession, emit_fn: Callable):
                     continue
                 is_long  = pos.size > 0
                 seed_fee = pos_value * settings.taker_fee_rate
-                session.simulated_positions[pos.symbol] = {
+                reinit_pos = {
                     "size":        your_size if is_long else -your_size,
                     "entry_price": current_px,
                     "leverage":    your_lev,
                     "side":        "LONG" if is_long else "SHORT",
                     "value":       pos_value,
                     "margin_used": margin,
+                    "copy_ratio":  session.copy_ratio,
                 }
+                session.simulated_positions[pos.symbol] = reinit_pos
                 session.simulated_balance -= margin + seed_fee
                 session.total_fees_paid   += seed_fee
+                db_upsert_position(session.address, pos.symbol, reinit_pos)
                 ts_ms = int(datetime.now().timestamp() * 1000)
                 db_record_fill(
                     session.address, session.label,
