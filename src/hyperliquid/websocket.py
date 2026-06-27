@@ -91,32 +91,30 @@ class HyperliquidWebSocket:
             except Exception as e:
                 logger.error(f"Error in heartbeat task: {e}")
     
-    async def subscribe_user_events(self, address: str, callback: Optional[Callable] = None):
+    async def subscribe_user_events(self, address: str, dexs: list,
+                                      callback: Optional[Callable] = None):
         """
-        Subscribe to user updates (positions, orders, fills)
-        
-        Args:
-            address: Wallet address to monitor
-            callback: Function to call when updates are received
+        Subscribe to userEvents for every DEX so fills on sub-DEXes are captured.
+        One WebSocket subscription is sent per DEX; all share the same callback.
+        Subscriptions are stored per-DEX key so reconnect re-sends them all.
         """
-        channel = f"user:{address}"
-        
-        subscription = {
-            "method": "subscribe",
-            "subscription": {
-                "type": "userEvents",
-                "user": address
-            }
-        }
-        
-        self.subscriptions[channel] = subscription
+        channel_key = f"user:{address}"
         if callback:
-            self.callbacks[channel] = callback
-        
-        if self.ws:
-            await self._send_subscription(subscription)
-        
-        logger.info(f"Subscribed to user updates for {address}")
+            self.callbacks[channel_key] = callback
+
+        for dex in dexs:
+            sub = {
+                "method": "subscribe",
+                "subscription": {"type": "userEvents", "user": address},
+            }
+            if dex:  # empty string = default DEX; don't add an empty dex param
+                sub["subscription"]["dex"] = dex
+            key = f"user:{address}:{dex}" if dex else channel_key
+            self.subscriptions[key] = sub
+            if self.ws:
+                await self._send_subscription(sub)
+
+        logger.info(f"Subscribed to userEvents for {address} across {len(dexs)} DEX(es)")
 
 
     async def subscribe_order_updates(self, address: str, callback: Optional[Callable] = None):
@@ -201,21 +199,17 @@ class HyperliquidWebSocket:
     async def _handle_message(self, message: str):
         """Handle incoming WebSocket message"""
         try:
-            # Log RAW message
-            logger.info(f"📨 RAW WebSocket Message: {message[:500]}...")  # First 500 chars
-            
+            logger.debug(f"📨 RAW WebSocket Message: {message[:500]}...")
+
             data = json.loads(message)
-            
-            # Determine the channel/type of update
+
             channel = data.get("channel", "unknown")
-            
-            # Handle pong response from heartbeat
+
             if channel == "pong":
                 logger.debug("❤️ Received pong from server")
                 return
-            
-            # Log the parsed data
-            logger.info(f"📦 Parsed - Channel: '{channel}', Keys: {list(data.keys())}")
+
+            logger.debug(f"📦 Parsed - Channel: '{channel}', Keys: {list(data.keys())}")
             
             # Create update object
             update = WebSocketUpdate(
@@ -236,7 +230,7 @@ class HyperliquidWebSocket:
 
             if callback is not None:
                 callback_found = True
-                logger.info(f"✅ Calling callback for channel '{channel}'")
+                logger.debug(f"✅ Calling callback for channel '{channel}'")
                 try:
                     if asyncio.iscoroutinefunction(callback):
                         await callback(update)

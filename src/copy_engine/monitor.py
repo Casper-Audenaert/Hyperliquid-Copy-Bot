@@ -57,7 +57,7 @@ class WalletMonitor:
 
         # userEvents carries fills + positions + orders in one message.
         # We do NOT subscribe to orderUpdates — it would double-trigger on_new_order (Bug 5).
-        await self.ws.subscribe_user_events(self.target_address, self._handle_user_event)
+        await self.ws.subscribe_user_events(self.target_address, self.client.dexs, self._handle_user_event)
         await self.ws.listen()
 
     async def stop_monitoring(self):
@@ -131,24 +131,42 @@ class WalletMonitor:
                     logger.error(f"Fill callback error: {e}")
 
     async def _replay_missed_fills(self):
-        """Fetch fills newer than last_fill_time after a WS reconnect and replay them."""
+        """Fetch fills newer than last_fill_time after a WS reconnect and replay them.
+        Loops over all DEXes so sub-DEX fills are not missed during the reconnect window."""
         if self._last_fill_time == 0:
             return  # No fills processed yet; nothing to replay
         logger.info(f"Replaying missed fills since t={self._last_fill_time}…")
+        all_new: list = []
+        seen_tids: set = set()
         try:
             async with aiohttp.ClientSession() as http:
-                async with http.post(
-                    self.client.info_url,
-                    json={"type": "userFills", "user": self.target_address},
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    fills = await resp.json()
-            if not isinstance(fills, list):
-                return
-            new_fills = [f for f in fills if f.get("time", 0) > self._last_fill_time]
-            if new_fills:
-                logger.info(f"Replaying {len(new_fills)} missed fills")
-                await self._handle_fills(sorted(new_fills, key=lambda f: f.get("time", 0)))
+                for dex in self.client.dexs:
+                    try:
+                        payload = {"type": "userFills", "user": self.target_address}
+                        if dex:
+                            payload["dex"] = dex
+                        async with http.post(
+                            self.client.info_url,
+                            json=payload,
+                            timeout=aiohttp.ClientTimeout(total=15),
+                        ) as resp:
+                            fills = await resp.json()
+                        if not isinstance(fills, list):
+                            continue
+                        for f in fills:
+                            if f.get("time", 0) <= self._last_fill_time:
+                                continue
+                            tid = f.get("tid")
+                            if tid and tid in seen_tids:
+                                continue
+                            if tid:
+                                seen_tids.add(tid)
+                            all_new.append(f)
+                    except Exception:
+                        continue
+            if all_new:
+                logger.info(f"Replaying {len(all_new)} missed fills across {len(self.client.dexs)} DEX(es)")
+                await self._handle_fills(sorted(all_new, key=lambda f: f.get("time", 0)))
         except Exception as e:
             logger.warning(f"Fill replay failed: {e}")
 

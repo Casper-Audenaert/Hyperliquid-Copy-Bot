@@ -31,6 +31,7 @@ from copy_engine.position_sizer import PositionSizer
 from web.db import (
     db_record_fill, db_record_close, db_snapshot_equity,
     db_get_trades, purge_wallet_data,
+    db_get_latest_equity_snapshot, db_restore_session_counters,
 )
 
 # Shared session registry (keyed by lowercase address)
@@ -710,6 +711,18 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
     if offset_secs:
         await asyncio.sleep(offset_secs)
     session._state_lock = asyncio.Lock()
+
+    # Restore balance and stat counters from DB so they survive a server restart
+    _snap = db_get_latest_equity_snapshot(session.address)
+    if _snap:
+        session.simulated_balance = _snap["equity"]  # equity = cash + margin + upnl; seeding re-deducts margin
+        logger.info(f"[{session.label}] Restored balance ${_snap['equity']:.2f} from last snapshot")
+        _ctrs = db_restore_session_counters(session.address)
+        session.simulated_pnl       = _ctrs["simulated_pnl"]
+        session.total_fees_paid     = _ctrs["total_fees_paid"]
+        session.wins                = _ctrs["wins"]
+        session.losses              = _ctrs["losses"]
+        session.trades_copied_count = _ctrs["trades_copied_count"]
 
     logger.info(f"[{session.label}] Fetching initial state for {session.address[:10]}…")
     state = await session.monitor.get_current_state()

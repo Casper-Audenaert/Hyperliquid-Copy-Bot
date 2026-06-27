@@ -1772,9 +1772,11 @@ socket.on('state_update', s => {
   state[s.address] = {...(state[s.address]||{}), ...s};
   if (isNew) {
     if (compareMode) compareSelection.add(s.address);
-    loadHistory(s.address).then(()=>rebuildChart());
-    loadTrades(s.address);
+    loadHistory(s.address).then(()=>{ if (s.address === curWallet()) rebuildChart(); });
     loadStats(s.address);
+    // Only load trades for the wallet that will actually be displayed;
+    // selectWallet() handles it for any wallet the user explicitly clicks.
+    if (!activeWallet && Object.keys(state).length === 1) loadTrades(s.address);
   }
   renderSidebar();
   renderKpis();

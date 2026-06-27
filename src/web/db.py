@@ -161,6 +161,34 @@ def db_snapshot_equity(wallet_addr: str, equity: float, balance: float, upnl: fl
         db.commit()
 
 
+def db_get_latest_equity_snapshot(wallet_addr: str) -> dict | None:
+    with DbSession(_db_engine) as db:
+        row = (db.query(EquitySnapshot)
+               .filter(EquitySnapshot.wallet_addr == wallet_addr)
+               .order_by(EquitySnapshot.id.desc())
+               .first())
+    if not row:
+        return None
+    return {"equity": row.equity, "balance": row.balance, "upnl": row.upnl}
+
+
+def db_restore_session_counters(wallet_addr: str) -> dict:
+    """Aggregate live (non-seed) fill stats for restoring in-memory session counters."""
+    with DbSession(_db_engine) as db:
+        rows = (db.query(TradeRecord)
+                .filter(TradeRecord.wallet_addr == wallet_addr,
+                        TradeRecord.is_seed == False)  # noqa: E712
+                .all())
+    pnl    = sum(r.realized_pnl for r in rows if r.realized_pnl is not None)
+    fees   = sum(r.fee or 0 for r in rows)
+    wins   = sum(1 for r in rows if r.realized_pnl is not None and r.realized_pnl > 0)
+    losses = sum(1 for r in rows if r.realized_pnl is not None and r.realized_pnl < 0)
+    return {
+        "simulated_pnl": pnl, "total_fees_paid": fees,
+        "wins": wins, "losses": losses, "trades_copied_count": len(rows),
+    }
+
+
 # ── Query helpers ─────────────────────────────────────────────────────────────
 
 def db_get_equity_history(wallet_addr: str, hours: int = 24) -> list:
