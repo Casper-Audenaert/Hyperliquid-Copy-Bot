@@ -6,9 +6,7 @@ from typing import Optional, List, Dict, Any
 from loguru import logger
 from .models import Position, Order, UserState, PositionSide, OrderSide
 
-# Shared across ALL client instances — prevents 429s when many wallets fire simultaneously.
-# Raised from 4→10: fill handler no longer makes REST calls, so steady-state load is much lower;
-# the semaphore now only throttles periodic state + equity snapshot calls.
+# Primary semaphore — used by HyperliquidClient._post (live fill path, periodic state).
 _api_sem: Optional[asyncio.Semaphore] = None
 
 def _get_sem() -> asyncio.Semaphore:
@@ -16,6 +14,19 @@ def _get_sem() -> asyncio.Semaphore:
     if _api_sem is None:
         _api_sem = asyncio.Semaphore(10)
     return _api_sem
+
+
+# Startup semaphore — used by direct aiohttp callers (detect_style, fetch_fills, replay).
+# Tighter limit prevents the burst of 21 wallets × 9 DEX calls overwhelming HL's rate limit.
+_startup_sem: Optional[asyncio.Semaphore] = None
+
+def get_startup_sem() -> asyncio.Semaphore:
+    """Public semaphore for callers that bypass HyperliquidClient._post.
+    Limits concurrent startup/bulk REST calls to 3 across all wallets."""
+    global _startup_sem
+    if _startup_sem is None:
+        _startup_sem = asyncio.Semaphore(3)
+    return _startup_sem
 
 
 class HyperliquidClient:

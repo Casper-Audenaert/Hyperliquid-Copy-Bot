@@ -26,7 +26,7 @@ from web.db import (
     _db_engine,
     add_wallet_to_db, remove_wallet_from_db,
     list_wallets_from_db, purge_wallet_data, prune_old_snapshots,
-    db_get_equity_history, db_get_trades,
+    db_get_equity_history, db_get_trades, db_get_hft_calibration_stats,
     TradeRecord, EquitySnapshot,
 )
 from web.sim import _sessions, _create_session, start_session, _reinit_session, _session_to_dict
@@ -112,6 +112,13 @@ def api_stats(wallet):
     return jsonify(compute_stats(wallet.lower(), open_pos, copy_ratio=copy_ratio))
 
 
+@app.route("/api/calibration/<wallet>")
+def api_calibration(wallet):
+    """HFT accuracy calibration data — aggregates entry slippage and copy delay
+    across all debounced trades to measure the empirical simulation gap."""
+    return jsonify(db_get_hft_calibration_stats(wallet.lower()))
+
+
 @app.route("/api/add-wallet", methods=["POST"])
 def api_add_wallet():
     data    = request.get_json() or {}
@@ -128,7 +135,7 @@ def api_add_wallet():
         return jsonify({"error": "already monitored"}), 409
 
     session = _create_session(address, label, start_balance)
-    add_wallet_to_db(address, label, start_balance)
+    add_wallet_to_db(address, label, start_balance)  # copy_mode/detected_style set after detection in start_session
 
     # Start the session in the background loop; it emits state_update when ready
     submit(start_session(session, _safe_emit))
@@ -306,10 +313,17 @@ if __name__ == "__main__":
     db_wallets = list_wallets_from_db()
 
     for i, w in enumerate(db_wallets):
-        session = _create_session(w.address, w.label, w.start_balance)
-        # Stagger starts by 2s each — prevents 429s when many wallets init simultaneously
-        submit(start_session(session, _safe_emit, offset_secs=i * 2))
-        logger.info(f"Queued: {w.label} ({w.address[:10]}…) [start in {i*2}s]")
+        # Restore detected style from DB so restarts don't start with wrong defaults
+        session = _create_session(
+            w.address, w.label, w.start_balance,
+            copy_mode=getattr(w, "copy_mode", "all_fills") or "all_fills",
+            debounce_secs=getattr(w, "debounce_secs", 30) or 30,
+            detected_style=getattr(w, "detected_style", "Swing") or "Swing",
+        )
+        # Stagger starts by 5s each — 2s was too tight for 20+ wallets each making
+        # 9+ REST calls during startup (fill history + style detection)
+        submit(start_session(session, _safe_emit, offset_secs=i * 5))
+        logger.info(f"Queued: {w.label} ({w.address[:10]}…) [start in {i*5}s]")
 
     # 4. Drain the emit queue from a Flask-SocketIO background task
     socketio.start_background_task(_emit_worker)

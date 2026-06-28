@@ -2,9 +2,57 @@ import asyncio
 import aiohttp
 from typing import Callable, Optional, List
 from loguru import logger
-from hyperliquid.client import HyperliquidClient
+from hyperliquid.client import HyperliquidClient, get_startup_sem
 from hyperliquid.websocket import HyperliquidWebSocket
 from hyperliquid.models import Position, Order, UserState, WebSocketUpdate, PositionSide
+
+
+# ── Shared WebSocket pool ─────────────────────────────────────────────────────
+# HL enforces 15 WS connections per IP.  All monitors share connections from
+# this pool rather than each opening their own.  Each WS handles unlimited
+# subscriptions, so in practice a single connection serves all wallets.
+_MAX_WS_CONNECTIONS = 14     # keep 1 slot free for other HL WS usage
+_ws_pool: List[HyperliquidWebSocket] = []
+_ws_pool_lock: Optional[asyncio.Lock] = None   # lazily created in the asyncio loop
+
+
+def _get_pool_lock() -> asyncio.Lock:
+    global _ws_pool_lock
+    if _ws_pool_lock is None:
+        _ws_pool_lock = asyncio.Lock()
+    return _ws_pool_lock
+
+
+async def _acquire_shared_ws(ws_url: str) -> HyperliquidWebSocket:
+    """Return the WS connection with fewest subscriptions, or create a new one if
+    the pool has space.  Never creates more than _MAX_WS_CONNECTIONS connections."""
+    async with _get_pool_lock():
+        # Prefer an existing connected WS (fewest subscribers = most balanced)
+        if _ws_pool:
+            best = min(_ws_pool, key=lambda w: len(w.subscriptions))
+            return best
+
+        # Pool is empty — create the first shared connection
+        ws = HyperliquidWebSocket(ws_url)
+        _ws_pool.append(ws)
+        return ws
+
+
+async def _release_wallet_from_pool(address: str, dexs: list):
+    """Remove a wallet's subscriptions and callback from its shared WS.
+    Called when a wallet is removed from monitoring."""
+    addr_lower = address.lower()
+    async with _get_pool_lock():
+        for ws in _ws_pool:
+            if f"user:{addr_lower}" in ws.callbacks:
+                await ws.unsubscribe_user_events(address, dexs)
+                # Remove the reconnect handler registered for this address
+                ws.on_reconnect_handlers = [
+                    h for h in ws.on_reconnect_handlers
+                    if getattr(h, "__self__", None) is None
+                    or getattr(h.__self__, "target_address", "").lower() != addr_lower
+                ]
+                break
 
 
 class WalletMonitor:
@@ -15,15 +63,17 @@ class WalletMonitor:
         ws_url: str = "wss://api.hyperliquid.xyz/ws",
     ):
         self.target_address = target_address
+        self.api_url = api_url
+        self.ws_url = ws_url
         self.client = HyperliquidClient(api_url)
-        self.ws = HyperliquidWebSocket(ws_url)
+        # ws is set to the shared connection in start_monitoring()
+        self.ws: Optional[HyperliquidWebSocket] = None
 
         self.current_state: Optional[UserState] = None
         self.last_positions: List[Position] = []
         self.last_orders: List[Order] = []
 
         # Track the timestamp of the last processed fill for gap recovery
-        # ponytail: last_fill_time=0 on startup → only replays on reconnect after first fill
         self._last_fill_time: int = 0
 
         # Callbacks set by the session layer
@@ -32,6 +82,7 @@ class WalletMonitor:
         self.on_position_close: Optional[Callable] = None
         self.on_new_order: Optional[Callable] = None
         self.on_order_fill: Optional[Callable] = None
+        self.on_leverage_change: Optional[Callable] = None  # (symbol, old_lev, new_lev)
 
         logger.info(f"WalletMonitor initialised for {target_address}")
 
@@ -46,33 +97,50 @@ class WalletMonitor:
     async def start_monitoring(self):
         logger.info(f"Starting monitoring for {self.target_address}")
         await self.get_current_state()
-        await self.ws.connect()
 
-        # Wire up reconnect-based fill-gap recovery
-        self.ws.on_reconnect = self._replay_missed_fills
+        # Attach to (or create) a shared WS connection from the pool
+        shared_ws = await _acquire_shared_ws(self.ws_url)
+        self.ws = shared_ws
+
+        # Register this monitor's reconnect/fill-replay handler
+        shared_ws.on_reconnect_handlers.append(self._replay_missed_fills)
+
+        # If the shared WS isn't running yet, start it now
+        if not shared_ws.is_running:
+            await shared_ws.connect()
+            asyncio.create_task(shared_ws.listen())
+            logger.info(
+                f"Started shared WS (pool size={len(_ws_pool)}) "
+                f"for {self.target_address[:10]}…"
+            )
+        else:
+            logger.info(
+                f"Reusing shared WS (pool size={len(_ws_pool)}, "
+                f"subs={len(shared_ws.subscriptions)}) "
+                f"for {self.target_address[:10]}…"
+            )
 
         # Background state refresh — decoupled from fill events so high-frequency
-        # fills (thousands/hour) don't trigger REST calls on every message.
+        # fills don't trigger REST calls on every message.
         asyncio.create_task(self._periodic_state_refresh())
 
-        # userEvents carries fills + positions + orders in one message.
-        # We do NOT subscribe to orderUpdates — it would double-trigger on_new_order (Bug 5).
-        await self.ws.subscribe_user_events(self.target_address, self.client.dexs, self._handle_user_event)
-        await self.ws.listen()
+        # Subscribe this wallet's address to the shared WS
+        await shared_ws.subscribe_user_events(
+            self.target_address, self.client.dexs, self._handle_user_event
+        )
+        # Note: do NOT call await shared_ws.listen() here — it is already running
+        # as an asyncio task created above (or by a previous monitor).
 
     async def stop_monitoring(self):
-        logger.info("Stopping wallet monitoring")
-        await self.ws.stop()
+        logger.info(f"Stopping monitoring for {self.target_address}")
+        await _release_wallet_from_pool(self.target_address, self.client.dexs)
 
     async def _periodic_state_refresh(self):
-        """Refresh current_state every ~60s independent of fill events.
-        Automated bots trade thousands/hour — one REST call per fill per wallet
-        causes 429 storms. State is refreshed here; the fill handler reads cache.
-        Wide jitter (0-30s) keeps 15 wallets spread across a 30s window."""
+        """Refresh current_state every ~60s independent of fill events."""
         import random
-        await asyncio.sleep(random.uniform(0, 30))  # initial stagger on startup
+        await asyncio.sleep(random.uniform(0, 30))  # initial stagger
         while True:
-            await asyncio.sleep(50 + random.uniform(0, 20))  # 50-70s jitter
+            await asyncio.sleep(50 + random.uniform(0, 20))  # 50–70s jitter
             try:
                 await self.get_current_state()
                 logger.debug(f"State refreshed for {self.target_address[:10]}…")
@@ -88,18 +156,21 @@ class WalletMonitor:
                 return
             data = update.data["data"]
 
-            # No get_current_state() here — state is kept fresh by _periodic_state_refresh()
-            # AND by patching current_state in-place from WS position updates below.
-            # Removes 9 REST calls per fill per wallet, critical for high-frequency bots.
+            # Belt-and-suspenders address check: with a shared WS connection,
+            # the broadcast path may deliver another wallet's events here.
+            # Reject the entire message if the outer user field doesn't match.
+            event_user = (data.get("user") or "").lower()
+            if event_user and event_user != self.target_address.lower():
+                logger.debug(
+                    f"Skipping event for {event_user[:10]}… "
+                    f"(this monitor is {self.target_address[:10]}…)"
+                )
+                return
 
-            # Fills first: on_order_fill removes closed positions from simulated_positions,
-            # so the position snapshot's on_position_close returns early (no get_all_mids call).
-            # _handle_positions still patches current_state leverage for SUBSEQUENT messages.
             if "fills" in data:
                 await self._handle_fills(data["fills"])
             if "positions" in data:
                 await self._handle_positions(data["positions"])
-            # orders in userEvents are informational; new-order copying happens via fills
 
         except Exception as e:
             logger.error(f"Error handling WS event: {e}")
@@ -111,6 +182,13 @@ class WalletMonitor:
     async def _handle_fills(self, fills: List[dict]):
         from config.settings import settings
         for fill in fills:
+            # Per-fill address check: HL includes "user" in each fill dict.
+            # If it's present and doesn't match our target, skip this fill — it
+            # arrived via a shared WS connection meant for a different wallet.
+            fill_user = (fill.get("user") or "").lower()
+            if fill_user and fill_user != self.target_address.lower():
+                continue
+
             symbol = fill.get("coin", "").upper()
             if symbol in settings.copy_rules.blocked_assets:
                 logger.debug(f"Blocked asset fill skipped: {symbol}")
@@ -131,10 +209,9 @@ class WalletMonitor:
                     logger.error(f"Fill callback error: {e}")
 
     async def _replay_missed_fills(self):
-        """Fetch fills newer than last_fill_time after a WS reconnect and replay them.
-        Loops over all DEXes so sub-DEX fills are not missed during the reconnect window."""
+        """Fetch fills newer than last_fill_time after a WS reconnect and replay them."""
         if self._last_fill_time == 0:
-            return  # No fills processed yet; nothing to replay
+            return
         logger.info(f"Replaying missed fills since t={self._last_fill_time}…")
         all_new: list = []
         seen_tids: set = set()
@@ -145,12 +222,13 @@ class WalletMonitor:
                         payload = {"type": "userFills", "user": self.target_address}
                         if dex:
                             payload["dex"] = dex
-                        async with http.post(
-                            self.client.info_url,
-                            json=payload,
-                            timeout=aiohttp.ClientTimeout(total=15),
-                        ) as resp:
-                            fills = await resp.json()
+                        async with get_startup_sem():
+                            async with http.post(
+                                self.client.info_url,
+                                json=payload,
+                                timeout=aiohttp.ClientTimeout(total=15),
+                            ) as resp:
+                                fills = await resp.json()
                         if not isinstance(fills, list):
                             continue
                         for f in fills:
@@ -165,6 +243,9 @@ class WalletMonitor:
                     except Exception:
                         continue
             if all_new:
+                if len(all_new) > 500:
+                    logger.warning(f"Replay capped at 500 fills (had {len(all_new)}) — likely HFT target")
+                    all_new = sorted(all_new, key=lambda f: f.get("time", 0))[-500:]
                 logger.info(f"Replaying {len(all_new)} missed fills across {len(self.client.dexs)} DEX(es)")
                 await self._handle_fills(sorted(all_new, key=lambda f: f.get("time", 0)))
         except Exception as e:
@@ -173,13 +254,7 @@ class WalletMonitor:
     # ── Position handling ─────────────────────────────────────────────────────
 
     async def _handle_positions(self, positions: List[dict]):
-        """Detect open/close/update transitions from the position snapshot.
-        New positions: on_new_position is a no-op (fills are the authoritative copy signal).
-        Close/update: still trigger callbacks for safety-net close handling.
-
-        Also patches current_state.positions in-place from WebSocket data so that
-        the fill handler always has accurate leverage without a REST call.
-        """
+        """Detect open/close/update transitions and patch current_state from WS data."""
         from config.settings import settings
         for pos_data in positions:
             symbol = pos_data.get("coin", "").upper()
@@ -188,26 +263,24 @@ class WalletMonitor:
             if symbol in settings.copy_rules.blocked_assets:
                 continue
 
-            # ── Patch current_state from WS position data ─────────────────────
-            # WS sends leverage, entryPx, positionValue etc. alongside coin/szi.
-            # Update current_state so fill handler reads correct leverage immediately.
-            lev_raw    = pos_data.get("leverage", {})
-            leverage   = float(lev_raw.get("value", 1) if isinstance(lev_raw, dict) else lev_raw or 1)
-            entry_px   = float(pos_data.get("entryPx") or 0)
-            pos_val    = float(pos_data.get("positionValue") or 0)
-            curr_px    = (pos_val / abs(size)) if size != 0 else entry_px
-            upnl       = float(pos_data.get("unrealizedPnl") or 0)
-            liq_raw    = pos_data.get("liquidationPx")
-            liq_px     = float(liq_raw) if liq_raw else None
-            margin     = float(pos_data.get("marginUsed") or 0)
+            lev_raw  = pos_data.get("leverage", {})
+            leverage = float(lev_raw.get("value", 1) if isinstance(lev_raw, dict) else lev_raw or 1)
+            entry_px = float(pos_data.get("entryPx") or 0)
+            pos_val  = float(pos_data.get("positionValue") or 0)
+            curr_px  = (pos_val / abs(size)) if size != 0 else entry_px
+            upnl     = float(pos_data.get("unrealizedPnl") or 0)
+            liq_raw  = pos_data.get("liquidationPx")
+            liq_px   = float(liq_raw) if liq_raw else None
+            margin   = float(pos_data.get("marginUsed") or 0)
 
             if self.current_state is not None:
                 side = PositionSide.LONG if size > 0 else PositionSide.SHORT
                 if size != 0 and entry_px > 0:
-                    # Update or insert position in current_state
-                    updated = False
+                    updated      = False
+                    old_leverage = 0.0
                     for i, p in enumerate(self.current_state.positions):
                         if p.symbol == symbol:
+                            old_leverage = p.leverage
                             self.current_state.positions[i] = Position(
                                 symbol=symbol, side=side, size=abs(size),
                                 entry_price=entry_px, current_price=curr_px,
@@ -223,12 +296,19 @@ class WalletMonitor:
                             leverage=leverage, unrealized_pnl=upnl,
                             liquidation_price=liq_px, margin=margin,
                         ))
+                    if (updated and self.on_leverage_change
+                            and old_leverage > 0 and abs(leverage - old_leverage) > 0.01):
+                        try:
+                            asyncio.create_task(
+                                self.on_leverage_change(symbol, old_leverage, leverage)
+                            )
+                        except Exception:
+                            pass
                 elif size == 0:
                     self.current_state.positions = [
                         p for p in self.current_state.positions if p.symbol != symbol
                     ]
 
-            # ── Transition callbacks ──────────────────────────────────────────
             existing = next((p for p in self.last_positions if p.symbol == symbol), None)
 
             if existing and size == 0:
@@ -243,7 +323,6 @@ class WalletMonitor:
                         logger.error(f"Position-close callback error: {e}")
 
             elif existing and abs(size) != abs(existing.size):
-                # Size changed — fills already handled the copy; this is informational
                 logger.debug(f"Position updated (snapshot): {symbol} {existing.size}→{size}")
                 if self.on_position_update:
                     try:

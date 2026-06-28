@@ -33,6 +33,7 @@ let histChart          = null;
 let sharpeSeriesChart  = null;
 let fillCount    = 0;
 const recentFillsBuffer = []; // ponytail: ring buffer — all wallet fills regardless of compareMode
+let _chartUpdatePending = false; // debounce flag — prevents chart.update() storm from HFT equity_ticks
 let statsCache   = {};      // addr → stats dict (cached from /api/stats)
 let compareSelection = new Set(); // addrs visible in compare mode
 let showCombined     = false;     // overlay combined portfolio curve
@@ -74,12 +75,15 @@ function applyTheme(theme) {
   document.getElementById('theme-btn').textContent = theme === 'light' ? '☾' : '☀';
   localStorage.setItem('hl-theme', theme);
   rebuildChart();
-  if (pnlChart)         { pnlChart.destroy();        pnlChart        = null; }
-  if (underwaterChart)  { underwaterChart.destroy();  underwaterChart  = null; }
-  if (winRateChart)     { winRateChart.destroy();     winRateChart     = null; }
-  if (symPnlChart)      { symPnlChart.destroy();      symPnlChart      = null; }
-  if (histChart)        { histChart.destroy();        histChart        = null; }
-  if (sharpeSeriesChart){ sharpeSeriesChart.destroy();sharpeSeriesChart= null; }
+  if (pnlChart)           { pnlChart.destroy();           pnlChart           = null; }
+  if (underwaterChart)    { underwaterChart.destroy();    underwaterChart     = null; }
+  if (winRateChart)       { winRateChart.destroy();       winRateChart       = null; }
+  if (symPnlChart)        { symPnlChart.destroy();        symPnlChart        = null; }
+  if (histChart)          { histChart.destroy();          histChart          = null; }
+  if (sharpeSeriesChart)  { sharpeSeriesChart.destroy();  sharpeSeriesChart  = null; }
+  if (weeklyPnlChartInst) { weeklyPnlChartInst.destroy(); weeklyPnlChartInst = null; }
+  if (dailyTradesChartInst){dailyTradesChartInst.destroy();dailyTradesChartInst=null;}
+  if (monthlyPnlChart)    { monthlyPnlChart.destroy();    monthlyPnlChart    = null; }
   const cur = curWallet();
   if (cur && statsCache[cur]) renderStats(statsCache[cur]);
   if (showUnderwater && cur) renderUnderwaterChart(cur);
@@ -158,7 +162,7 @@ function initChart() {
         x: { type:'time', time:{ tooltipFormat:'HH:mm:ss', displayFormats:{minute:'HH:mm',hour:'HH:mm',day:'MMM d'} },
              ticks:{color:c.t3,maxTicksLimit:8,font:{size:10}}, grid:{color:c.hr+'88'}, border:{color:c.hr} },
         y: { ticks:{ color:c.t3, font:{size:10},
-                     callback: v => compareMode ? (v>=0?'+':'')+v.toFixed(1)+'%' : '$'+v.toLocaleString(undefined,{maximumFractionDigits:0}) },
+                     callback: v => compareMode ? (v>=0?'+':'')+v.toFixed(1)+'%' : fUsd(v) },
              grid:{color:c.hr+'88'}, border:{color:c.hr} }
       }
     }
@@ -178,7 +182,8 @@ function computeUnderwaterData(history) {
   let peak = -Infinity;
   return history.map(p => {
     if (p.equity > peak) peak = p.equity;
-    return { x: p.t.endsWith('Z') ? p.t : p.t + 'Z',
+    const ts = (p.t || '').slice(0, 23);
+    return { x: ts.endsWith('Z') ? ts : ts + 'Z',
              y: peak > 0 ? (p.equity - peak) / peak * 100 : 0 };
   });
 }
@@ -232,7 +237,13 @@ function filteredHistory(addr) {
   const h = state[addr]?._history || [];
   if (!rangeHours) return h;
   const cut = Date.now() - rangeHours * 3_600_000;
-  return h.filter(p => new Date(p.t.endsWith('Z')?p.t:p.t+'Z').getTime() >= cut);
+  return h.filter(p => {
+    // Slice to 23 chars ("YYYY-MM-DDTHH:MM:SS.mmm") before parsing — ECMAScript only
+    // guarantees millisecond precision; 6-decimal microseconds (Python default) cause
+    // Invalid Date in Safari and some strict-mode engines.
+    const ts = (p.t || '').slice(0, 23);
+    return new Date(ts.endsWith('Z') ? ts : ts + 'Z').getTime() >= cut;
+  });
 }
 
 // ── Compare helpers ────────────────────────────────────────────────────────
@@ -344,7 +355,16 @@ function addEquityPoint(addr, pt) {
   if (ds) {
     ds.data.push({ x: pt.t, y });
     if (ds.data.length > 5000) ds.data.shift();
-    chart.update('none');
+    // Debounce to one redraw per animation frame (~16 ms).
+    // Calling chart.update('none') on every HFT fill (hundreds/sec) locks up
+    // Chart.js hover detection — the tooltip freezes at one value.
+    if (!_chartUpdatePending) {
+      _chartUpdatePending = true;
+      requestAnimationFrame(() => {
+        chart.update('none');
+        _chartUpdatePending = false;
+      });
+    }
   } else {
     rebuildChart();
   }
@@ -380,12 +400,17 @@ function renderSidebar() {
     const shortAddr = addr.slice(0,6) + '…' + addr.slice(-4);
     const npnl = s.net_pnl ?? null;
     const npnlCls = npnl == null ? 'z' : npnl > 0 ? 'pos' : npnl < 0 ? 'neg' : 'z';
+    const style  = s.detected_style || 'Swing';
+    const styleBadge = style === 'HFT'
+      ? `<span class="style-pill hft" title="High-frequency target — copies use ${s.debounce_secs ?? 30}s debounce (median hold ${s.median_hold_secs ?? '?'}s)">HFT</span>`
+      : `<span class="style-pill swing" title="Swing/long-term target — all fills copied immediately">Swing</span>`;
     return `<div class="wcard${cardCls}" onclick="${clickFn}">
   <div class="wcard-inner">
     <div class="wc-header">
       <span class="wc-rank">#${rank+1}</span>
       <div class="wc-dot${s.is_paused?' paused':''}" style="background:${s.is_paused?'var(--warn)':clr(addr)}"></div>
       <span class="wc-name" title="${addr}">${s.label}</span>
+      ${styleBadge}
       ${s.liquidation_risk ? `<span class="score-pill bad" title="A position is within 5% of its liquidation price">⚠ LIQ</span>` : (score != null ? `<span class="score-pill ${scoreCls}">${score}</span>` : '')}
       <div class="wc-actions">
         <button class="wc-act-btn rst" onclick="event.stopPropagation();resetWallet('${addr}')" title="Reset">⟳</button>
@@ -728,24 +753,51 @@ function renderStats(st) {
     ${(()=>{
       const cb = st.capital_brackets;
       if (!cb) return '';
-      const fRatio = r => r > 0 ? '1:'+Math.round(1/r) : '—';
-      const row = (lbl, cap, ratio, color, tip) =>
+      const userBal = state[activeWallet || Object.keys(state)[0]]?.start_balance || 0;
+      const fRatio  = r => r > 0 ? '1:' + Math.round(1/r) : '—';
+
+      // Suffix per row: green tick if user meets it, dimmed delta if not
+      const sfx = (needed) => {
+        if (!userBal || !needed) return '';
+        const diff = needed - userBal;
+        if (diff <= 0) return `<span style="color:var(--green);font-size:11px;margin-left:3px">✓</span>`;
+        return `<span style="color:var(--t3);font-size:10px;margin-left:3px">need +${fUsd(diff)}</span>`;
+      };
+
+      const rowC = (lbl, cap, ratio, color, tip) =>
         `<div class="stat-row" title="${tip}">
           <span class="stat-lbl">${lbl}</span>
-          <span style="display:flex;gap:6px;align-items:baseline">
+          <span style="display:flex;gap:5px;align-items:baseline;flex-wrap:wrap">
             ${sv(fUsd(cap), color)}
             <span style="font-size:10px;color:var(--t3)">${fRatio(ratio)}</span>
+            ${sfx(cap)}
           </span>
         </div>`;
+
+      // Plain-English summary line based on where the user's capital sits
+      let status;
+      if (!userBal) {
+        status = `Capital thresholds for copying this trader. HL minimum order = $10 notional.`;
+      } else if (userBal >= cb.optimal) {
+        status = `<span style="color:var(--green);font-weight:700">✓ Great coverage.</span> Your ${fUsd(userBal)} gives good resolution — smallest trade ≥ $100.`;
+      } else if (userBal >= cb.suggested) {
+        status = `<span style="color:var(--green);font-weight:700">✓ Comfortable.</span> Your ${fUsd(userBal)} covers all trades with headroom. ${fUsd(cb.optimal - userBal)} more reaches Optimal.`;
+      } else if (userBal >= cb.min) {
+        status = `<span style="color:var(--warn);font-weight:700">⚠ Covered, but tight.</span> Your ${fUsd(userBal)} captures all trades — nothing is skipped. ${fUsd(cb.suggested - userBal)} more reaches Suggested for better resolution.`;
+      } else {
+        status = `<span style="color:var(--red);font-weight:700">✗ Below floor.</span> Your ${fUsd(userBal)} is below the minimum — ${fUsd(cb.min - userBal)} more needed to stop skipping the trader's smallest orders.`;
+      }
+
       return `
     <div class="stat-section">
       <div class="stat-section-title">Copy Capital Guide</div>
-      <div style="font-size:10px;color:var(--t3);margin-bottom:6px">Real capital needed to mirror this trader on HL (proportional ratio). HL minimum order = $10 notional.</div>
+      <div style="font-size:11px;color:var(--t2);margin-bottom:8px;line-height:1.5">${status}</div>
+      <div style="font-size:10px;color:var(--t3);margin-bottom:6px">Each level shows the capital where your smallest copied trade hits that dollar threshold. Bigger capital = larger positions = more meaningful dollar P&amp;L per trade (percentage returns stay the same).</div>
       <div class="stat-grid">
-        ${row('Min (floor)', cb.min, cb.ratio_min, 'var(--warn)', 'Bare minimum — smallest trade hits the $10 HL floor exactly')}
-        ${row('Suggested', cb.suggested, cb.ratio_suggested, 'var(--t1)', 'Comfortable floor — smallest trade = $50 (5× headroom)')}
-        ${row('Optimal', cb.optimal, cb.ratio_optimal, 'var(--green)', 'Good resolution — smallest trade = $100, P&L moves are meaningful')}
-        ${row('1:1 Follow', cb.one_to_one, cb.ratio_one_to_one, 'var(--brand)', 'Mirror the trader at exact scale')}
+        ${rowC('Min (floor)',  cb.min,        cb.ratio_min,        userBal >= cb.min        ? 'var(--green)' : 'var(--warn)',  'Smallest trade = $10 exactly. Below this level some of the trader\'s orders get skipped (below HL\'s minimum notional).')}
+        ${rowC('Suggested',   cb.suggested,  cb.ratio_suggested,  userBal >= cb.suggested  ? 'var(--green)' : 'var(--t2)',   'Smallest trade = $50 — 5× headroom above the HL floor. Comfortable for most strategies.')}
+        ${rowC('Optimal',     cb.optimal,    cb.ratio_optimal,    userBal >= cb.optimal    ? 'var(--green)' : 'var(--t2)',   'Smallest trade = $100 — good resolution. Each individual trade produces meaningful P&L.')}
+        ${rowC('1:1 Follow',  cb.one_to_one, cb.ratio_one_to_one, 'var(--brand)',           'Mirror this trader at their exact position sizes — no scaling.')}
       </div>
     </div>`;
     })()}
@@ -764,7 +816,7 @@ function renderStats(st) {
         ${st.fee_drag_pct!=null?`<div class="stat-row"><span class="stat-lbl">Fee Drag</span>${sv(st.fee_drag_pct+'% of gross profit','var(--red)')}</div>`:''}
         <div class="stat-row" title="Minimum fill notional needed so the expected price move covers the fee"><span class="stat-lbl">Break-even Size</span>${sv(st.breakeven_notional!=null?fUsd(st.breakeven_notional)+' notional':'—','var(--t2)')}</div>
       </div>
-      <div style="font-size:10px;color:var(--t3);margin-top:4px">* Funding applied pro-rated every 30s from live HL rates. Slippage not modeled.</div>
+      <div style="font-size:10px;color:var(--t3);margin-top:4px">* Funding pro-rated every 30s from live HL rates. Slippage model: 3 bps/side on every fill. Execution latency: 150 ms drift on opens (all-fills mode).</div>
     </div>
 
     ${symbolStats.length ? `
@@ -1295,8 +1347,8 @@ function _renderPnlHeatmap(pnlByDay) {
   const H = 7 * (CELL + GAP) + 18;
   const cells = weeks.flatMap((week, wi) =>
     week.map((day, di) => {
-      if (!day.inRange) return `<rect x="${24+wi*(CELL+GAP)}" y="${18+di*(CELL+GAP)}" width="${CELL}" height="${CELL}" rx="2" fill="var(--border)" opacity="0.3"/>`;
-      if (day.pnl == null) return `<rect x="${24+wi*(CELL+GAP)}" y="${18+di*(CELL+GAP)}" width="${CELL}" height="${CELL}" rx="2" fill="var(--card2)"/>`;
+      if (!day.inRange) return `<rect x="${24+wi*(CELL+GAP)}" y="${18+di*(CELL+GAP)}" width="${CELL}" height="${CELL}" rx="2" fill="var(--s3)" opacity="0.3"/>`;
+      if (day.pnl == null) return `<rect x="${24+wi*(CELL+GAP)}" y="${18+di*(CELL+GAP)}" width="${CELL}" height="${CELL}" rx="2" fill="var(--s2)"/>`;
       const intensity = Math.min(Math.abs(day.pnl) / maxAbs, 1);
       const alpha = 0.2 + intensity * 0.8;
       const col   = day.pnl >= 0 ? `rgba(52,211,153,${alpha.toFixed(2)})` : `rgba(248,113,113,${alpha.toFixed(2)})`;
@@ -1326,7 +1378,7 @@ function renderWeeklyPnlChart(data) {
     options: { responsive: true, maintainAspectRatio: true,
       plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => '$' + c.raw.toFixed(2) } } },
       scales: { x: { ticks: { color: 'var(--t3)', font: { size: 9 } }, grid: { display: false } },
-                y: { ticks: { color: 'var(--t3)', font: { size: 9 } }, grid: { color: 'var(--border)' } } } },
+                y: { ticks: { color: 'var(--t3)', font: { size: 9 } }, grid: { color: 'var(--hr)' } } } },
   });
 }
 
@@ -1345,7 +1397,7 @@ function renderDailyTradeCountChart(data) {
     options: { responsive: true, maintainAspectRatio: false,
       plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => c.raw + ' trades' } } },
       scales: { x: { ticks: { color: 'var(--t3)', font: { size: 9 } }, grid: { display: false } },
-                y: { ticks: { color: 'var(--t3)', font: { size: 9 } }, grid: { color: 'var(--border)' } } } },
+                y: { ticks: { color: 'var(--t3)', font: { size: 9 } }, grid: { color: 'var(--hr)' } } } },
   });
 }
 

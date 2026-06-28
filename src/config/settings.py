@@ -49,6 +49,31 @@ class RiskManagementConfig(BaseModel):
     max_daily_loss_usd: float = 500.0
     enable_custom_stops: bool = False
     stop_loss_pct: float = 5.0
+    fast_loss_pct: float = 0.05           # pause if equity drops this fraction within the window
+    fast_loss_window_secs: int = 300      # rolling window for the circuit breaker (5 minutes)
+    max_net_exposure_pct: float = 0.80    # |long_notional - short_notional| / equity cap
+
+class CopyStyleConfig(BaseModel):
+    hft_threshold_fills_per_hour: int = 60   # fills/hr above this → debounced copy mode
+    hft_debounce_secs: int = 30              # seconds to wait before confirming a debounced copy
+
+class SimAccuracyConfig(BaseModel):
+    slippage_bps: float = 3.0          # basis points of slippage per side on every fill
+    sim_latency_ms: int = 150          # ms of execution delay (price drift approximation)
+    maker_close_rate: float = 0.0      # fraction of close fills charged at maker fee rate
+
+class StartupSeedingPolicy(BaseModel):
+    startup_mode: str = "smart_safe"              # "smart_safe" | "always_seed" | "always_skip"
+    max_seed_drift_pct: float = 0.015             # 1.5% max entry drift before ghosting
+    max_seed_leverage: int = 4                    # cap leverage at seed time
+    startup_seed_size_multiplier: float = 0.35    # scale down seed size vs live copy size
+    max_seed_position_notional_pct: float = 0.03  # 3% per-position exposure limit
+    max_total_copied_exposure_pct: float = 0.25   # 25% total portfolio exposure limit
+    max_symbol_exposure_pct: float = 0.10         # 10% per-symbol exposure limit
+    pause_on_daily_loss_pct: float = 0.03         # skip seeding if today's loss >= 3%
+    pause_on_total_drawdown_pct: float = 0.10     # skip seeding if drawdown >= 10%
+    allow_seed_small: bool = True                 # use SEED_SMALL for borderline positions
+    ghost_on_failed_seed: bool = True             # ghost instead of ignoring failed seed orders
 
 def _validate_eth_address(v: Optional[str], field_name: str) -> Optional[str]:
     """Validate Ethereum address format."""
@@ -78,6 +103,9 @@ class Settings(BaseModel):
     leverage: LeverageConfig = Field(default_factory=LeverageConfig)
     copy_rules: CopyRulesConfig = Field(default_factory=CopyRulesConfig)
     risk_management: RiskManagementConfig = Field(default_factory=RiskManagementConfig)
+    seed_policy: StartupSeedingPolicy = Field(default_factory=StartupSeedingPolicy)
+    copy_style: CopyStyleConfig = Field(default_factory=CopyStyleConfig)
+    sim_accuracy: SimAccuracyConfig = Field(default_factory=SimAccuracyConfig)
 
     # Paths
     log_level: str = "INFO"
