@@ -119,22 +119,36 @@ class WalletSession:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+_MAX_PRICE_DEVIATION = 0.05   # 5% — reject WS prices that diverge this far from allMids
+
 def _upnl(s: WalletSession) -> float:
     if not s.simulated_positions:
         return 0.0
-    # WS-patched current_state prices are the most real-time source — use them so
-    # the equity chart tracks actual market moves, not a stale 3s cache.
-    # allMids cache is a fallback for symbols the target no longer holds.
-    price_map: dict = {}
-    if s.monitor and s.monitor.current_state:
-        price_map = {p.symbol: p.current_price
-                     for p in s.monitor.current_state.positions if p.current_price > 0}
+    # Price source strategy: use WS current_state prices (real-time, refreshed every
+    # WS message) for responsive equity tracking, BUT sanity-check against allMids.
+    # If a WS price deviates > 5% from allMids it signals sub-DEX positionValue
+    # divergence — that causes massive equity spikes (e.g. entry $0.10 vs
+    # current_state $30).  In that case fall back to the allMids price instead.
+    mids: dict = {}
     if _mids_cache:
-        for sym in s.simulated_positions:
-            if sym not in price_map or price_map[sym] <= 0:
-                px = _mids_cache.get(sym)
-                if px and float(px) > 0:
-                    price_map[sym] = float(px)
+        mids = {sym: float(px) for sym, px in _mids_cache.items() if float(px) > 0}
+    ws: dict = {}
+    if s.monitor and s.monitor.current_state:
+        ws = {p.symbol: p.current_price
+              for p in s.monitor.current_state.positions if p.current_price > 0}
+
+    price_map: dict = {}
+    for sym in s.simulated_positions:
+        mid_px = mids.get(sym)
+        ws_px  = ws.get(sym)
+        if ws_px and mid_px and mid_px > 0:
+            deviation = abs(ws_px - mid_px) / mid_px
+            price_map[sym] = ws_px if deviation <= _MAX_PRICE_DEVIATION else mid_px
+        elif ws_px:
+            price_map[sym] = ws_px
+        elif mid_px:
+            price_map[sym] = mid_px
+
     total = 0.0
     for sym, pos in s.simulated_positions.items():
         px = price_map.get(sym, 0)
@@ -147,27 +161,28 @@ def _upnl(s: WalletSession) -> float:
 
 
 def _session_to_dict(s: WalletSession) -> dict:
-    # Build price map with source chosen per position type:
-    #   Seeded positions  → allMids cache  (same source as entry_price; prevents
-    #                                       sub-DEX positionValue inflation at startup)
-    #   Live positions    → WS current_state (real-time, shows actual price moves)
-    # Both fall back to the other source if their primary is unavailable.
-    ws_prices   = {}
-    mids_prices = {}
+    # Build price map: WS current_state as primary (real-time), allMids as sanity check.
+    # If WS price deviates > 5% from allMids it flags a sub-DEX positionValue
+    # discrepancy — use allMids instead to prevent the inflation.
+    _ws_prices  = {}
+    _mid_prices = {}
     if s.monitor and s.monitor.current_state:
-        ws_prices = {p.symbol: p.current_price
-                     for p in s.monitor.current_state.positions if p.current_price > 0}
+        _ws_prices = {p.symbol: p.current_price
+                      for p in s.monitor.current_state.positions if p.current_price > 0}
     if _mids_cache:
-        mids_prices = {sym: float(px) for sym, px in _mids_cache.items() if float(px) > 0}
+        _mid_prices = {sym: float(px) for sym, px in _mids_cache.items() if float(px) > 0}
 
     price_map = {}
-    for sym, pos in s.simulated_positions.items():
-        if pos.get("seeded_on_startup"):
-            px = mids_prices.get(sym) or ws_prices.get(sym)
-        else:
-            px = ws_prices.get(sym) or mids_prices.get(sym)
-        if px and px > 0:
-            price_map[sym] = px
+    for sym in s.simulated_positions:
+        ws_px  = _ws_prices.get(sym)
+        mid_px = _mid_prices.get(sym)
+        if ws_px and mid_px and mid_px > 0:
+            deviation = abs(ws_px - mid_px) / mid_px
+            price_map[sym] = ws_px if deviation <= _MAX_PRICE_DEVIATION else mid_px
+        elif ws_px:
+            price_map[sym] = ws_px
+        elif mid_px:
+            price_map[sym] = mid_px
 
     total_upnl  = 0.0
     total_margin = 0.0
@@ -826,14 +841,37 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
             # Using start_balance here would shrink our ratio as the target grows,
             # even when our own equity is also growing — that's wrong.
 
-            price_map: dict = {}
+            # Build price_map: WS current_state as primary (real-time), allMids as
+            # sanity check.  Same _MAX_PRICE_DEVIATION guard as _upnl() — rejects
+            # sub-DEX positionValue/size prices that diverge > 5% from allMids.
+            _snap_mids: dict = {}
+            if _mids_cache:
+                _snap_mids = {sym: float(px) for sym, px in _mids_cache.items() if float(px) > 0}
+            _snap_ws: dict = {}
             if session.monitor and session.monitor.current_state:
-                price_map = {p.symbol: p.current_price
-                             for p in session.monitor.current_state.positions if p.current_price > 0}
+                _snap_ws = {p.symbol: p.current_price
+                            for p in session.monitor.current_state.positions if p.current_price > 0}
+            price_map: dict = {}
+            for sym in session.simulated_positions:
+                ws_px  = _snap_ws.get(sym)
+                mid_px = _snap_mids.get(sym)
+                if ws_px and mid_px and mid_px > 0:
+                    deviation = abs(ws_px - mid_px) / mid_px
+                    price_map[sym] = ws_px if deviation <= _MAX_PRICE_DEVIATION else mid_px
+                elif ws_px:
+                    price_map[sym] = ws_px
+                elif mid_px:
+                    price_map[sym] = mid_px
+            # REST fallback for symbols not yet in either source
             missing = [s for s in session.simulated_positions if s not in price_map or price_map[s] <= 0]
             if missing:
-                mids = await _get_shared_mids(session.client)
-                price_map.update(mids)
+                try:
+                    rest_mids = await _get_shared_mids(session.client)
+                    for sym in missing:
+                        if sym in rest_mids and float(rest_mids[sym]) > 0:
+                            price_map[sym] = float(rest_mids[sym])
+                except Exception:
+                    pass
 
             total_upnl = 0.0
             for sym, pos in session.simulated_positions.items():
@@ -1549,6 +1587,9 @@ async def _reinit_session(session: WalletSession, emit_fn: Callable):
         session.bot_start_time       = datetime.now()
         session.equity_history       = []
         session.recent_fills         = []
+        session._last_equity_tick_ts = 0.0   # reset rate-limit so first tick fires immediately
+        session._style_last_checked  = 0.0   # force style re-detection after reinit
+        session._pending_debounce    = {}     # cancel any queued debounce tasks
 
     state = await session.monitor.get_current_state()
     if state and state.balance > 0:
@@ -1690,6 +1731,18 @@ async def _reinit_session(session: WalletSession, emit_fn: Callable):
         "upnl": round(upnl, 2),
     })
     db_snapshot_equity(session.address, eq, session.simulated_balance, upnl)
+
+    # Re-register all WS callbacks — reinit clears simulated_positions/ghosts but the
+    # monitor's callbacks were set in the original start_session and point to closures
+    # over the OLD state.  Recreating them ensures on_order_fill, on_leverage_change,
+    # etc. all reference the correct (now-reset) session object.
+    cbs = make_callbacks(session, emit_fn)
+    session.monitor.on_new_position    = cbs["on_new_position"]
+    session.monitor.on_position_close  = cbs["on_position_close"]
+    session.monitor.on_position_update = cbs["on_position_update"]
+    session.monitor.on_new_order       = cbs["on_new_order"]
+    session.monitor.on_order_fill      = cbs["on_order_fill"]
+    session.monitor.on_leverage_change = cbs["on_leverage_change"]
 
     emit_fn("clear", {"address": session.address, "label": session.label,
                       "start_balance": session.start_balance, "equity": round(eq, 2)})
