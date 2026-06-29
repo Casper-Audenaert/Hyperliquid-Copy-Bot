@@ -471,6 +471,25 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
 
     pnl_realized = None
 
+    # Affordability guard: if the margin required exceeds free cash, skip.
+    # Spot buys (1x leverage) and very large positions create margin = full notional.
+    # The target's spot position won't appear in current_state.positions, so
+    # target_leverage defaults to 1.0 → margin = our_size * price. With a $10k
+    # sim account we can never put up $387k margin — skip it rather than letting
+    # the balance go deeply negative (which corrupts all subsequent equity calcs).
+    if is_opening and not is_flip:
+        _margin_est = our_size * price / max(our_leverage, 1)
+        if _margin_est > session.simulated_balance:
+            session.skipped_fills_count += 1
+            session._processed_fill_ids[fill_id] = None
+            _evict_fill_ids(session)
+            logger.warning(
+                f"[{session.label}] Affordability guard: {symbol} needs "
+                f"~${_margin_est:,.0f} margin but free balance is "
+                f"${session.simulated_balance:,.0f} ({our_leverage:.0f}x lev) — skip"
+            )
+            return
+
     # Guard: close for a position we never tracked → skip (pre-dates our session)
     if is_closing and not is_flip and symbol not in session.simulated_positions:
         session._processed_fill_ids[fill_id] = None
@@ -494,8 +513,15 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             pos      = session.simulated_positions[symbol]
             pos_size = abs(pos["size"])
 
-            # Use the same fraction the target closed (ratio-stable even if copy_ratio drifted)
-            fraction   = min(target_size / target_pos_size, 1.0) if target_pos_size > 0 else 1.0
+            # Use the same fraction the target closed (ratio-stable even if copy_ratio drifted).
+            # Fallback when current_state is stale/unavailable: infer close fraction from the
+            # fill size scaled by copy_ratio vs our sim position size.  Without this, a partial
+            # close with unknown target position size would silently close 100% of our position.
+            if target_pos_size > 0:
+                fraction = min(target_size / target_pos_size, 1.0)
+            else:
+                our_expected_close = target_size * session.copy_ratio
+                fraction = min(our_expected_close / pos_size, 1.0) if pos_size > 0 else 1.0
             close_size = pos_size * fraction
             emit_size  = close_size
 
@@ -742,9 +768,12 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
             return
 
         # Dedup by tid (trade ID) or composite key
+        # Normalize px/sz to float so "50000" and "50000.0" produce the same dedup key.
         fill_id = fill_data.get("tid") or (
-            fill_data.get("coin", ""), fill_data.get("px", ""),
-            fill_data.get("sz", ""),  fill_data.get("dir", ""),
+            fill_data.get("coin", ""),
+            float(fill_data.get("px") or 0),
+            float(fill_data.get("sz") or 0),
+            fill_data.get("dir", ""),
         )
         if fill_id in session._processed_fill_ids:
             return
@@ -1380,6 +1409,22 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
         session.wins                = _ctrs["wins"]
         session.losses              = _ctrs["losses"]
         session.trades_copied_count = _ctrs["trades_copied_count"]
+
+    elif _saved_positions:
+        # Positions exist but no equity snapshot yet — server crashed before the first 30s
+        # snapshot tick fired.  Restore position state; balance stays at start_balance and
+        # corrects itself on the next snapshot when margin + UPNL are recomputed from prices.
+        session.simulated_positions = _saved_positions
+        _ctrs = db_restore_session_counters(session.address)
+        session.simulated_pnl       = _ctrs["simulated_pnl"]
+        session.total_fees_paid     = _ctrs["total_fees_paid"]
+        session.wins                = _ctrs["wins"]
+        session.losses              = _ctrs["losses"]
+        session.trades_copied_count = _ctrs["trades_copied_count"]
+        logger.info(
+            f"[{session.label}] Restored {len(_saved_positions)} position(s) "
+            f"(no equity snapshot — crash before first tick)"
+        )
 
     logger.info(f"[{session.label}] Fetching initial state for {session.address[:10]}…")
     state = await session.monitor.get_current_state()

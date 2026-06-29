@@ -49,7 +49,13 @@ def _start_loop():
 
 def submit(coro):
     import asyncio
-    return asyncio.run_coroutine_threadsafe(coro, _loop)
+    assert _loop is not None, "Event loop not started"
+    future = asyncio.run_coroutine_threadsafe(coro, _loop)
+    def _log_exc(f):
+        if not f.cancelled() and f.exception():
+            logger.error(f"Background task failed: {f.exception()!r}")
+    future.add_done_callback(_log_exc)
+    return future
 
 
 # ── Thread-safe emit queue ────────────────────────────────────────────────────
@@ -77,7 +83,7 @@ socketio = SocketIO(app, async_mode="threading", cors_allowed_origins="*")
 
 @socketio.on("connect")
 def on_dash_connect():
-    for s in _sessions.values():
+    for s in list(_sessions.values()):
         emit("state_update", _session_to_dict(s))
 
 
@@ -88,7 +94,7 @@ def index():
 
 @app.route("/api/state")
 def api_state():
-    return jsonify([_session_to_dict(s) for s in _sessions.values()])
+    return jsonify([_session_to_dict(s) for s in list(_sessions.values())])
 
 
 @app.route("/api/history/<wallet>")
@@ -176,7 +182,7 @@ def api_clear():
         db.query(TradeRecord).delete()
         db.query(EquitySnapshot).delete()
         db.commit()
-    for s in _sessions.values():
+    for s in list(_sessions.values()):
         submit(_reinit_session(s, _safe_emit))
     return jsonify({"ok": True})
 
@@ -227,7 +233,7 @@ _server_start = time.time()
 @app.route("/api/health")
 def api_health():
     wallets = {}
-    for addr, s in _sessions.items():
+    for addr, s in list(_sessions.items()):
         ws_ok = getattr(s.monitor, "is_connected", None)
         uptime = (datetime.now() - s.bot_start_time).total_seconds() / 3600 if s.bot_start_time else 0
         wallets[addr] = {

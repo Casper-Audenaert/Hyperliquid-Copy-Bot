@@ -505,9 +505,14 @@ def compute_stats(wallet_addr: str, open_positions: dict = None, copy_ratio: flo
     recent_7d_trades = len([t for t in recent_trades if t.realized_pnl is not None])
     prior_7d_trades  = len([t for t in prior_trades  if t.realized_pnl is not None])
     if days_active >= 7 and prior_7d_trades > 0:
-        if recent_7d_pnl > prior_7d_pnl * 1.1:
+        # Compare absolute improvement against 10% of the prior period's magnitude.
+        # Multiplier-based comparison (prior * 1.1) flips direction when prior is negative
+        # (e.g. prior=-$500 → threshold=-$550 → recent=-$549 wrongly shows "improving").
+        _improvement = recent_7d_pnl - prior_7d_pnl
+        _threshold   = abs(prior_7d_pnl) * 0.10 if prior_7d_pnl != 0 else 1.0
+        if _improvement > _threshold:
             pnl_trend = "improving"
-        elif recent_7d_pnl < prior_7d_pnl * 0.9:
+        elif _improvement < -_threshold:
             pnl_trend = "declining"
         else:
             pnl_trend = "stable"

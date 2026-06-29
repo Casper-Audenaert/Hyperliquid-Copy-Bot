@@ -200,13 +200,20 @@ class WalletMonitor:
 
             logger.info(f"Fill: {fill.get('dir','')} {symbol} sz={fill.get('sz')} px={fill.get('px')}")
             if self.on_order_fill:
-                try:
-                    if asyncio.iscoroutinefunction(self.on_order_fill):
-                        await self.on_order_fill(fill)
-                    else:
+                if asyncio.iscoroutinefunction(self.on_order_fill):
+                    # Dispatch as a task so slow callbacks (DB write + REST fetch) don't
+                    # block subsequent fills.  session._state_lock inside _process_fill
+                    # serializes per-session mutations so concurrency is safe.
+                    _t = asyncio.create_task(self.on_order_fill(fill))
+                    _t.add_done_callback(
+                        lambda t: logger.error(f"Fill callback error: {t.exception()!r}")
+                        if not t.cancelled() and t.exception() else None
+                    )
+                else:
+                    try:
                         self.on_order_fill(fill)
-                except Exception as e:
-                    logger.error(f"Fill callback error: {e}")
+                    except Exception as e:
+                        logger.error(f"Fill callback error: {e}")
 
     async def _replay_missed_fills(self):
         """Fetch fills newer than last_fill_time after a WS reconnect and replay them."""
