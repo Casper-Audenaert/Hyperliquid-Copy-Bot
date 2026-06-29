@@ -121,7 +121,7 @@ class WalletSession:
 
 _MAX_PRICE_DEVIATION = 0.05   # 5% — reject WS prices that diverge this far from allMids
 
-def _upnl(s: WalletSession) -> float:
+def _upnl(s: WalletSession, price_override: dict | None = None) -> float:
     if not s.simulated_positions:
         return 0.0
     # Price source strategy: use WS current_state prices (real-time, refreshed every
@@ -141,17 +141,22 @@ def _upnl(s: WalletSession) -> float:
     for sym in s.simulated_positions:
         mid_px = mids.get(sym)
         ws_px  = ws.get(sym)
-        if ws_px and mid_px and mid_px > 0:
-            deviation = abs(ws_px - mid_px) / mid_px
-            price_map[sym] = ws_px if deviation <= _MAX_PRICE_DEVIATION else mid_px
-        elif ws_px:
-            price_map[sym] = ws_px
-        elif mid_px:
+        # Always prefer allMids (REST, refreshed ≤3 s) over WS positionValue/size.
+        # positionValue is a sub-DEX aggregate that can be 1-3% off from the real mark
+        # price, causing UPNL dips that snap back on the next WS update (e.g. 9999→9986→9999).
+        if mid_px and mid_px > 0:
             price_map[sym] = mid_px
+        elif ws_px:
+            # No allMids — sanity-check against entry price (50% tolerance)
+            entry = s.simulated_positions[sym].get("entry_price", 0)
+            if entry > 0 and abs(ws_px - entry) / entry > 0.5:
+                price_map[sym] = entry  # ponytail: 0 upnl beats a sub-DEX spike
+            else:
+                price_map[sym] = ws_px
 
     total = 0.0
     for sym, pos in s.simulated_positions.items():
-        px = price_map.get(sym, 0)
+        px = (price_override or {}).get(sym) or price_map.get(sym, 0)
         if px <= 0:
             continue
         size  = abs(pos["size"])
@@ -160,7 +165,7 @@ def _upnl(s: WalletSession) -> float:
     return total
 
 
-def _session_to_dict(s: WalletSession) -> dict:
+def _session_to_dict(s: WalletSession, price_override: dict | None = None) -> dict:
     # Build price map: WS current_state as primary (real-time), allMids as sanity check.
     # If WS price deviates > 5% from allMids it flags a sub-DEX positionValue
     # discrepancy — use allMids instead to prevent the inflation.
@@ -176,19 +181,20 @@ def _session_to_dict(s: WalletSession) -> dict:
     for sym in s.simulated_positions:
         ws_px  = _ws_prices.get(sym)
         mid_px = _mid_prices.get(sym)
-        if ws_px and mid_px and mid_px > 0:
-            deviation = abs(ws_px - mid_px) / mid_px
-            price_map[sym] = ws_px if deviation <= _MAX_PRICE_DEVIATION else mid_px
-        elif ws_px:
-            price_map[sym] = ws_px
-        elif mid_px:
+        if mid_px and mid_px > 0:
             price_map[sym] = mid_px
+        elif ws_px:
+            entry = s.simulated_positions[sym].get("entry_price", 0)
+            if entry > 0 and abs(ws_px - entry) / entry > 0.5:
+                price_map[sym] = entry  # ponytail: 0 upnl beats a sub-DEX spike
+            else:
+                price_map[sym] = ws_px
 
     total_upnl  = 0.0
     total_margin = 0.0
     positions   = []
     for sym, pos in s.simulated_positions.items():
-        current_price = price_map.get(sym, pos.get("entry_price", 0))
+        current_price = (price_override or {}).get(sym) or price_map.get(sym, pos.get("entry_price", 0))
         size   = abs(pos.get("size", 0))
         entry  = pos.get("entry_price", 0)
         is_long = pos.get("side", "LONG").upper() == "LONG"
@@ -599,7 +605,14 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             session.trades_copied_count += 1
 
     # Emit outside lock
-    upnl         = _upnl(session)
+    # Use the stored entry_price for the just-opened/added position so UPNL = 0 at the
+    # instant of the fill. allMids cache is up to 3 s stale; on high-leverage positions
+    # even a 1-2% lag amplifies into a visible equity dip that recovers on the next tick.
+    _px_override: dict = {}
+    if (not is_closing or is_flip) and symbol in session.simulated_positions:
+        _px_override = {symbol: session.simulated_positions[symbol].get("entry_price", price)}
+
+    upnl         = _upnl(session, price_override=_px_override)
     total_margin = sum(p.get("margin_used", 0) for p in session.simulated_positions.values())
     equity       = session.simulated_balance + total_margin + upnl
     session.equity_history.append({
@@ -619,18 +632,24 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
         "realized_pnl": round(pnl_realized, 4) if pnl_realized is not None else None,
         "timestamp": datetime.utcnow().isoformat(timespec='milliseconds'),
     })
-    emit_fn("state_update", _session_to_dict(session))
+    emit_fn("state_update", _session_to_dict(session, price_override=_px_override))
     # Rate-limit equity_tick from fills to at most once per second.
     # HFT wallets can generate hundreds of fills/sec — emitting a tick on each would
     # flood the chart with data points and lock up Chart.js tooltip hover detection.
     _now = time.monotonic()
     if _now - session._last_equity_tick_ts >= 1.0:
-        session._last_equity_tick_ts = _now
-        emit_fn("equity_tick", {
-            "wallet": session.address,
-            "t": datetime.utcnow().isoformat(timespec='milliseconds'),
-            "equity": round(equity, 2),
-        })
+        # Spike guard: skip the tick if equity jumped >50% from the previous snapshot.
+        # A fill can't legitimately move equity 50% in <1 s — this catches stale WS prices
+        # that slipped through the per-price checks (e.g. cache miss right at fill time).
+        _prev_eq = session.equity_history[-2]["equity"] if len(session.equity_history) >= 2 else equity
+        _ref     = max(abs(_prev_eq), 1.0)
+        if abs(equity - _prev_eq) / _ref <= 0.5:
+            session._last_equity_tick_ts = _now
+            emit_fn("equity_tick", {
+                "wallet": session.address,
+                "t": datetime.utcnow().isoformat(timespec='milliseconds'),
+                "equity": round(equity, 2),
+            })
 
 
 # ── Callbacks ─────────────────────────────────────────────────────────────────
@@ -841,9 +860,8 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
             # Using start_balance here would shrink our ratio as the target grows,
             # even when our own equity is also growing — that's wrong.
 
-            # Build price_map: WS current_state as primary (real-time), allMids as
-            # sanity check.  Same _MAX_PRICE_DEVIATION guard as _upnl() — rejects
-            # sub-DEX positionValue/size prices that diverge > 5% from allMids.
+            # Build price_map: allMids (REST, ≤3 s) always preferred; WS positionValue/size
+            # only used as a last resort because it can be 1-3% off from the real mark price.
             _snap_mids: dict = {}
             if _mids_cache:
                 _snap_mids = {sym: float(px) for sym, px in _mids_cache.items() if float(px) > 0}
@@ -855,13 +873,14 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
             for sym in session.simulated_positions:
                 ws_px  = _snap_ws.get(sym)
                 mid_px = _snap_mids.get(sym)
-                if ws_px and mid_px and mid_px > 0:
-                    deviation = abs(ws_px - mid_px) / mid_px
-                    price_map[sym] = ws_px if deviation <= _MAX_PRICE_DEVIATION else mid_px
-                elif ws_px:
-                    price_map[sym] = ws_px
-                elif mid_px:
+                if mid_px and mid_px > 0:
                     price_map[sym] = mid_px
+                elif ws_px:
+                    entry = session.simulated_positions[sym].get("entry_price", 0)
+                    if entry > 0 and abs(ws_px - entry) / entry > 0.5:
+                        price_map[sym] = entry  # ponytail: 0 upnl beats a sub-DEX spike
+                    else:
+                        price_map[sym] = ws_px
             # REST fallback for symbols not yet in either source
             missing = [s for s in session.simulated_positions if s not in price_map or price_map[s] <= 0]
             if missing:
@@ -918,6 +937,8 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
             #   • As target grows, my ratio adjusts relative to them, not to my start balance
             if session.monitor.current_state and session.monitor.current_state.balance > 0 and equity > 0:
                 _new_ratio = equity / session.monitor.current_state.balance
+                # ponytail: cap to 2× previous ratio per tick — spike can't double sizes instantly
+                _new_ratio = min(_new_ratio, session.copy_ratio * 2.0)
                 async with session._state_lock:
                     session.copy_ratio = _new_ratio
 
@@ -996,18 +1017,25 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
                 except Exception:
                     pass
 
-            await asyncio.to_thread(db_snapshot_equity, session.address, equity, session.simulated_balance, total_upnl)
+            # Spike guard: if equity jumped >50% vs the previous snapshot, the price map
+            # still has a bad value — skip recording and emitting this tick entirely.
+            _prev_snap = session.equity_history[-1]["equity"] if session.equity_history else equity
+            _snap_ref  = max(abs(_prev_snap), 1.0)
+            _snap_ok   = abs(equity - _prev_snap) / _snap_ref <= 0.5
+            if _snap_ok:
+                await asyncio.to_thread(db_snapshot_equity, session.address, equity, session.simulated_balance, total_upnl)
             session.equity_history.append({
                 "t": datetime.utcnow().isoformat(timespec='milliseconds'),
-                "equity": round(equity, 2),
+                "equity": round(equity if _snap_ok else _prev_snap, 2),
                 "balance": round(session.simulated_balance, 2),
                 "upnl": round(total_upnl, 2),
             })
             if len(session.equity_history) > 2000:
                 session.equity_history = session.equity_history[-2000:]
-            emit_fn("equity_tick", {"wallet": session.address,
-                                    "t": datetime.utcnow().isoformat(timespec='milliseconds'),
-                                    "equity": round(equity, 2)})
+            if _snap_ok:
+                emit_fn("equity_tick", {"wallet": session.address,
+                                        "t": datetime.utcnow().isoformat(timespec='milliseconds'),
+                                        "equity": round(equity, 2)})
             # Re-evaluate trading style every 6 hours so wallets that change behaviour
             # (e.g. HFT bot goes idle, swing trader starts scalping) are reclassified.
             _STYLE_RECHECK_SECS = 6 * 3600

@@ -419,6 +419,21 @@ def db_restore_session_counters(wallet_addr: str) -> dict:
 
 # ── Query helpers ─────────────────────────────────────────────────────────────
 
+def _despike(rows: list) -> list:
+    """Remove single-point equity spikes using a 3-point median.
+    A point is a spike when it deviates >50% from its neighbours' median."""
+    if len(rows) < 3:
+        return rows
+    eq = [r["equity"] for r in rows]
+    result = list(rows)
+    for i in range(1, len(eq) - 1):
+        med = sorted([eq[i - 1], eq[i], eq[i + 1]])[1]
+        ref = max(abs(med), abs(eq[i - 1]), 1.0)
+        if abs(eq[i] - med) / ref > 0.5:
+            result[i] = {**result[i], "equity": round(med, 2)}
+    return result
+
+
 def db_get_equity_history(wallet_addr: str, hours: int = 24) -> list:
     cutoff = datetime.utcnow() - timedelta(hours=hours if hours else 9999)
     with DbSession(_db_engine) as db:
@@ -428,8 +443,9 @@ def db_get_equity_history(wallet_addr: str, hours: int = 24) -> list:
                 .order_by(EquitySnapshot.timestamp)
                 .all())
     # timespec='milliseconds' → "YYYY-MM-DDTHH:MM:SS.mmm" — safe for all browsers
-    return [{"t": r.timestamp.isoformat(timespec='milliseconds'), "equity": r.equity,
-             "balance": r.balance, "upnl": r.upnl} for r in rows]
+    raw = [{"t": r.timestamp.isoformat(timespec='milliseconds'), "equity": r.equity,
+            "balance": r.balance, "upnl": r.upnl} for r in rows]
+    return _despike(raw)
 
 
 def db_get_trades(wallet_addr: str, limit: int = 200,
