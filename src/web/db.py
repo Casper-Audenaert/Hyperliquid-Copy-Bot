@@ -421,7 +421,8 @@ def db_restore_session_counters(wallet_addr: str) -> dict:
 
 def _despike(rows: list) -> list:
     """Remove single-point equity spikes using a 3-point median.
-    A point is a spike when it deviates >50% from its neighbours' median."""
+    A spike is any single point that deviates >2% from its neighbours' median and
+    immediately reverts — the pattern the sub-DEX positionValue lag produces."""
     if len(rows) < 3:
         return rows
     eq = [r["equity"] for r in rows]
@@ -429,7 +430,7 @@ def _despike(rows: list) -> list:
     for i in range(1, len(eq) - 1):
         med = sorted([eq[i - 1], eq[i], eq[i + 1]])[1]
         ref = max(abs(med), abs(eq[i - 1]), 1.0)
-        if abs(eq[i] - med) / ref > 0.5:
+        if abs(eq[i] - med) / ref > 0.02:
             result[i] = {**result[i], "equity": round(med, 2)}
     return result
 

@@ -605,9 +605,16 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             session.trades_copied_count += 1
 
     # Emit outside lock
-    # Use the stored entry_price for the just-opened/added position so UPNL = 0 at the
-    # instant of the fill. allMids cache is up to 3 s stale; on high-leverage positions
-    # even a 1-2% lag amplifies into a visible equity dip that recovers on the next tick.
+    # Force a fresh allMids fetch so _upnl() prices are accurate at fill time.
+    # Without this, _mids_cache can be up to 3 s stale; on high-leverage positions
+    # even a 1-2% price lag amplifies into a visible equity dip that snaps back next tick.
+    try:
+        await _get_shared_mids(session.client)
+    except Exception:
+        pass
+
+    # Use entry_price for the just-opened/added position so its UPNL = 0 at fill instant
+    # (entry_price == fill price, so size × (fill_price − fill_price) = 0).
     _px_override: dict = {}
     if (not is_closing or is_flip) and symbol in session.simulated_positions:
         _px_override = {symbol: session.simulated_positions[symbol].get("entry_price", price)}
@@ -862,8 +869,12 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
 
             # Build price_map: allMids (REST, ≤3 s) always preferred; WS positionValue/size
             # only used as a last resort because it can be 1-3% off from the real mark price.
-            _snap_mids: dict = {}
-            if _mids_cache:
+            # Force a fresh allMids fetch every snapshot tick — reading _mids_cache directly
+            # would use up-to-3s-stale prices and cause chart dips that snap back next tick.
+            try:
+                _fresh = await _get_shared_mids(session.client)
+                _snap_mids = {sym: float(px) for sym, px in _fresh.items() if float(px) > 0}
+            except Exception:
                 _snap_mids = {sym: float(px) for sym, px in _mids_cache.items() if float(px) > 0}
             _snap_ws: dict = {}
             if session.monitor and session.monitor.current_state:
