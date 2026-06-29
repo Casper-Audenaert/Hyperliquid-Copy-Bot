@@ -1852,6 +1852,29 @@ socket.on('fill', f => {
 });
 
 socket.on('equity_tick', tick => {
+  // Retroactive 3-point median spike correction.
+  // When a new point arrives we can now see whether the PREVIOUS point was an isolated
+  // anomaly (deviates from both its predecessor AND the incoming value).  If so, replace
+  // it with the median of the three — this eliminates sub-DEX positionValue lag dips
+  // that slip through server-side guards (e.g. 9999→9986→9999).
+  // Threshold: >0.1% isolated deviation is treated as an artifact.
+  const addr = tick.wallet;
+  const h    = state[addr]?._history;
+  if (h && h.length >= 2) {
+    const prev2eq = h[h.length - 2].equity;
+    const prev1   = h[h.length - 1];
+    const currEq  = tick.equity;
+    const sorted  = [prev2eq, prev1.equity, currEq].slice().sort((a, b) => a - b);
+    const med     = sorted[1];
+    const ref     = Math.max(Math.abs(med), Math.abs(prev2eq), 1);
+    if (Math.abs(prev1.equity - med) / ref > 0.001) {
+      h[h.length - 1] = { ...prev1, equity: med };
+      const ds  = chart?.data?.datasets?.find(d => d.label === state[addr]?.label);
+      const sb  = state[addr]?.start_balance || 1;
+      if (ds && ds.data.length >= 1)
+        ds.data[ds.data.length - 1].y = compareMode ? ((med / sb) - 1) * 100 : med;
+    }
+  }
   addEquityPoint(tick.wallet, {t:tick.t, equity:tick.equity});
 });
 
