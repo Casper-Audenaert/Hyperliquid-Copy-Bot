@@ -622,6 +622,10 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     upnl         = _upnl(session, price_override=_px_override)
     total_margin = sum(p.get("margin_used", 0) for p in session.simulated_positions.values())
     equity       = session.simulated_balance + total_margin + upnl
+    # Capture _prev_eq BEFORE the append so the spike check compares current equity
+    # to the true previous value (not to itself at history[-2] after the append).
+    _prev_eq = session.equity_history[-1]["equity"] if session.equity_history else equity
+    _ref     = max(abs(_prev_eq), 1.0)
     session.equity_history.append({
         "t": datetime.utcnow().isoformat(timespec='milliseconds'),
         "equity": round(equity, 2),
@@ -645,12 +649,10 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     # flood the chart with data points and lock up Chart.js tooltip hover detection.
     _now = time.monotonic()
     if _now - session._last_equity_tick_ts >= 1.0:
-        # Spike guard: skip the tick if equity jumped >50% from the previous snapshot.
-        # A fill can't legitimately move equity 50% in <1 s — this catches stale WS prices
-        # that slipped through the per-price checks (e.g. cache miss right at fill time).
-        _prev_eq = session.equity_history[-2]["equity"] if len(session.equity_history) >= 2 else equity
-        _ref     = max(abs(_prev_eq), 1.0)
-        if abs(equity - _prev_eq) / _ref <= 0.5:
+        # Spike guard: sub-DEX positionValue lag and stale allMids can shift UPNL by
+        # 1-10% on high-leverage positions without any real price move. 10% threshold
+        # blocks those artifacts while passing legitimate large fills.
+        if abs(equity - _prev_eq) / _ref <= 0.10:
             session._last_equity_tick_ts = _now
             emit_fn("equity_tick", {
                 "wallet": session.address,
@@ -1028,11 +1030,11 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
                 except Exception:
                     pass
 
-            # Spike guard: if equity jumped >50% vs the previous snapshot, the price map
+            # Spike guard: if equity jumped >10% vs the previous snapshot, the price map
             # still has a bad value — skip recording and emitting this tick entirely.
             _prev_snap = session.equity_history[-1]["equity"] if session.equity_history else equity
             _snap_ref  = max(abs(_prev_snap), 1.0)
-            _snap_ok   = abs(equity - _prev_snap) / _snap_ref <= 0.5
+            _snap_ok   = abs(equity - _prev_snap) / _snap_ref <= 0.10
             if _snap_ok:
                 await asyncio.to_thread(db_snapshot_equity, session.address, equity, session.simulated_balance, total_upnl)
             session.equity_history.append({

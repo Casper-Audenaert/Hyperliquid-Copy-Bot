@@ -233,17 +233,34 @@ function toggleSubChart(which) {
   }
 }
 
+// JS port of db.py:_despike — 3-point median filter at 0.2% threshold.
+// Catches multi-point spikes that the retroactive equity_tick handler misses
+// (when a stale allMids cache produces the same bad price across several ticks,
+// each spike point looks "normal" to its immediate neighbor but the 3-point
+// window across the full array still identifies and replaces it with the median).
+function _despikeHistory(h) {
+  if (h.length < 3) return h;
+  const result = h.map(p => ({...p}));
+  for (let i = 1; i < result.length - 1; i++) {
+    const a = result[i - 1].equity, b = result[i].equity, c = result[i + 1].equity;
+    const sorted = [a, b, c].slice().sort((x, y) => x - y);
+    const med = sorted[1];
+    const ref = Math.max(Math.abs(med), Math.abs(a), 1);
+    if (Math.abs(b - med) / ref > 0.002) result[i] = {...result[i], equity: med};
+  }
+  return result;
+}
+
 function filteredHistory(addr) {
   const h = state[addr]?._history || [];
-  if (!rangeHours) return h;
-  const cut = Date.now() - rangeHours * 3_600_000;
-  return h.filter(p => {
+  const sliced = rangeHours ? h.filter(p => {
     // Slice to 23 chars ("YYYY-MM-DDTHH:MM:SS.mmm") before parsing — ECMAScript only
     // guarantees millisecond precision; 6-decimal microseconds (Python default) cause
     // Invalid Date in Safari and some strict-mode engines.
     const ts = (p.t || '').slice(0, 23);
-    return new Date(ts.endsWith('Z') ? ts : ts + 'Z').getTime() >= cut;
-  });
+    return new Date(ts.endsWith('Z') ? ts : ts + 'Z').getTime() >= Date.now() - rangeHours * 3_600_000;
+  }) : h;
+  return _despikeHistory(sliced);
 }
 
 // ── Compare helpers ────────────────────────────────────────────────────────
