@@ -622,10 +622,6 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     upnl         = _upnl(session, price_override=_px_override)
     total_margin = sum(p.get("margin_used", 0) for p in session.simulated_positions.values())
     equity       = session.simulated_balance + total_margin + upnl
-    # Capture _prev_eq BEFORE the append so the spike check compares current equity
-    # to the true previous value (not to itself at history[-2] after the append).
-    _prev_eq = session.equity_history[-1]["equity"] if session.equity_history else equity
-    _ref     = max(abs(_prev_eq), 1.0)
     session.equity_history.append({
         "t": datetime.utcnow().isoformat(timespec='milliseconds'),
         "equity": round(equity, 2),
@@ -644,21 +640,12 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
         "timestamp": datetime.utcnow().isoformat(timespec='milliseconds'),
     })
     emit_fn("state_update", _session_to_dict(session, price_override=_px_override))
-    # Rate-limit equity_tick from fills to at most once per second.
-    # HFT wallets can generate hundreds of fills/sec — emitting a tick on each would
-    # flood the chart with data points and lock up Chart.js tooltip hover detection.
-    _now = time.monotonic()
-    if _now - session._last_equity_tick_ts >= 1.0:
-        # Spike guard: sub-DEX positionValue lag and stale allMids can shift UPNL by
-        # 1-10% on high-leverage positions without any real price move. 10% threshold
-        # blocks those artifacts while passing legitimate large fills.
-        if abs(equity - _prev_eq) / _ref <= 0.10:
-            session._last_equity_tick_ts = _now
-            emit_fn("equity_tick", {
-                "wallet": session.address,
-                "t": datetime.utcnow().isoformat(timespec='milliseconds'),
-                "equity": round(equity, 2),
-            })
+    # equity_tick is intentionally NOT emitted from fills.
+    # Fill-based equity uses _px_override (entry_price for the new position → UPNL=0)
+    # while other open positions use a potentially-stale _mids_cache.  This pricing
+    # mismatch vs the snapshot's fresh allMids fetch is what caused the chart spikes.
+    # The periodic snapshot (every 25-35 s) is the sole source of equity_tick events —
+    # it uses one consistent price source (fresh allMids, no overrides) for all positions.
 
 
 # ── Callbacks ─────────────────────────────────────────────────────────────────

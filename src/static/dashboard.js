@@ -233,20 +233,22 @@ function toggleSubChart(which) {
   }
 }
 
-// JS port of db.py:_despike — 3-point median filter at 0.2% threshold.
-// Catches multi-point spikes that the retroactive equity_tick handler misses
-// (when a stale allMids cache produces the same bad price across several ticks,
-// each spike point looks "normal" to its immediate neighbor but the 3-point
-// window across the full array still identifies and replaces it with the median).
+// JS port of db.py:_despike — 5-point median filter at 0.2% threshold.
+// 5-point (not 3-point) is required to fix multi-point spikes: when two consecutive
+// snapshots both carry a stale allMids price, each spike point looks "normal" to its
+// immediate 3-point neighbors ([spike, spike] → median = spike → no correction).
+// The 5-point window sees enough surrounding context to correct runs of up to 2 spikes.
 function _despikeHistory(h) {
-  if (h.length < 3) return h;
+  if (h.length < 5) return h;
   const result = h.map(p => ({...p}));
-  for (let i = 1; i < result.length - 1; i++) {
-    const a = result[i - 1].equity, b = result[i].equity, c = result[i + 1].equity;
-    const sorted = [a, b, c].slice().sort((x, y) => x - y);
-    const med = sorted[1];
-    const ref = Math.max(Math.abs(med), Math.abs(a), 1);
-    if (Math.abs(b - med) / ref > 0.002) result[i] = {...result[i], equity: med};
+  for (let i = 2; i < result.length - 2; i++) {
+    const vals = [
+      result[i-2].equity, result[i-1].equity, result[i].equity,
+      result[i+1].equity, result[i+2].equity,
+    ].slice().sort((x, y) => x - y);
+    const med = vals[2];
+    const ref = Math.max(Math.abs(med), Math.abs(result[i-2].equity), 1);
+    if (Math.abs(result[i].equity - med) / ref > 0.002) result[i] = {...result[i], equity: med};
   }
   return result;
 }
@@ -1869,29 +1871,46 @@ socket.on('fill', f => {
 });
 
 socket.on('equity_tick', tick => {
-  // Retroactive 3-point median spike correction.
-  // When a new point arrives we can now see whether the PREVIOUS point was an isolated
-  // anomaly (deviates from both its predecessor AND the incoming value).  If so, replace
-  // it with the median of the three — this eliminates sub-DEX positionValue lag dips
-  // that slip through server-side guards (e.g. 9999→9986→9999).
-  // Threshold: >0.1% isolated deviation is treated as an artifact.
+  // Retroactive spike correction: each incoming tick gives us the "right" context
+  // to correct the PREVIOUS point (3-point: h[-2], h[-1], tick) and the point
+  // BEFORE that (5-point: h[-4], h[-3], h[-2], h[-1], tick).
+  // The 5-point window is needed for 2-consecutive-snapshot spikes where the
+  // 3-point median sees [spike, spike] as normal (median = spike → no correction).
   const addr = tick.wallet;
   const h    = state[addr]?._history;
+  const ds   = chart?.data?.datasets?.find(d => d.label === state[addr]?.label);
+  const sb   = state[addr]?.start_balance || 1;
+
   if (h && h.length >= 2) {
+    // Fix h[-1] via 3-point window: [h[-2], h[-1], tick]
     const prev2eq = h[h.length - 2].equity;
     const prev1   = h[h.length - 1];
-    const currEq  = tick.equity;
-    const sorted  = [prev2eq, prev1.equity, currEq].slice().sort((a, b) => a - b);
-    const med     = sorted[1];
-    const ref     = Math.max(Math.abs(med), Math.abs(prev2eq), 1);
-    if (Math.abs(prev1.equity - med) / ref > 0.001) {
-      h[h.length - 1] = { ...prev1, equity: med };
-      const ds  = chart?.data?.datasets?.find(d => d.label === state[addr]?.label);
-      const sb  = state[addr]?.start_balance || 1;
+    const sorted3 = [prev2eq, prev1.equity, tick.equity].slice().sort((a, b) => a - b);
+    const med3    = sorted3[1];
+    const ref3    = Math.max(Math.abs(med3), Math.abs(prev2eq), 1);
+    if (Math.abs(prev1.equity - med3) / ref3 > 0.001) {
+      h[h.length - 1] = { ...prev1, equity: med3 };
       if (ds && ds.data.length >= 1)
-        ds.data[ds.data.length - 1].y = compareMode ? ((med / sb) - 1) * 100 : med;
+        ds.data[ds.data.length - 1].y = compareMode ? ((med3 / sb) - 1) * 100 : med3;
     }
   }
+  if (h && h.length >= 4) {
+    // Fix h[-2] via 5-point window: [h[-4], h[-3], h[-2], h[-1](corrected above), tick]
+    const i2      = h.length - 2;
+    const sorted5 = [
+      h[i2 - 2].equity, h[i2 - 1].equity, h[i2].equity,
+      h[i2 + 1].equity,  // h[-1], possibly just corrected above
+      tick.equity,
+    ].slice().sort((a, b) => a - b);
+    const med5 = sorted5[2];
+    const ref5 = Math.max(Math.abs(med5), Math.abs(h[i2 - 2].equity), 1);
+    if (Math.abs(h[i2].equity - med5) / ref5 > 0.002) {
+      h[i2] = { ...h[i2], equity: med5 };
+      if (ds && ds.data.length >= 2)
+        ds.data[ds.data.length - 2].y = compareMode ? ((med5 / sb) - 1) * 100 : med5;
+    }
+  }
+
   addEquityPoint(tick.wallet, {t:tick.t, equity:tick.equity});
 });
 
