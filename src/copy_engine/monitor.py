@@ -105,20 +105,26 @@ class WalletMonitor:
         # Register this monitor's reconnect/fill-replay handler
         shared_ws.on_reconnect_handlers.append(self._replay_missed_fills)
 
-        # If the shared WS isn't running yet, start it now
-        if not shared_ws.is_running:
-            await shared_ws.connect()
-            asyncio.create_task(shared_ws.listen())
-            logger.info(
-                f"Started shared WS (pool size={len(_ws_pool)}) "
-                f"for {self.target_address[:10]}…"
-            )
-        else:
-            logger.info(
-                f"Reusing shared WS (pool size={len(_ws_pool)}, "
-                f"subs={len(shared_ws.subscriptions)}) "
-                f"for {self.target_address[:10]}…"
-            )
+        # Serialize the is_running check + connect + listen() creation with the pool
+        # lock so that when many wallets are added simultaneously, only ONE listen()
+        # task is ever created per WS object.  Without this, all coroutines yield
+        # inside `await shared_ws.connect()` before is_running is set to True, so
+        # each one proceeds to create_task(listen()) → multiple listen() tasks on
+        # the same WS → "cannot call recv while another coroutine is already waiting".
+        async with _get_pool_lock():
+            if not shared_ws.is_running:
+                await shared_ws.connect()
+                asyncio.create_task(shared_ws.listen())
+                logger.info(
+                    f"Started shared WS (pool size={len(_ws_pool)}) "
+                    f"for {self.target_address[:10]}…"
+                )
+            else:
+                logger.info(
+                    f"Reusing shared WS (pool size={len(_ws_pool)}, "
+                    f"subs={len(shared_ws.subscriptions)}) "
+                    f"for {self.target_address[:10]}…"
+                )
 
         # Background state refresh — decoupled from fill events so high-frequency
         # fills don't trigger REST calls on every message.
