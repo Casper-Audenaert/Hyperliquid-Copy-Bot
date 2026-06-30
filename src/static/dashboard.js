@@ -546,8 +546,11 @@ function renderKpis() {
   setKpi('w', wr!=null ? wr.toFixed(1)+'%' : '—', `${wins}W / ${losses}L`, wrColor);
   setKpi('t', String(wins + losses), npos+' open position'+(npos!==1?'s':''), null);
 
-  // Header
-  const paused = sess.some(s=>s.is_paused);
+  // Header: in compare mode, individual wallet cards already show each wallet's
+  // paused state via an orange dot — don't hoist that into the global banner,
+  // which would show "PAUSED" just because one of 21 wallets hit a circuit
+  // breaker, making it look like the entire system is stopped.
+  const paused = !compareMode && sess.some(s=>s.is_paused);
   document.getElementById('pdot').className       = 'pulse-dot'+(paused?' paused':'');
   document.getElementById('live-txt').textContent = paused ? 'PAUSED' : 'LIVE';
   const _pb = document.getElementById('btn-pause'); if (_pb) _pb.textContent = paused ? '▶ Resume' : '⏸ Pause';

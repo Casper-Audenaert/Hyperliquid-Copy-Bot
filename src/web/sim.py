@@ -709,15 +709,8 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             session._processed_fill_ids[fill_id] = None
             _evict_fill_ids(session)
             session.trades_copied_count += 1
-
-            if pnl < 0 and _record_loss(session, abs(pnl)):
-                session.is_paused = True
-                logger.error(f"[{session.label}] Daily loss limit reached — paused")
-                try:
-                    from web_app import _send_telegram
-                    _send_telegram(f"⏸ <b>PAUSED</b> — {session.label}\nDaily loss limit reached")
-                except Exception:
-                    pass
+            if pnl < 0:
+                _record_loss(session, abs(pnl))  # track daily loss for stats only — no auto-pause
 
         elif is_closing and not is_flip:
             # Position was already force-closed by the liquidation check above —
@@ -928,14 +921,8 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
             await asyncio.to_thread(db_delete_position, session.address, symbol)
             await asyncio.to_thread(db_record_close, session.address, symbol, pnl)
 
-            if pnl < 0 and _record_loss(session, abs(pnl)):
-                session.is_paused = True
-                logger.error(f"[{session.label}] Daily loss limit reached — paused")
-                try:
-                    from web_app import _send_telegram
-                    _send_telegram(f"⏸ <b>PAUSED</b> — {session.label}\nDaily loss limit reached")
-                except Exception:
-                    pass
+            if pnl < 0:
+                _record_loss(session, abs(pnl))  # track daily loss for stats only — no auto-pause
 
         emit_fn("position_close", {"wallet": session.address, "symbol": symbol, "pnl": round(pnl, 2)})
         emit_fn("state_update",   _session_to_dict(session))
@@ -1232,15 +1219,15 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
                     session.equity_history[0]["equity"],
                 )
                 if baseline > 0 and (baseline - equity) / baseline >= rm.fast_loss_pct:
-                    session.is_paused = True
-                    logger.error(
-                        f"[{session.label}] Circuit breaker: equity dropped "
-                        f"{((baseline-equity)/baseline)*100:.1f}% in {rm.fast_loss_window_secs}s — paused"
+                    logger.warning(
+                        f"[{session.label}] Circuit breaker threshold reached: equity dropped "
+                        f"{((baseline-equity)/baseline)*100:.1f}% in {rm.fast_loss_window_secs}s "
+                        f"(alert only — not pausing, simulation runs like real trading)"
                     )
                     try:
                         from web_app import _send_telegram
                         _send_telegram(
-                            f"⏸ <b>CIRCUIT BREAKER</b> — {session.label}\n"
+                            f"⚠️ <b>RAPID LOSS ALERT</b> — {session.label}\n"
                             f"Equity down {((baseline-equity)/baseline)*100:.1f}% in {rm.fast_loss_window_secs}s"
                         )
                     except Exception:
@@ -1271,13 +1258,15 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
             equity = session.simulated_balance + total_margin + total_upnl
 
             if equity <= 0 and not session.is_paused:
-                session.is_paused = True
-                msg = f"[{session.label}] Account equity = ${equity:.2f} — session paused (simulated liquidation)"
-                logger.error(msg)
+                # Alert only — don't pause. Real exchanges enforce this via liquidation
+                # at the position level (already handled by _check_and_liquidate), not
+                # by freezing the account. Equity should not reach 0 with proper
+                # position-level liquidation, but alert if it does.
+                logger.error(f"[{session.label}] Account equity = ${equity:.2f} (alert only, not pausing)")
                 emit_fn("liquidated", {"wallet": session.address, "equity": round(equity, 2)})
                 try:
                     from web_app import _send_telegram  # late import to avoid circular
-                    _send_telegram(f"🚨 <b>LIQUIDATED</b> — {session.label}\nEquity: ${equity:.2f}")
+                    _send_telegram(f"🚨 <b>EQUITY ALERT</b> — {session.label}\nEquity: ${equity:.2f}")
                 except Exception:
                     pass
 
