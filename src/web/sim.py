@@ -101,6 +101,7 @@ class WalletSession:
     detected_style: str = "Swing"          # "HFT" | "Swing" — surfaced to UI as a badge
     _pending_debounce: dict = field(default_factory=dict)  # symbol → asyncio.Task
     _style_last_checked: float = 0.0                       # monotonic time of last _detect_trading_style call
+    _fill_timestamps: list = field(default_factory=list)   # monotonic times of recent live fills, for fast burst detection
     _last_equity_tick_ts: float = 0.0                      # monotonic time of last equity_tick emit from fills
     median_hold_secs: float = 60.0                         # median position hold time (seconds) for this target
     simulated_pnl: float = 0.0        # cumulative realized PnL (gross, pre-fee)
@@ -961,6 +962,54 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
         )
         if fill_id in session._processed_fill_ids:
             return
+
+        # Fast burst detection: uses the fill's own exchange-reported timestamp, not
+        # when we process it — using processing time would misfire during a WS
+        # reconnect replay, when fills that actually happened hours apart get delivered
+        # in a tight loop. Two signals mirror how trade-surveillance systems distinguish
+        # churn from rebalancing: repeated closes on ONE symbol within the window is the
+        # costly round-trip flip pattern (the original incident: 88 fills on xyz:MU);
+        # a one-time basket rebalance shows many fills but few/no closes on any single
+        # symbol, and should NOT trip into debounced copying unnecessarily.
+        _fill_time_ms = fill_data.get("time", 0)
+        if _fill_time_ms > 0:
+            _b_sym   = fill_data.get("coin", "")
+            _b_dir   = fill_data.get("dir", "")
+            _b_close = "Close" in _b_dir or "Reduce" in _b_dir
+            session._fill_timestamps.append((_fill_time_ms, _b_sym, _b_close))
+            _window_ms = settings.copy_style.fast_burst_window_secs * 1000
+            session._fill_timestamps = [
+                f for f in session._fill_timestamps if _fill_time_ms - f[0] <= _window_ms
+            ]
+            if session.copy_mode == "all_fills":
+                _closes_by_sym: dict = {}
+                for _, _s, _c in session._fill_timestamps:
+                    if _c:
+                        _closes_by_sym[_s] = _closes_by_sym.get(_s, 0) + 1
+                _max_closes   = max(_closes_by_sym.values(), default=0)
+                _total_closes = sum(_closes_by_sym.values())
+                if _max_closes >= settings.copy_style.fast_burst_same_symbol_closes:
+                    _burst_reason = f"{_max_closes} closes on one symbol"
+                elif _total_closes >= settings.copy_style.fast_burst_total_closes:
+                    _burst_reason = f"{_total_closes} closes across symbols"
+                else:
+                    _burst_reason = None
+                if _burst_reason:
+                    session.copy_mode       = "debounced"
+                    session.detected_style  = "HFT"
+                    session.debounce_secs   = settings.copy_style.hft_debounce_secs
+                    session._style_last_checked = 0.0  # force a full _detect_trading_style pass soon
+                    logger.warning(
+                        f"[{session.label}] Fast burst detected ({_burst_reason}) in "
+                        f"{settings.copy_style.fast_burst_window_secs}s — switching to debounced "
+                        f"(debounce={session.debounce_secs}s)"
+                    )
+                    try:
+                        from web_app import _send_telegram
+                        _send_telegram(f"⚡ <b>{session.label}</b>: burst detected ({_burst_reason}) "
+                                       f"— switched to debounced copying")
+                    except Exception:
+                        pass
 
         try:
             symbol     = fill_data.get("coin", "")
