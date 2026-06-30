@@ -351,13 +351,14 @@ def db_record_close(wallet_addr: str, symbol: str, realized_pnl: float):
             db.commit()
 
 
-def db_update_trade_equity(fill_id, equity: float):
-    """Patch the resulting account equity onto a specific fill's row, by fill_id
-    (precise — unlike db_record_close's by-symbol lookup, there's no ambiguity
-    about which row this belongs to). Lets a user trace equity change-by-change
-    through the trade feed instead of only seeing the equity curve chart."""
+def db_update_trade_equity(wallet_addr: str, fill_id, equity: float):
+    """Patch the resulting account equity onto THIS WALLET'S specific fill row.
+    Filters by both wallet_addr and fill_id — necessary because the same fill_id
+    (Hyperliquid tid) now legitimately appears in multiple wallets when they all
+    copy the same target. Without wallet_addr, only one wallet's row gets patched
+    and all others stay NULL."""
     with DbSession(_db_engine) as db:
-        rec = db.query(TradeRecord).filter_by(fill_id=str(fill_id)).first()
+        rec = db.query(TradeRecord).filter_by(fill_id=str(fill_id), wallet_addr=wallet_addr).first()
         if rec:
             rec.equity_after = equity
             db.commit()

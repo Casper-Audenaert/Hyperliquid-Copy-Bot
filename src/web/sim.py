@@ -837,7 +837,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     # Patch the resulting equity onto this fill's DB row so the trade feed can
     # show exactly what equity was right after each transaction — lets a user
     # trace every dollar without relying on the chart alone.
-    await asyncio.to_thread(db_update_trade_equity, fill_id, round(equity, 2))
+    await asyncio.to_thread(db_update_trade_equity, session.address, fill_id, round(equity, 2))
 
     emit_fn("fill", {
         "wallet": session.address, "label": session.label,
@@ -1869,7 +1869,7 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
                     session.simulated_balance
                     + sum(p.get("margin_used", 0) for p in session.simulated_positions.values())
                 )
-                db_update_trade_equity(fill_id, round(_seed_running_equity, 2))
+                db_update_trade_equity(session.address, fill_id, round(_seed_running_equity, 2))
                 # Emit fill event so the trade feed shows the seeded position —
                 # without this, positions appear in the panel but are invisible in the feed.
                 emit_fn("fill", {
@@ -2063,7 +2063,7 @@ async def _reinit_session(session: WalletSession, emit_fn: Callable):
                     session.simulated_balance
                     + sum(p.get("margin_used", 0) for p in session.simulated_positions.values())
                 )
-                db_update_trade_equity(fill_id, round(_seed_running_equity, 2))
+                db_update_trade_equity(session.address, fill_id, round(_seed_running_equity, 2))
                 emit_fn("fill", {
                     "wallet":       session.address,
                     "label":        session.label,
