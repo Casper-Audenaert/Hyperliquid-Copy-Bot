@@ -238,6 +238,10 @@ function toggleSubChart(which) {
 // snapshots both carry a stale allMids price, each spike point looks "normal" to its
 // immediate 3-point neighbors ([spike, spike] → median = spike → no correction).
 // The 5-point window sees enough surrounding context to correct runs of up to 2 spikes.
+// Equity is now hard-floored server-side (web/sim.py _clamp_close_pnl /
+// _check_and_liquidate), so this should only ever fire on genuine stale-price
+// blips — frequent firing signals a different upstream pricing bug, not
+// something to fix by loosening these thresholds.
 function _despikeHistory(h) {
   if (h.length < 5) return h;
   const result = h.map(p => ({...p}));
@@ -339,7 +343,7 @@ function rebuildChart() {
       label: s.label || addr.slice(0,8), data, borderColor: col,
       backgroundColor: compareMode ? col+'18' : buildGrad(ctx, col),
       borderWidth:2, pointRadius:0, pointHoverRadius:5,
-      pointHoverBackgroundColor:col, fill:!compareMode, tension:0.35,
+      pointHoverBackgroundColor:col, fill:!compareMode, tension:0.18,
     };
   });
   if (compareMode && showCombined && addrs.length > 1) {
@@ -536,7 +540,7 @@ function renderKpis() {
 
   setKpi('b', fUsd(bal),  '', null);
   setKpi('u', fUsd(upnl), fPct(upPct), upnl);
-  setKpi('e', fUsd(eq),   fPct(ret)+' total return', ret);
+  setKpi('e', fUsd(eq),   fPct(ret)+' return from start', ret);
   setKpi('p', fUsd(netPnl), grossPnl !== netPnl ? `gross ${fUsd(grossPnl)} before fees` : 'realized net', netPnl);
   const wrColor = wr==null ? null : wr>=55 ? 1 : wr>=40 ? 0 : -1;
   setKpi('w', wr!=null ? wr.toFixed(1)+'%' : '—', `${wins}W / ${losses}L`, wrColor);
@@ -727,8 +731,8 @@ function renderStats(st) {
     <div class="stat-section">
       <div class="stat-section-title">Risk</div>
       <div class="stat-grid">
-        <div class="stat-row"><span class="stat-lbl">Max Drawdown</span>${sv(st.max_drawdown!=null?st.max_drawdown+'%':'—', ddC(st.max_drawdown))}</div>
-        <div class="stat-row"><span class="stat-lbl">Current DD</span>${sv(st.current_drawdown!=null?st.current_drawdown+'%':'—', ddC(st.current_drawdown))}</div>
+        <div class="stat-row" title="Relative to this wallet's all-time equity peak, not its starting balance"><span class="stat-lbl">Max Drawdown</span>${sv(st.max_drawdown!=null?st.max_drawdown+'%':'—', ddC(st.max_drawdown))}</div>
+        <div class="stat-row" title="Relative to this wallet's all-time equity peak, not its starting balance"><span class="stat-lbl">Current DD</span>${sv(st.current_drawdown!=null?st.current_drawdown+'%':'—', ddC(st.current_drawdown))}</div>
         <div class="stat-row"><span class="stat-lbl">Sharpe</span>${sv(st.sharpe??'—', shC(st.sharpe))}</div>
         <div class="stat-row"><span class="stat-lbl">Calmar</span>${sv(st.calmar!=null?st.calmar+'×':'—', shC(st.calmar))}</div>
         <div class="stat-row"><span class="stat-lbl">Volatility</span>${sv(st.volatility!=null?st.volatility+'%':'—','var(--t2)')}</div>

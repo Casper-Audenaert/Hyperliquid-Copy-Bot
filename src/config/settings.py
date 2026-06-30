@@ -19,9 +19,6 @@ class TelegramConfig(BaseModel):
     report_interval_hours: int = 1
 
 class SizingConfig(BaseModel):
-    mode: str = "proportional"  # "fixed" or "proportional"
-    fixed_size: float = 100.0
-    portfolio_ratio: float = 0.01  # 1:100 ratio
     max_position_size: float = 1000.0
     max_total_exposure: float = 5000.0
 
@@ -47,8 +44,6 @@ class CopyRulesConfig(BaseModel):
 class RiskManagementConfig(BaseModel):
     max_concurrent_positions: int = 10
     max_daily_loss_usd: float = 500.0
-    enable_custom_stops: bool = False
-    stop_loss_pct: float = 5.0
     fast_loss_pct: float = 0.05           # pause if equity drops this fraction within the window
     fast_loss_window_secs: int = 300      # rolling window for the circuit breaker (5 minutes)
     max_net_exposure_pct: float = 0.80    # |long_notional - short_notional| / equity cap

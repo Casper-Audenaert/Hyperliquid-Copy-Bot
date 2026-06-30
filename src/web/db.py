@@ -422,7 +422,11 @@ def db_restore_session_counters(wallet_addr: str) -> dict:
 def _despike(rows: list) -> list:
     """Remove single-point equity spikes using a 3-point median.
     A spike is any single point that deviates >2% from its neighbours' median and
-    immediately reverts — the pattern the sub-DEX positionValue lag produces."""
+    immediately reverts — the pattern the sub-DEX positionValue lag produces.
+    Equity is now hard-floored server-side (web/sim.py _clamp_close_pnl /
+    _check_and_liquidate), so this should only ever fire on genuine stale-price
+    blips — frequent firing signals a different upstream pricing bug, not
+    something to fix by loosening this threshold."""
     if len(rows) < 3:
         return rows
     eq = [r["equity"] for r in rows]
