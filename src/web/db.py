@@ -3,7 +3,7 @@ import os
 from datetime import datetime, timedelta
 from typing import List, Optional
 
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, text
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Session as DbSession
 
 from config.settings import settings
@@ -37,6 +37,12 @@ class Wallet(Base):
 
 class TradeRecord(Base):
     __tablename__ = "web_trades"
+    # fill_id is a Hyperliquid tid -- an exchange-wide execution ID, not a
+    # per-account one. Two independently-tracked wallets can legitimately share
+    # a tid (e.g. as counterparties to the same trade), so uniqueness must be
+    # scoped per-wallet, not global -- a global constraint silently drops the
+    # second wallet's row instead of recording its own real, separate fill.
+    __table_args__ = (UniqueConstraint('wallet_addr', 'fill_id', name='uq_web_trades_wallet_fill'),)
     id           = Column(Integer, primary_key=True)
     wallet_addr  = Column(String, index=True)
     wallet_label = Column(String)
@@ -56,7 +62,7 @@ class TradeRecord(Base):
     target_entry_px = Column(Float, nullable=True)    # target's original fill price (calibration)
     copy_delay_ms   = Column(Float, nullable=True)    # ms between target fill and our copy entry
     timestamp       = Column(DateTime, default=datetime.utcnow)
-    fill_id         = Column(String, unique=True)
+    fill_id         = Column(String)
 
 
 class EquitySnapshot(Base):
@@ -151,6 +157,61 @@ for _col, _ddl in [
             import logging as _log
             _log.getLogger(__name__).warning(f"DB migration ({_col}): {_e}")
 
+# One-time table rebuild: web_trades.fill_id used to be globally unique, silently
+# dropping a wallet's own copy of a fill whenever another wallet's row already
+# claimed that fill_id (Hyperliquid tids are exchange-wide, not per-account, so
+# two independently-tracked wallets can legitimately share one). SQLite can't
+# drop a column-level UNIQUE constraint via ALTER TABLE, so this rebuilds the
+# table under the new composite (wallet_addr, fill_id) constraint already
+# defined on TradeRecord above. Idempotent: skipped once the old single-column
+# unique index is gone.
+try:
+    with _db_engine.connect() as conn:
+        # SQLite backs both a column-level UNIQUE and a table-level composite
+        # UNIQUE constraint with an auto-named index (sqlite_autoindex_web_trades_1
+        # either way), so that name alone can't distinguish "needs migrating" from
+        # "already migrated" -- check the table's own CREATE SQL for the composite
+        # constraint's name instead, which only appears once it's been rebuilt.
+        _table_sql = conn.execute(text(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='web_trades'"
+        )).fetchone()
+        _already_migrated = bool(_table_sql and _table_sql[0] and "uq_web_trades_wallet_fill" in _table_sql[0])
+        _has_stranded_old_table = conn.execute(text(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='web_trades_old'"
+        )).fetchone()
+    if (not _already_migrated) or _has_stranded_old_table:
+        with _db_engine.connect() as conn:
+            if not _has_stranded_old_table:
+                conn.execute(text("ALTER TABLE web_trades RENAME TO web_trades_old"))
+            else:
+                # Resuming after a previously interrupted run of this migration --
+                # drop the half-created new web_trades (if any) and retry from
+                # the still-intact web_trades_old.
+                conn.execute(text("DROP TABLE IF EXISTS web_trades"))
+            # SQLite keeps explicitly-named indexes attached to the renamed table
+            # rather than renaming them, so the new web_trades (which re-declares
+            # the same index name via Column(..., index=True)) would collide with
+            # it otherwise.
+            conn.execute(text("DROP INDEX IF EXISTS ix_web_trades_wallet_addr"))
+            conn.commit()
+        TradeRecord.__table__.create(_db_engine, checkfirst=True)
+        with _db_engine.connect() as conn:
+            conn.execute(text(
+                "INSERT INTO web_trades (id, wallet_addr, wallet_label, symbol, side, direction, "
+                "size, price, notional, leverage, realized_pnl, fee, equity_after, is_simulated, "
+                "is_seed, is_debounced, target_entry_px, copy_delay_ms, timestamp, fill_id) "
+                "SELECT id, wallet_addr, wallet_label, symbol, side, direction, size, price, "
+                "notional, leverage, realized_pnl, fee, equity_after, is_simulated, is_seed, "
+                "is_debounced, target_entry_px, copy_delay_ms, timestamp, fill_id FROM web_trades_old"
+            ))
+            conn.execute(text("DROP TABLE web_trades_old"))
+            conn.commit()
+        import logging as _log
+        _log.getLogger(__name__).warning("Migrated web_trades to per-wallet fill_id uniqueness")
+except Exception as _e:
+    import logging as _log
+    _log.getLogger(__name__).warning(f"DB migration (fill_id uniqueness rebuild): {_e}")
+
 
 # ── Wallet registry ───────────────────────────────────────────────────────────
 
@@ -219,7 +280,7 @@ def db_record_fill(wallet_addr: str, wallet_label: str, fill_id, symbol: str,
                    copy_delay_ms: float = None):
     notional = size * price
     with DbSession(_db_engine) as db:
-        if db.query(TradeRecord).filter_by(fill_id=str(fill_id)).first():
+        if db.query(TradeRecord).filter_by(fill_id=str(fill_id), wallet_addr=wallet_addr).first():
             return
         db.add(TradeRecord(
             wallet_addr=wallet_addr, wallet_label=wallet_label,
