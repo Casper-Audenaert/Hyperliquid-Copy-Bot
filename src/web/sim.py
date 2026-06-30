@@ -32,6 +32,7 @@ from web.db import (
     db_record_fill, db_record_close, db_snapshot_equity,
     db_get_trades, purge_wallet_data,
     db_get_latest_equity_snapshot, db_restore_session_counters,
+    db_get_known_fill_ids,
     db_upsert_position, db_delete_position, db_load_positions,
     db_upsert_ghost, db_delete_ghost, db_load_ghosts,
     db_update_wallet_style,
@@ -468,6 +469,29 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     if our_notional < DUST_GUARD:
         session.skipped_fills_count += 1
         return
+
+    # ── Entry deviation guard ─────────────────────────────────────────────────
+    # Skip if the target's reported fill price has already diverged too far from
+    # the current live market — copying a stale fill at a blown-out price is worse
+    # than not copying it. _mids_cache is built from get_all_mids() across every
+    # sub-dex (client.dexs), including the default "" dex that also returns spot
+    # mid prices, so this covers every dex and spot uniformly with no special-casing.
+    if is_opening and not is_flip:
+        max_dev = settings.copy_rules.max_entry_deviation_pct
+        if max_dev > 0 and price > 0:
+            cur_mid = _mids_cache.get(symbol, 0)
+            if cur_mid and cur_mid > 0:
+                deviation_pct = abs(cur_mid - price) / price * 100
+                if deviation_pct > max_dev:
+                    session.skipped_fills_count += 1
+                    session._processed_fill_ids[fill_id] = None
+                    _evict_fill_ids(session)
+                    logger.warning(
+                        f"[{session.label}] Entry deviation guard: {symbol} target fill "
+                        f"${price:,.4f} vs current ${cur_mid:,.4f} "
+                        f"({deviation_pct:.2f}% > {max_dev:.2f}%) — skip"
+                    )
+                    return
 
     # ── Slippage model ────────────────────────────────────────────────────────
     # Simulates the price impact of being a price-taker vs. the target's fill.
@@ -996,6 +1020,16 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
                 f"(ours {our_new_lev}x), margin Δ${margin_delta:+.2f}"
             )
 
+    def on_alert(msg: str):
+        """Operator-facing warning for failure modes that don't fit the per-fill
+        flow above (e.g. WS replay truncation) — logged and pushed to Telegram."""
+        logger.error(f"[{session.label}] {msg}")
+        try:
+            from web_app import _send_telegram
+            _send_telegram(f"⚠️ <b>{session.label}</b>: {msg}")
+        except Exception:
+            pass
+
     return {
         "on_new_position":   on_new_position,
         "on_position_close": on_position_close,
@@ -1003,6 +1037,7 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
         "on_new_order":      on_new_order,
         "on_order_fill":     on_order_fill,
         "on_leverage_change": on_leverage_change,
+        "on_alert":          on_alert,
     }
 
 
@@ -1383,6 +1418,23 @@ async def _debounced_copy_task(session: "WalletSession", symbol: str,
     if current_px <= 0:
         return
 
+    # Entry deviation guard (debounced path): compare against the target's
+    # ORIGINAL fill price, not just-fetched current price — this is the drift
+    # accrued during the debounce delay itself, which _target_px/_fill_time were
+    # already being recorded for (calibration stats) but never gated on.
+    original_px = pending["original_px"]
+    max_dev = settings.copy_rules.max_entry_deviation_pct
+    if max_dev > 0 and original_px > 0:
+        deviation_pct = abs(current_px - original_px) / original_px * 100
+        if deviation_pct > max_dev:
+            logger.warning(
+                f"[{session.label}] Debounce entry deviation guard: {symbol} price drifted "
+                f"{deviation_pct:.2f}% since target's original fill "
+                f"(${original_px:,.4f} → ${current_px:,.4f}, limit {max_dev:.2f}%) — skip"
+            )
+            session.skipped_fills_count += 1
+            return
+
     total_sz = pending["total_sz"]
     template = pending["fill_template"]
 
@@ -1502,6 +1554,21 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
     # ── Restart recovery ──────────────────────────────────────────────────────
     _saved_positions = db_load_positions(session.address)
     _snap            = db_get_latest_equity_snapshot(session.address)
+
+    # Hydrate the in-memory fill-dedup dict from already-recorded trades so a
+    # WS replay after a crash/restart can't reprocess a fill we already applied
+    # (the DB's fill_id unique constraint would reject the duplicate row, but the
+    # in-memory balance/position mutation would already have happened by then).
+    # Only tid-keyed fill_ids (the dominant case) round-trip cleanly through
+    # int() — the rare composite-tuple fallback key isn't backfilled here.
+    _known_fill_ids = db_get_known_fill_ids(session.address)
+    _hydrated = 0
+    for _fid_str in _known_fill_ids:
+        if _fid_str.lstrip('-').isdigit():
+            session._processed_fill_ids[int(_fid_str)] = None
+            _hydrated += 1
+    if _hydrated:
+        logger.info(f"[{session.label}] Hydrated {_hydrated} known fill IDs from DB for restart-safe dedup")
 
     if _saved_positions and _snap:
         # Full restore: use the exact cash balance from the snapshot (margin is already
@@ -1756,6 +1823,7 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
     session.monitor.on_new_order       = cbs["on_new_order"]
     session.monitor.on_order_fill      = cbs["on_order_fill"]
     session.monitor.on_leverage_change = cbs["on_leverage_change"]
+    session.monitor.on_alert           = cbs["on_alert"]
 
     asyncio.create_task(_periodic_equity_snapshot(session, emit_fn))
     asyncio.create_task(_periodic_liquidation_check(session, emit_fn))
@@ -1939,6 +2007,7 @@ async def _reinit_session(session: WalletSession, emit_fn: Callable):
     session.monitor.on_new_order       = cbs["on_new_order"]
     session.monitor.on_order_fill      = cbs["on_order_fill"]
     session.monitor.on_leverage_change = cbs["on_leverage_change"]
+    session.monitor.on_alert           = cbs["on_alert"]
 
     emit_fn("clear", {"address": session.address, "label": session.label,
                       "start_balance": session.start_balance, "equity": round(eq, 2)})

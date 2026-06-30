@@ -83,6 +83,7 @@ class WalletMonitor:
         self.on_new_order: Optional[Callable] = None
         self.on_order_fill: Optional[Callable] = None
         self.on_leverage_change: Optional[Callable] = None  # (symbol, old_lev, new_lev)
+        self.on_alert: Optional[Callable] = None  # (message: str) -> None, operator-facing warnings
 
         logger.info(f"WalletMonitor initialised for {target_address}")
 
@@ -257,7 +258,13 @@ class WalletMonitor:
                         continue
             if all_new:
                 if len(all_new) > 500:
+                    dropped = len(all_new) - 500
                     logger.warning(f"Replay capped at 500 fills (had {len(all_new)}) — likely HFT target")
+                    if self.on_alert:
+                        self.on_alert(
+                            f"Replay truncated for {self.target_address[:10]}…: "
+                            f"{dropped} older missed fill(s) were dropped, not copied"
+                        )
                     all_new = sorted(all_new, key=lambda f: f.get("time", 0))[-500:]
                 logger.info(f"Replaying {len(all_new)} missed fills across {len(self.client.dexs)} DEX(es)")
                 await self._handle_fills(sorted(all_new, key=lambda f: f.get("time", 0)))

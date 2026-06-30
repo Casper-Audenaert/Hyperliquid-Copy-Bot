@@ -36,8 +36,7 @@ class CopyRulesConfig(BaseModel):
     max_open_trades: Optional[int] = None  # None = unlimited
     max_open_orders: Optional[int] = None  # None = unlimited
     max_account_equity: Optional[float] = None  # None = unlimited
-    min_entry_quality_pct: float = 5.0
-    max_slippage_pct: float = 1.0
+    max_entry_deviation_pct: float = 5.0  # skip a copy if price has already moved this far from the target's fill
     min_position_size_usd: float = 10.0
     blocked_assets: list[str] = []  # Assets to NOT copy (e.g., ["BTC", "ETH"])
 

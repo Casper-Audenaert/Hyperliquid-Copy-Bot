@@ -417,6 +417,14 @@ def db_restore_session_counters(wallet_addr: str) -> dict:
     }
 
 
+def db_get_known_fill_ids(wallet_addr: str) -> set:
+    """Fill IDs already recorded for this wallet — used to hydrate the in-memory
+    dedup dict on restart so replayed fills from before a crash aren't reprocessed."""
+    with DbSession(_db_engine) as db:
+        rows = db.query(TradeRecord.fill_id).filter_by(wallet_addr=wallet_addr).all()
+    return {r[0] for r in rows if r[0] is not None}
+
+
 # ── Query helpers ─────────────────────────────────────────────────────────────
 
 def _despike(rows: list) -> list:
