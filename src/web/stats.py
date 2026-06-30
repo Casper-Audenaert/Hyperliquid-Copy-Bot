@@ -392,8 +392,11 @@ def _compute_decision(score, sharpe, max_dd, win_rate, consistency_pct,
 
 
 def _eff_fee(t: TradeRecord) -> float:
-    """Return the fee for a trade record, falling back to notional×rate for old NULL rows."""
-    if t.fee:  # truthy: catches both None and 0.0 (stored when rate was 0 at insert time)
+    """Return the fee for a trade record, falling back to notional×rate only for
+    truly unset rows (NULL — from before the fee column existed). An explicitly
+    stored 0.0 means no fee was charged for this fill and must not trigger the
+    fallback, which would invent a phantom fee from the notional."""
+    if t.fee is not None:
         return t.fee
     if t.notional:
         is_flip = bool(t.direction and '>' in t.direction)
