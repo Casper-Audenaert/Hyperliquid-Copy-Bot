@@ -32,7 +32,7 @@ from web.db import (
     db_record_fill, db_record_close, db_snapshot_equity,
     db_get_trades, purge_wallet_data,
     db_get_latest_equity_snapshot, db_restore_session_counters,
-    db_get_known_fill_ids,
+    db_get_known_fill_ids, db_update_trade_equity,
     db_upsert_position, db_delete_position, db_load_positions,
     db_upsert_ghost, db_delete_ghost, db_load_ghosts,
     db_update_wallet_style,
@@ -449,6 +449,25 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     is_flip    = ">" in direction
     is_opening = "Open" in direction or "Add" in direction
 
+    if not (is_closing or is_flip or is_opening):
+        # Spot-style fill: Hyperliquid reports plain "Buy"/"Sell" with no Open/Close
+        # qualifier (unlike perp fills). Infer intent from the existing position:
+        # same implied side as what we hold -> opening/adding; opposite side ->
+        # reducing/closing. No flip support here -- an oversized opposite fill just
+        # closes 100% of the existing position; the excess isn't copied (deliberate,
+        # conservative scope decision -- avoids guessing at Hyperliquid's exact
+        # spot-fill flip size semantics, which differ from the perp ">" case).
+        existing = session.simulated_positions.get(symbol)
+        if existing:
+            fill_side     = "LONG" if position_side == PositionSide.LONG else "SHORT"
+            existing_side = existing.get("side", "").upper()
+            if fill_side == existing_side:
+                is_opening = True
+            else:
+                is_closing = True
+        else:
+            is_opening = True
+
     # Scale size by fixed copy_ratio
     our_size = target_size * session.copy_ratio
 
@@ -814,12 +833,18 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     if len(session.equity_history) > 2000:
         session.equity_history = session.equity_history[-2000:]
 
+    # Patch the resulting equity onto this fill's DB row so the trade feed can
+    # show exactly what equity was right after each transaction — lets a user
+    # trace every dollar without relying on the chart alone.
+    await asyncio.to_thread(db_update_trade_equity, fill_id, round(equity, 2))
+
     emit_fn("fill", {
         "wallet": session.address, "label": session.label,
         "symbol": symbol, "side": position_side.value,
         "direction": direction, "size": emit_size, "price": price,
         "notional": round(our_notional, 2), "leverage": our_leverage,
         "realized_pnl": round(pnl_realized, 4) if pnl_realized is not None else None,
+        "fee": round(fill_fee, 4), "equity_after": round(equity, 2),
         "timestamp": datetime.utcnow().isoformat(timespec='milliseconds'),
     })
     emit_fn("state_update", _session_to_dict(session, price_override=_px_override))
@@ -1106,6 +1131,7 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
 
             # HL `funding` field = current predicted 1-hour rate (not 8h).
             # Pro-rate to this 30s tick: 1h = 3600s → 120 ticks of 30s each.
+            _funding_breakdown: list = []  # per-symbol charges this tick, for feed visibility
             try:
                 funding_map = await _get_shared_funding_rates(session.client)
                 async with session._state_lock:
@@ -1125,9 +1151,22 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
                         else:
                             session.simulated_balance   += charge
                             session.total_funding_paid  -= charge
+                        # Sign convention matches total_funding_paid: positive = paid, negative = earned.
+                        _funding_breakdown.append({"symbol": sym, "charge": round(charge if is_long else -charge, 4)})
                     session.simulated_balance = max(session.simulated_balance, 0.0)
             except Exception as e:
                 logger.warning(f"[{session.label}] funding rate fetch failed, skipping: {e}")
+
+            # Funding moves the balance every tick with no corresponding "trade" —
+            # without this, it's an invisible drain/credit a user can't account for
+            # when trying to reconcile equity from the trade feed alone.
+            _funding_total = round(sum(f["charge"] for f in _funding_breakdown), 4)
+            if _funding_total != 0:
+                emit_fn("funding", {
+                    "wallet": session.address, "label": session.label,
+                    "total_charge": _funding_total, "breakdown": _funding_breakdown,
+                    "timestamp": datetime.utcnow().isoformat(timespec='milliseconds'),
+                })
 
             equity = session.simulated_balance + total_margin + total_upnl
 
@@ -1199,7 +1238,8 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
             _snap_ref  = max(abs(_prev_snap), 1.0)
             _snap_ok   = abs(equity - _prev_snap) / _snap_ref <= 0.10
             if _snap_ok:
-                await asyncio.to_thread(db_snapshot_equity, session.address, equity, session.simulated_balance, total_upnl)
+                await asyncio.to_thread(db_snapshot_equity, session.address, equity, session.simulated_balance,
+                                        total_upnl, session.total_funding_paid)
             session.equity_history.append({
                 "t": datetime.utcnow().isoformat(timespec='milliseconds'),
                 "equity": round(equity if _snap_ok else _prev_snap, 2),
@@ -1583,6 +1623,7 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
         _ctrs = db_restore_session_counters(session.address)
         session.simulated_pnl       = _ctrs["simulated_pnl"]
         session.total_fees_paid     = _ctrs["total_fees_paid"]
+        session.total_funding_paid  = _snap.get("total_funding_paid", 0.0)
         session.wins                = _ctrs["wins"]
         session.losses              = _ctrs["losses"]
         session.trades_copied_count = _ctrs["trades_copied_count"]
@@ -1595,6 +1636,7 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
         _ctrs = db_restore_session_counters(session.address)
         session.simulated_pnl       = _ctrs["simulated_pnl"]
         session.total_fees_paid     = _ctrs["total_fees_paid"]
+        session.total_funding_paid  = _snap.get("total_funding_paid", 0.0)
         session.wins                = _ctrs["wins"]
         session.losses              = _ctrs["losses"]
         session.trades_copied_count = _ctrs["trades_copied_count"]
@@ -1771,6 +1813,14 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
                     seed_size, entry_px, your_lev,
                     fee=seed_fee, is_seed=True,
                 )
+                # Entry == mark price at seed time, so UPNL is 0 for every seeded
+                # position — running equity is just balance + cumulative margin,
+                # no need to fetch fresh prices for each one.
+                _seed_running_equity = (
+                    session.simulated_balance
+                    + sum(p.get("margin_used", 0) for p in session.simulated_positions.values())
+                )
+                db_update_trade_equity(fill_id, round(_seed_running_equity, 2))
                 # Emit fill event so the trade feed shows the seeded position —
                 # without this, positions appear in the panel but are invisible in the feed.
                 emit_fn("fill", {
@@ -1784,6 +1834,8 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
                     "notional":      round(pos_value, 2),
                     "leverage":      your_lev,
                     "realized_pnl":  None,
+                    "fee":           round(seed_fee, 4),
+                    "equity_after":  round(_seed_running_equity, 2),
                     "timestamp":     datetime.utcnow().isoformat(timespec='milliseconds'),
                 })
                 counts[decision] += 1
@@ -1814,7 +1866,7 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
         "balance": round(session.simulated_balance, 2),
         "upnl": round(upnl, 2),
     })
-    db_snapshot_equity(session.address, eq, session.simulated_balance, upnl)
+    db_snapshot_equity(session.address, eq, session.simulated_balance, upnl, session.total_funding_paid)
 
     cbs = make_callbacks(session, emit_fn)
     session.monitor.on_new_position    = cbs["on_new_position"]
@@ -1842,6 +1894,8 @@ async def _reinit_session(session: WalletSession, emit_fn: Callable):
         session.simulated_positions  = {}
         session.ghost_positions      = {}
         session.simulated_pnl        = 0.0
+        session.total_fees_paid      = 0.0
+        session.total_funding_paid   = 0.0
         session.trades_copied_count  = 0
         session.wins                 = 0
         session.losses               = 0
@@ -1956,6 +2010,11 @@ async def _reinit_session(session: WalletSession, emit_fn: Callable):
                     seed_size, entry_px, your_lev,
                     fee=seed_fee, is_seed=True,
                 )
+                _seed_running_equity = (
+                    session.simulated_balance
+                    + sum(p.get("margin_used", 0) for p in session.simulated_positions.values())
+                )
+                db_update_trade_equity(fill_id, round(_seed_running_equity, 2))
                 emit_fn("fill", {
                     "wallet":       session.address,
                     "label":        session.label,
@@ -1967,6 +2026,8 @@ async def _reinit_session(session: WalletSession, emit_fn: Callable):
                     "notional":     round(pos_value, 2),
                     "leverage":     your_lev,
                     "realized_pnl": None,
+                    "fee":          round(seed_fee, 4),
+                    "equity_after": round(_seed_running_equity, 2),
                     "timestamp":    datetime.utcnow().isoformat(timespec='milliseconds'),
                 })
                 counts[decision] += 1
@@ -1994,7 +2055,7 @@ async def _reinit_session(session: WalletSession, emit_fn: Callable):
         "balance": round(session.simulated_balance, 2),
         "upnl": round(upnl, 2),
     })
-    db_snapshot_equity(session.address, eq, session.simulated_balance, upnl)
+    db_snapshot_equity(session.address, eq, session.simulated_balance, upnl, session.total_funding_paid)
 
     # Re-register all WS callbacks — reinit clears simulated_positions/ghosts but the
     # monitor's callbacks were set in the original start_session and point to closures

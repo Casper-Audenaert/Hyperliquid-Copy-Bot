@@ -681,10 +681,11 @@ header{
         <table class="ftbl">
           <thead><tr>
             <th>Time</th><th>Symbol</th><th>Direction</th>
-            <th>Size</th><th>Price</th><th>PnL</th><th>Wallet</th>
+            <th>Size</th><th>Price</th><th title="Taker fee charged (or funding paid/earned) on this event">Fee</th>
+            <th>PnL</th><th title="Account equity right after this event">Equity</th><th>Wallet</th>
           </tr></thead>
           <tbody id="feed-body">
-            <tr id="feed-ph"><td colspan="7" class="no-feed">Waiting for fills…</td></tr>
+            <tr id="feed-ph"><td colspan="9" class="no-feed">Waiting for fills…</td></tr>
           </tbody>
         </table>
       </div>

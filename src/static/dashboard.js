@@ -647,6 +647,12 @@ function prependFill(f) {
   const pnlH   = pnlFmt == null
     ? `<span class="dim">—</span>`
     : `<span style="color:${pnl>=0?'var(--green)':'var(--red)'}">${pnl>=0?'+':''}${pnlFmt}</span>`;
+  const feeH = f.fee != null
+    ? `<span class="dim" title="Taker fee charged on this fill">${fUsd(f.fee)}</span>`
+    : `<span class="dim">—</span>`;
+  const eqH  = f.equity_after != null
+    ? `<span class="mono">${fUsd(f.equity_after)}</span>`
+    : `<span class="dim">—</span>`;
 
   const tr = document.createElement('tr');
   tr.className = 'fnew';
@@ -656,12 +662,43 @@ function prependFill(f) {
     <td><span class="dc ${dirCls(dir)}">${dir||f.side||'—'}</span></td>
     <td class="mono">${fNum(f.size)}</td>
     <td class="mono">$${fPx(f.price)}</td>
+    <td class="mono">${feeH}</td>
     <td>${pnlH}</td>
+    <td class="mono">${eqH}</td>
     <td class="wlbl">${f.wallet_label||f.label||''}</td>`;
   tbody.prepend(tr);
   while (tbody.children.length > 200) tbody.removeChild(tbody.lastChild);
   fillCount++;
   document.getElementById('feed-cnt').textContent = fillCount+' fill'+(fillCount!==1?'s':'');
+}
+
+function prependFundingRow(f) {
+  // Funding moves the balance every ~30s tick with no corresponding "trade" —
+  // shown as a distinct row (one per affected symbol) so equity changes from
+  // funding are just as traceable in the feed as fills are.
+  const tbody = document.getElementById('feed-body');
+  const ph    = document.getElementById('feed-ph');
+  if (ph) ph.remove();
+
+  const eq = state[f.wallet]?.equity;
+  (f.breakdown || []).forEach(b => {
+    if (!b.charge) return;
+    const paid  = b.charge > 0;  // positive = paid (debit), negative = earned (credit)
+    const tr = document.createElement('tr');
+    tr.className = 'fnew';
+    tr.innerHTML = `
+      <td class="mono dim">${fTime(f.timestamp||new Date().toISOString())}</td>
+      <td><span class="sym-b">${b.symbol||'—'}</span></td>
+      <td><span class="dc" style="color:var(--t3)">Funding ${paid?'Paid':'Earned'}</span></td>
+      <td class="mono dim">—</td>
+      <td class="mono dim">—</td>
+      <td class="mono"><span style="color:${paid?'var(--red)':'var(--green)'}">${paid?'-':'+'}${fUsd(Math.abs(b.charge))}</span></td>
+      <td class="dim">—</td>
+      <td class="mono">${eq != null ? `<span class="dim">${fUsd(eq)}</span>` : '<span class="dim">—</span>'}</td>
+      <td class="wlbl">${f.label||''}</td>`;
+    tbody.prepend(tr);
+  });
+  while (tbody.children.length > 200) tbody.removeChild(tbody.lastChild);
 }
 
 // ── Stats tearsheet ────────────────────────────────────────────────────────
@@ -1636,7 +1673,7 @@ function reloadFeedForCompare(from = '', to = '') {
     all.slice(-200).reverse().forEach(t => prependFill(t));
     if (!all.length)
       document.getElementById('feed-body').innerHTML =
-        '<tr id="feed-ph"><td colspan="7" class="no-feed">No fills yet…</td></tr>';
+        '<tr id="feed-ph"><td colspan="9" class="no-feed">No fills yet…</td></tr>';
   });
 }
 
@@ -1874,6 +1911,13 @@ socket.on('fill', f => {
   }
 });
 
+socket.on('funding', f => {
+  const cur = curWallet();
+  if (compareMode || !cur || cur === f.wallet) {
+    prependFundingRow(f);
+  }
+});
+
 socket.on('equity_tick', tick => {
   // Retroactive spike correction: each incoming tick gives us the "right" context
   // to correct the PREVIOUS point (3-point: h[-2], h[-1], tick) and the point
@@ -1973,7 +2017,7 @@ socket.on('clear', async d => {
     const cur = curWallet();
     if (cur === addr) {
       document.getElementById('feed-body').innerHTML =
-        '<tr id="feed-ph"><td colspan="7" class="no-feed">Waiting for fills…</td></tr>';
+        '<tr id="feed-ph"><td colspan="9" class="no-feed">Waiting for fills…</td></tr>';
       fillCount = 0;
       document.getElementById('feed-cnt').textContent = '0 fills';
       document.getElementById('stats-content').innerHTML =
@@ -1996,7 +2040,7 @@ socket.on('clear', async d => {
     chart.data.datasets = []; chart.update('none');
     _destroyCharts();
     document.getElementById('feed-body').innerHTML =
-      '<tr id="feed-ph"><td colspan="7" class="no-feed">Waiting for fills…</td></tr>';
+      '<tr id="feed-ph"><td colspan="9" class="no-feed">Waiting for fills…</td></tr>';
     fillCount = 0;
     document.getElementById('feed-cnt').textContent = '0 fills';
     document.getElementById('stats-content').innerHTML =

@@ -49,6 +49,7 @@ class TradeRecord(Base):
     leverage     = Column(Integer)
     realized_pnl = Column(Float, nullable=True)
     fee          = Column(Float, nullable=True)
+    equity_after = Column(Float, nullable=True)  # account equity right after this fill — lets a user trace equity change-by-change
     is_simulated    = Column(Boolean, default=True)
     is_seed         = Column(Boolean, default=False)  # True = seeded at session start
     is_debounced    = Column(Boolean, default=False)  # True = entered via HFT debounce filter
@@ -60,12 +61,13 @@ class TradeRecord(Base):
 
 class EquitySnapshot(Base):
     __tablename__ = "web_equity"
-    id          = Column(Integer, primary_key=True)
-    wallet_addr = Column(String, index=True)
-    equity      = Column(Float)
-    balance     = Column(Float)
-    upnl        = Column(Float)
-    timestamp   = Column(DateTime, default=datetime.utcnow)
+    id                 = Column(Integer, primary_key=True)
+    wallet_addr        = Column(String, index=True)
+    equity             = Column(Float)
+    balance            = Column(Float)
+    upnl               = Column(Float)
+    total_funding_paid = Column(Float)
+    timestamp          = Column(DateTime, default=datetime.utcnow)
 
 
 class SimulatedPosition(Base):
@@ -123,6 +125,7 @@ for _col, _ddl in [
     ("is_debounced",    "ALTER TABLE web_trades ADD COLUMN is_debounced INTEGER DEFAULT 0"),
     ("target_entry_px", "ALTER TABLE web_trades ADD COLUMN target_entry_px REAL"),
     ("copy_delay_ms",   "ALTER TABLE web_trades ADD COLUMN copy_delay_ms REAL"),
+    ("equity_after",    "ALTER TABLE web_trades ADD COLUMN equity_after REAL"),
 ]:
     try:
         with _db_engine.connect() as conn:
@@ -137,6 +140,7 @@ for _col, _ddl in [
     ("copy_mode",      "ALTER TABLE wallets ADD COLUMN copy_mode TEXT DEFAULT 'all_fills'"),
     ("debounce_secs",  "ALTER TABLE wallets ADD COLUMN debounce_secs INTEGER DEFAULT 30"),
     ("detected_style", "ALTER TABLE wallets ADD COLUMN detected_style TEXT DEFAULT 'Swing'"),
+    ("total_funding_paid", "ALTER TABLE web_equity ADD COLUMN total_funding_paid REAL"),
 ]:
     try:
         with _db_engine.connect() as conn:
@@ -286,9 +290,23 @@ def db_record_close(wallet_addr: str, symbol: str, realized_pnl: float):
             db.commit()
 
 
-def db_snapshot_equity(wallet_addr: str, equity: float, balance: float, upnl: float):
+def db_update_trade_equity(fill_id, equity: float):
+    """Patch the resulting account equity onto a specific fill's row, by fill_id
+    (precise — unlike db_record_close's by-symbol lookup, there's no ambiguity
+    about which row this belongs to). Lets a user trace equity change-by-change
+    through the trade feed instead of only seeing the equity curve chart."""
     with DbSession(_db_engine) as db:
-        db.add(EquitySnapshot(wallet_addr=wallet_addr, equity=equity, balance=balance, upnl=upnl))
+        rec = db.query(TradeRecord).filter_by(fill_id=str(fill_id)).first()
+        if rec:
+            rec.equity_after = equity
+            db.commit()
+
+
+def db_snapshot_equity(wallet_addr: str, equity: float, balance: float, upnl: float,
+                       total_funding_paid: float = 0.0):
+    with DbSession(_db_engine) as db:
+        db.add(EquitySnapshot(wallet_addr=wallet_addr, equity=equity, balance=balance,
+                              upnl=upnl, total_funding_paid=total_funding_paid))
         db.commit()
 
 
@@ -300,7 +318,8 @@ def db_get_latest_equity_snapshot(wallet_addr: str) -> dict | None:
                .first())
     if not row:
         return None
-    return {"equity": row.equity, "balance": row.balance, "upnl": row.upnl}
+    return {"equity": row.equity, "balance": row.balance, "upnl": row.upnl,
+            "total_funding_paid": row.total_funding_paid or 0.0}
 
 
 def db_upsert_position(wallet_addr: str, symbol: str, pos: dict):
@@ -482,4 +501,5 @@ def db_get_trades(wallet_addr: str, limit: int = 200,
     return [{"symbol": r.symbol, "side": r.side, "direction": r.direction,
              "size": r.size, "price": r.price, "notional": r.notional,
              "leverage": r.leverage, "realized_pnl": r.realized_pnl,
+             "fee": r.fee, "equity_after": r.equity_after, "is_seed": bool(r.is_seed),
              "timestamp": r.timestamp.isoformat()} for r in rows]
