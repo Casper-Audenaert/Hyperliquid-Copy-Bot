@@ -612,17 +612,17 @@ Fee is charged on post-slippage notional. This is correct: your actual fee in li
 
 ### 8.4 Funding charges
 
-Fetched via `get_funding_rates()` every 35s (shared across all wallets via `_funding_cache`). Applied in `_periodic_equity_snapshot` every 10s:
+Fetched via `get_funding_rates()` every 35s (shared across all wallets via `_funding_cache`). Applied in `_periodic_equity_snapshot` every 3s:
 
 ```
-charge = position_value × funding_rate / 360
-# 360 = number of 10s ticks per hour
+charge = position_value × funding_rate / 1200
+# 1200 = number of 3s ticks per hour
 # Longs pay charge; shorts receive charge
 balance -= charge  (LONG)
 balance += charge  (SHORT)
 ```
 
-HL's funding rate field is the 1-hour predicted rate (not 8-hour). Pro-rating by 360 converts it to a per-10s tick. The actual HL settlement is once per hour on the hour — this pro-rating is accurate on average but slightly off for positions closed within the first hour.
+HL's funding rate field is the 1-hour predicted rate (not 8-hour). Pro-rating by 1200 converts it to a per-3s tick. The actual HL settlement is once per hour on the hour — this pro-rating is accurate on average but slightly off for positions closed within the first hour.
 
 ### 8.5 Liquidation price
 
@@ -816,9 +816,11 @@ async with session._state_lock:
 
 ## 12. Periodic Tasks
 
-### 12.1 `_periodic_equity_snapshot` — every 10s (fixed cadence)
+### 12.1 `_periodic_equity_snapshot` — every 3s (fixed cadence)
 
-Runs as an asyncio task for each wallet, on a fixed `asyncio.sleep(10)` cadence (not jittered — wallets are already staggered via `start_session`'s offset, and `_mids_cache`/`_funding_cache` dedupe REST calls by TTL regardless of tick alignment, so jitter isn't load-bearing here). `session.copy_ratio` is **not** touched by this task — it stays fixed for the lifetime of the session (see Section 5, Step 3).
+Runs as an asyncio task for each wallet, on a fixed `asyncio.sleep(3)` cadence (not jittered — wallets are already staggered via `start_session`'s offset, and `_mids_cache`/`_funding_cache` dedupe REST calls by TTL regardless of tick alignment, so jitter isn't load-bearing here). 3s matches `_MIDS_TTL`, so this cadence never polls faster than the shared mids cache actually refreshes. `session.copy_ratio` is **not** touched by this task — it stays fixed for the lifetime of the session (see Section 5, Step 3).
+
+Fills also emit `equity_tick` directly (throttled to 1/s via `session._last_equity_tick_ts`), so the chart updates immediately on a trade instead of waiting for the next periodic tick — see Section 7 fill-processing flow.
 
 **Sequence:**
 
@@ -830,9 +832,9 @@ Runs as an asyncio task for each wallet, on a fixed `asyncio.sleep(10)` cadence 
    upnl = size × (entry - mark)  SHORT
    ```
 
-3. **Funding charges** — for each position, look up funding rate from cache, pro-rate the 1-hour rate to this 10-second tick (3600s / 10s = 360 ticks/hour):
+3. **Funding charges** — for each position, look up funding rate from cache, pro-rate the 1-hour rate to this 3-second tick (3600s / 3s = 1200 ticks/hour):
    ```
-   charge = abs(size) × mark_price × funding_rate / 360
+   charge = abs(size) × mark_price × funding_rate / 1200
    balance -= charge  (LONG)
    balance += charge  (SHORT)
    total_funding_paid += charge  (LONG)

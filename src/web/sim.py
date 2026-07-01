@@ -900,12 +900,18 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
         "timestamp": datetime.utcnow().isoformat(timespec='milliseconds'),
     })
     emit_fn("state_update", _session_to_dict(session, price_override=_px_override))
-    # equity_tick is intentionally NOT emitted from fills.
-    # Fill-based equity uses _px_override (entry_price for the new position → UPNL=0)
-    # while other open positions use a potentially-stale _mids_cache.  This pricing
-    # mismatch vs the snapshot's fresh allMids fetch is what caused the chart spikes.
-    # The periodic snapshot (every 25-35 s) is the sole source of equity_tick events —
-    # it uses one consistent price source (fresh allMids, no overrides) for all positions.
+    # Live chart update on fills, throttled to 1/s (HFT wallets can fire hundreds of
+    # fills/sec — no point emitting faster than the frontend can usefully render).
+    # This reuses the equity already computed above (with _px_override for the
+    # just-filled symbol), so a small step may appear on that symbol's contribution
+    # once the next periodic snapshot re-prices it without the override; the
+    # frontend's _despikeHistory() 5-point median filter is designed to absorb this.
+    _now_mono = time.monotonic()
+    if _now_mono - session._last_equity_tick_ts >= 1.0:
+        session._last_equity_tick_ts = _now_mono
+        emit_fn("equity_tick", {"wallet": session.address,
+                                 "t": datetime.utcnow().isoformat(timespec='milliseconds'),
+                                 "equity": round(equity, 2)})
 
 
 # ── Callbacks ─────────────────────────────────────────────────────────────────
@@ -1172,7 +1178,9 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
             # regular time grid — wallets are already staggered via start_session's
             # offset_secs, and _funding_cache/_mids_cache dedupe REST calls by TTL
             # regardless of tick alignment, so jitter wasn't load-bearing here.
-            await asyncio.sleep(10)
+            # 3s matches _MIDS_TTL so this tick never fetches faster than the shared
+            # cache actually refreshes.
+            await asyncio.sleep(3)
             if session.address not in _sessions:
                 logger.debug(f"[{session.label}] Snapshot task exiting — wallet removed")
                 return
@@ -1227,7 +1235,7 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
             total_margin = sum(p.get("margin_used", 0) for p in session.simulated_positions.values())
 
             # HL `funding` field = current predicted 1-hour rate (not 8h).
-            # Pro-rate to this 10s tick: 1h = 3600s → 360 ticks of 10s each.
+            # Pro-rate to this 3s tick: 1h = 3600s → 1200 ticks of 3s each.
             _funding_breakdown: list = []  # per-symbol charges this tick, for feed visibility
             try:
                 funding_map = await _get_shared_funding_rates(session.client)
@@ -1240,7 +1248,7 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
                         if px <= 0:
                             continue
                         pos_value = abs(pos["size"]) * px
-                        charge    = pos_value * rate / 360  # 1h rate ÷ 360 ten-second ticks
+                        charge    = pos_value * rate / 1200  # 1h rate ÷ 1200 three-second ticks
                         is_long   = pos.get("side", "").upper() == "LONG"
                         if is_long:
                             session.simulated_balance   -= charge
