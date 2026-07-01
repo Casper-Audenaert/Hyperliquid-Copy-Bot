@@ -543,12 +543,14 @@ function renderKpis() {
     : (state[cur] ? [state[cur]] : []);
   if (!sess.length) return;
 
-  const bal   = sess.reduce((a,s)=>a+(s.balance||0), 0);
-  const upnl  = sess.reduce((a,s)=>a+(s.upnl||0), 0);
-  const eq    = sess.reduce((a,s)=>a+(s.equity||0), 0);
-  const grossPnl = sess.reduce((a,s)=>a+(s.pnl||0), 0);
-  const netPnl   = sess.reduce((a,s)=>a+(s.net_pnl||0), 0);  // already deducts fees+funding
-  const fees     = sess.reduce((a,s)=>a+(s.total_fees_paid||0), 0);
+  const bal     = sess.reduce((a,s)=>a+(s.balance||0), 0);
+  const upnl    = sess.reduce((a,s)=>a+(s.upnl||0), 0);
+  const eq      = sess.reduce((a,s)=>a+(s.equity||0), 0);
+  const margin  = sess.reduce((a,s)=>a+(s.total_margin||0), 0);
+  const grossPnl  = sess.reduce((a,s)=>a+(s.pnl||0), 0);
+  const netPnl    = sess.reduce((a,s)=>a+(s.net_pnl||0), 0);
+  const fees      = sess.reduce((a,s)=>a+(s.total_fees_paid||0), 0);
+  const funding   = sess.reduce((a,s)=>a+(s.total_funding_paid||0), 0);
   const trd   = sess.reduce((a,s)=>a+(s.trades_copied_count||0), 0);
   const npos  = sess.reduce((a,s)=>a+(s.positions?.length||0), 0);
   const sb    = sess.reduce((a,s)=>a+(s.start_balance||0), 0);
@@ -563,8 +565,10 @@ function renderKpis() {
 
   setKpi('b', fUsd(bal),  '', null);
   setKpi('u', fUsd(upnl), fPct(upPct), upnl);
-  setKpi('e', fUsd(eq),   fPct(ret)+' return from start', ret);
-  setKpi('p', fUsd(netPnl), grossPnl !== netPnl ? `gross ${fUsd(grossPnl)} before fees` : 'realized net', netPnl);
+  setKpi('e', fUsd(eq),   `${fUsd(bal)} + ${fUsd(margin)} margin + ${fUsd(upnl)} upnl`, ret);
+  const _fundPart = funding !== 0 ? ` − ${fUsd(Math.abs(funding))} funding` : '';
+  const _pnlSub = grossPnl !== netPnl ? `${fUsd(grossPnl)} gross − ${fUsd(fees)} fees${_fundPart}` : 'realized net';
+  setKpi('p', fUsd(netPnl), _pnlSub, netPnl);
   const wrColor = wr==null ? null : wr>=55 ? 1 : wr>=40 ? 0 : -1;
   setKpi('w', wr!=null ? wr.toFixed(1)+'%' : '—', `${wins}W / ${losses}L`, wrColor);
   setKpi('t', String(wins + losses), npos+' open position'+(npos!==1?'s':''), null);
@@ -889,14 +893,27 @@ function renderStats(st) {
     })()}
 
     <div class="stat-section">
-      <div class="stat-section-title">Fees (HL Taker)</div>
+      <div class="stat-section-title">Accounting</div>
       <div class="stat-grid">
-        <div class="stat-row"><span class="stat-lbl">Taker Fees Paid</span>${sv(fUsd(st.total_fees),'var(--red)')}</div>
-        ${(()=>{const fp=st.total_funding_paid??0;return fp!==0?`<div class="stat-row"><span class="stat-lbl">Funding ${fp>0?'Paid':'Earned'}</span>${sv(fUsd(Math.abs(fp)),fp>0?'var(--red)':'var(--green)')}</div>`:'';})()}
-        <div class="stat-row"><span class="stat-lbl">Gross PnL</span>${sv(fUsd(st.gross_realized_pnl), pnlC(st.gross_realized_pnl))}</div>
-        <div class="stat-row"><span class="stat-lbl">Net PnL (fees+funding)</span>${sv(fUsd(st.net_realized_pnl), pnlC(st.net_realized_pnl))}</div>
-        <div class="stat-row" title="Fee per individual fill (open or close)"><span class="stat-lbl">Avg Fee / Fill</span>${sv(fUsd(st.avg_fee_per_fill),'var(--red)')}</div>
-        <div class="stat-row" title="Fee per completed round-trip (open + close combined) — roughly 2× per-fill"><span class="stat-lbl">Avg Fee / Round-trip</span>${sv(fUsd(st.avg_fee_per_roundtrip),'var(--red)')}</div>
+        ${(()=>{
+          const _s = state[addr];
+          const _bal = _s?.balance??0, _margin = _s?.total_margin??0, _upnl = _s?.upnl??0, _eq = _s?.equity??0;
+          return `
+            <div class="stat-row formula-row"><span class="stat-lbl">Free Cash</span>${sv(fUsd(_bal),'var(--t2)')}</div>
+            <div class="stat-row formula-row"><span class="stat-lbl">+ Margin Used</span>${sv(fUsd(_margin),'var(--t2)')}</div>
+            <div class="stat-row formula-row"><span class="stat-lbl">+ Unrealized PnL</span>${sv(fUsd(_upnl),pnlC(_upnl))}</div>
+            <div class="stat-row formula-total"><span class="stat-lbl">= Equity</span>${sv(fUsd(_eq),'var(--t1)')}</div>`;
+        })()}
+        ${(()=>{
+          const fp = st.total_funding_paid??0;
+          return `
+            <div class="stat-row formula-row" style="margin-top:8px"><span class="stat-lbl">Gross PnL</span>${sv(fUsd(st.gross_realized_pnl),pnlC(st.gross_realized_pnl))}</div>
+            <div class="stat-row formula-row"><span class="stat-lbl">− Taker Fees</span>${sv(fUsd(st.total_fees),'var(--red)')}</div>
+            ${fp!==0?`<div class="stat-row formula-row"><span class="stat-lbl">− Funding ${fp>0?'Paid':'Earned'}</span>${sv(fUsd(Math.abs(fp)),fp>0?'var(--red)':'var(--green)')}</div>`:''}
+            <div class="stat-row formula-total"><span class="stat-lbl">= Net PnL</span>${sv(fUsd(st.net_realized_pnl),pnlC(st.net_realized_pnl))}</div>`;
+        })()}
+        <div class="stat-row" style="margin-top:8px" title="Fee per individual fill (open or close)"><span class="stat-lbl">Avg Fee / Fill</span>${sv(fUsd(st.avg_fee_per_fill),'var(--red)')}</div>
+        <div class="stat-row" title="Fee per completed round-trip (open + close combined)"><span class="stat-lbl">Avg Fee / Round-trip</span>${sv(fUsd(st.avg_fee_per_roundtrip),'var(--red)')}</div>
         <div class="stat-row"><span class="stat-lbl">Total Volume</span>${sv(fUsd(st.total_volume),'var(--t2)')}</div>
         <div class="stat-row"><span class="stat-lbl">Fee % of Volume</span>${sv(st.fee_pct_vol!=null?st.fee_pct_vol+'%':'—','var(--t2)')}</div>
         ${st.fee_drag_pct!=null?`<div class="stat-row"><span class="stat-lbl">Fee Drag</span>${sv(st.fee_drag_pct+'% of gross profit','var(--red)')}</div>`:''}

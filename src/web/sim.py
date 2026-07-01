@@ -29,7 +29,7 @@ from copy_engine.monitor import WalletMonitor
 from copy_engine.executor import TradeExecutor
 from copy_engine.position_sizer import PositionSizer
 from web.db import (
-    db_record_fill, db_record_close, db_snapshot_equity,
+    db_record_fill, db_record_close, db_snapshot_equity, db_update_latest_funding,
     db_get_trades, purge_wallet_data,
     db_get_latest_equity_snapshot, db_restore_session_counters,
     db_get_known_fill_ids, db_update_trade_equity,
@@ -1230,6 +1230,11 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
             # Funding moves the balance every tick with no corresponding "trade" —
             # without this, it's an invisible drain/credit a user can't account for
             # when trying to reconcile equity from the trade feed alone.
+            if _funding_breakdown:
+                # Always persist the running total even when the full equity snapshot
+                # is rate-limited — UPDATE (not INSERT) so no chart rows are added.
+                await asyncio.to_thread(db_update_latest_funding, session.address, session.total_funding_paid)
+
             _funding_total = round(sum(f["charge"] for f in _funding_breakdown), 4)
             if _funding_total != 0:
                 emit_fn("funding", {

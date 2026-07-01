@@ -425,16 +425,17 @@ def compute_stats(wallet_addr: str, open_positions: dict = None, copy_ratio: flo
     equities    = [r.equity for r in equity_rows]
 
     # ── Fee stats ──────────────────────────────────────────────────────────────
-    total_fees         = round(sum(_eff_fee(t) for t in trades), 2)  # all trades incl. seeds
-    total_volume       = round(sum(t.notional or 0 for t in live_trades), 2)  # copied fills only
+    total_fees         = round(sum(_eff_fee(t) for t in trades), 2)       # all fills incl. seeds — used for net_pnl
+    live_fees          = round(sum(_eff_fee(t) for t in live_trades), 2)  # live fills only — used for rates/averages
+    total_volume       = round(sum(t.notional or 0 for t in live_trades), 2)
     gross_pnl          = round(sum(closed_pnls), 2)
     total_funding      = round(equity_rows[-1].total_funding_paid if equity_rows else 0.0, 4)
     net_pnl            = round(gross_pnl - total_fees - total_funding, 2)
     close_fills        = [t for t in live_trades if t.realized_pnl is not None]
-    avg_fee_per_fill      = round(total_fees / len(trades), 4) if trades else 0.0
-    avg_fee_per_roundtrip = round(total_fees / len(close_fills), 4) if close_fills else 0.0
-    fee_pct_vol        = round(total_fees / total_volume * 100, 4) if total_volume else 0.0
-    fee_drag_pct       = round(total_fees / gross_pnl * 100, 1) if gross_pnl > total_fees else None
+    avg_fee_per_fill      = round(live_fees / len(live_trades), 4) if live_trades else 0.0
+    avg_fee_per_roundtrip = round(live_fees / len(close_fills), 4)  if close_fills else 0.0
+    fee_pct_vol        = round(live_fees / total_volume * 100, 4)   if total_volume else 0.0
+    fee_drag_pct       = round(live_fees / gross_pnl * 100, 1) if gross_pnl > live_fees else None
     breakeven_notional = round(0.10 / settings.taker_fee_rate, 2)
 
     # ── Copy capital brackets ──────────────────────────────────────────────────

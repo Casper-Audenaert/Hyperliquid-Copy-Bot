@@ -372,6 +372,20 @@ def db_snapshot_equity(wallet_addr: str, equity: float, balance: float, upnl: fl
         db.commit()
 
 
+def db_update_latest_funding(wallet_addr: str, total_funding_paid: float) -> None:
+    """UPDATE total_funding_paid on the most recent snapshot row — no new row inserted,
+    so this never adds chart noise. Safe to call every funding tick regardless of the
+    equity-snapshot rate-limit guard."""
+    with DbSession(_db_engine) as db:
+        row = (db.query(EquitySnapshot)
+               .filter(EquitySnapshot.wallet_addr == wallet_addr)
+               .order_by(EquitySnapshot.id.desc())
+               .first())
+        if row:
+            row.total_funding_paid = total_funding_paid
+            db.commit()
+
+
 def db_get_latest_equity_snapshot(wallet_addr: str) -> dict | None:
     with DbSession(_db_engine) as db:
         row = (db.query(EquitySnapshot)
