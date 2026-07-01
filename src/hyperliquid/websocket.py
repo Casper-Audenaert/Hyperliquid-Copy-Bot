@@ -131,6 +131,45 @@ class HyperliquidWebSocket:
                 pass
         logger.info(f"Unsubscribed userEvents for {address[:10]}…")
 
+    async def subscribe_user_fills(self, address: str, callback: Optional[Callable] = None):
+        """Subscribe to userFills — HL's purpose-built fill feed.  Sends an
+        `isSnapshot: true` message with recent fills immediately on (re)subscribe
+        (including after a reconnect, via the resubscribe loop in connect()),
+        which backstops the REST-based _replay_missed_fills in monitor.py without
+        an extra per-DEX REST burst.  Fills are routed through the same
+        _handle_fills() path as userEvents, so tid-based dedup already makes
+        double-delivery from both feeds safe.
+        """
+        addr_lower = address.lower()
+        channel_key = f"userFills:{addr_lower}"
+        if callback:
+            self.callbacks[channel_key] = callback
+
+        sub = {
+            "method": "subscribe",
+            "subscription": {"type": "userFills", "user": address},
+        }
+        self.subscriptions[channel_key] = sub
+        if self.ws:
+            await self._send_subscription(sub)
+
+        logger.info(f"Subscribed userFills for {address[:10]}…")
+
+    async def unsubscribe_user_fills(self, address: str):
+        addr_lower = address.lower()
+        channel_key = f"userFills:{addr_lower}"
+        self.subscriptions.pop(channel_key, None)
+        self.callbacks.pop(channel_key, None)
+        if self.ws and not self.ws.closed:
+            try:
+                await self.ws.send(json.dumps({
+                    "method": "unsubscribe",
+                    "subscription": {"type": "userFills", "user": address},
+                }))
+            except Exception:
+                pass
+        logger.info(f"Unsubscribed userFills for {address[:10]}…")
+
     async def _handle_message(self, message: str):
         try:
             data = json.loads(message)
@@ -184,6 +223,35 @@ class HyperliquidWebSocket:
                         except Exception as e:
                             logger.error(f"User broadcast callback error ({key}): {e}")
                 return  # handled above — skip the generic callback path below
+            elif channel == "userFills":
+                # Same routing pattern as "user": match by embedded user address,
+                # falling back to broadcast if HL omits it.
+                inner = data.get("data", {})
+                user_addr = (inner.get("user") or "").lower()
+                if user_addr:
+                    callback = self.callbacks.get(f"userFills:{user_addr}")
+                    if callback is not None:
+                        try:
+                            if asyncio.iscoroutinefunction(callback):
+                                await callback(update)
+                            else:
+                                callback(update)
+                        except Exception as e:
+                            logger.error(f"userFills callback error for {user_addr[:10]}…: {e}")
+                    else:
+                        logger.debug(f"No userFills callback registered for user={user_addr}")
+                else:
+                    for key, cb in list(self.callbacks.items()):
+                        if not key.startswith("userFills:"):
+                            continue
+                        try:
+                            if asyncio.iscoroutinefunction(cb):
+                                await cb(update)
+                            else:
+                                cb(update)
+                        except Exception as e:
+                            logger.error(f"userFills broadcast callback error ({key}): {e}")
+                return
             else:
                 callback = self.callbacks.get(channel)
                 if callback is None:
@@ -231,8 +299,10 @@ class HyperliquidWebSocket:
                 if not self.ws or self.ws.closed:
                     await self.connect()
                     if not first_connect and self.on_reconnect_handlers:
-                        for handler in self.on_reconnect_handlers:
-                            asyncio.create_task(handler())
+                        # Stagger handler fan-out: firing all wallets' REST-based fill
+                        # replay in the same instant can burst well past HL's rate-limit
+                        # budget when many wallets share one reconnecting connection.
+                        asyncio.create_task(self._run_reconnect_handlers(list(self.on_reconnect_handlers)))
                     first_connect = False
 
                 async for message in self.ws:
@@ -244,6 +314,12 @@ class HyperliquidWebSocket:
             except Exception as e:
                 logger.error(f"WS listener error: {e}")
                 await asyncio.sleep(self.reconnect_delay)
+
+    async def _run_reconnect_handlers(self, handlers: List[Callable]):
+        for i, handler in enumerate(handlers):
+            if i > 0:
+                await asyncio.sleep(0.5)
+            asyncio.create_task(handler())
 
     async def stop(self):
         self.is_running = False

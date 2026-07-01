@@ -205,7 +205,7 @@ Load `db_load_positions(address)` and `db_get_latest_equity_snapshot(address)`.
 copy_ratio = session.start_balance / target.balance
 ```
 
-This is locked for the session. It never changes during trading (only updated in the periodic snapshot for display purposes, guarded by `_state_lock`).
+This is locked for the session and never changes during trading. `_periodic_equity_snapshot` does not recompute or mutate `session.copy_ratio` — it is fixed for the lifetime of the session (see Section 12.1).
 
 **Step 4 — Ghost reconciliation (restart case)**
 
@@ -338,7 +338,7 @@ Checks are applied in strict order. The first failing check returns `GHOST_ONLY`
 ### 6.3 Seeding execution
 
 For `SEED_NOW` and `SEED_SMALL`:
-- Use `pos.entry_price` (target's actual entry) as the simulated entry price — not current mark price. This makes the simulation reflect the target's full position history from their original entry.
+- Use the **current mark price** as the simulated entry price — not the target's actual `entry_price` ("copy from now" semantics). Seeding at the target's historical entry would inherit their unrealized gain/loss at startup and inflate simulated equity; seeding at mark price starts the simulated position at ≈0 uPnL, as if the copy began right now.
 - Leverage is capped at `min(pos.leverage, max_seed_leverage)` then adjusted via `position_sizer.calculate_leverage()`
 - Compute `margin = seed_size × mark_price / leverage`
 - Charge seed fee: `seed_size × mark_price × taker_fee_rate`
@@ -612,17 +612,17 @@ Fee is charged on post-slippage notional. This is correct: your actual fee in li
 
 ### 8.4 Funding charges
 
-Fetched via `get_funding_rates()` every 35s (shared across all wallets via `_funding_cache`). Applied in `_periodic_equity_snapshot` every ~30s:
+Fetched via `get_funding_rates()` every 35s (shared across all wallets via `_funding_cache`). Applied in `_periodic_equity_snapshot` every 10s:
 
 ```
-charge = position_value × funding_rate / 120
-# 120 = number of 30s periods per hour
+charge = position_value × funding_rate / 360
+# 360 = number of 10s ticks per hour
 # Longs pay charge; shorts receive charge
 balance -= charge  (LONG)
 balance += charge  (SHORT)
 ```
 
-HL's funding rate field is the 1-hour predicted rate (not 8-hour). Pro-rating by 120 converts it to a per-30s tick. The actual HL settlement is once per hour on the hour — this pro-rating is accurate on average but slightly off for positions closed within the first hour.
+HL's funding rate field is the 1-hour predicted rate (not 8-hour). Pro-rating by 360 converts it to a per-10s tick. The actual HL settlement is once per hour on the hour — this pro-rating is accurate on average but slightly off for positions closed within the first hour.
 
 ### 8.5 Liquidation price
 
@@ -816,56 +816,48 @@ async with session._state_lock:
 
 ## 12. Periodic Tasks
 
-### 12.1 `_periodic_equity_snapshot` — every 25–35s
+### 12.1 `_periodic_equity_snapshot` — every 10s (fixed cadence)
 
-Runs as an asyncio task for each wallet. The random jitter (25 + uniform(0, 10)) prevents all wallets from calling the API simultaneously.
+Runs as an asyncio task for each wallet, on a fixed `asyncio.sleep(10)` cadence (not jittered — wallets are already staggered via `start_session`'s offset, and `_mids_cache`/`_funding_cache` dedupe REST calls by TTL regardless of tick alignment, so jitter isn't load-bearing here). `session.copy_ratio` is **not** touched by this task — it stays fixed for the lifetime of the session (see Section 5, Step 3).
 
 **Sequence:**
 
-1. **copy_ratio refresh** — re-compute from target's current balance inside `_state_lock`:
-   ```python
-   new_ratio = start_balance / monitor.current_state.balance
-   async with _state_lock:
-       session.copy_ratio = new_ratio
-   ```
-   This keeps the copy ratio in sync with the target's balance over weeks of trading.
+1. **Price map** — prefer a fresh `_get_shared_mids()` REST fetch (≤3s stale); fall back to `monitor.current_state.positions[i].current_price` (from last WS patch) if the REST fetch fails.
 
-2. **Price map** — use `monitor.current_state.positions[i].current_price` (from last WS patch). REST fallback via `_get_shared_mids()` for any symbols not in the current state.
-
-3. **Unrealized PnL** for each position:
+2. **Unrealized PnL** for each position:
    ```
    upnl = size × (mark - entry)  LONG
    upnl = size × (entry - mark)  SHORT
    ```
 
-4. **Funding charges** — for each position, look up funding rate from cache, pro-rate:
+3. **Funding charges** — for each position, look up funding rate from cache, pro-rate the 1-hour rate to this 10-second tick (3600s / 10s = 360 ticks/hour):
    ```
-   charge = abs(size) × mark_price × funding_rate / 120
+   charge = abs(size) × mark_price × funding_rate / 360
    balance -= charge  (LONG)
    balance += charge  (SHORT)
    total_funding_paid += charge  (LONG)
    total_funding_paid -= charge  (SHORT)  # earns funding
    ```
 
-5. **Equity computation:**
+4. **Equity computation:**
    ```
    equity = simulated_balance + total_margin + total_upnl
    ```
 
-6. **Circuit breaker check** — compare equity against baseline from `fast_loss_window_secs` ago in `equity_history`.
+5. **Circuit breaker check** — compare equity against baseline from `fast_loss_window_secs` ago in `equity_history`.
 
-7. **Liquidation check** — for each position, compute `liq_px` (from HL's WS data or fallback formula), store in `pos["_liq_px"]`, then check:
+6. **Liquidation check** — for each position, compute `liq_px` (from HL's WS data or fallback formula), store in `pos["_liq_px"]`, then check:
    ```
    LONG liquidated if mark <= liq_px
    SHORT liquidated if mark >= liq_px
    ```
    On liquidation: realize PnL at liq_px, delete position, emit `"margin_call"` event. If equity drops to ≤ 0, pause session and emit `"liquidated"`.
 
-8. **Style re-check** — if 6 hours have elapsed since last check: `asyncio.create_task(_detect_trading_style(session))`.
+7. **Style re-check** — if 6 hours have elapsed since last check: `asyncio.create_task(_detect_trading_style(session))`.
 
-9. **Snapshot write** — append to `equity_history` (in-memory, capped at 2000 entries) and write to `web_equity` DB table.
+8. **Snapshot write** — append to `equity_history` (in-memory, capped at 2000 entries) and write to `web_equity` DB table.
 
-10. **Emit** — `state_update` to UI.
+9. **Emit** — `state_update` to UI.
 
 ### 12.2 `WalletMonitor._periodic_state_refresh` — every 50–70s
 

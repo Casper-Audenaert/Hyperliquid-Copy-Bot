@@ -38,6 +38,8 @@ let statsCache   = {};      // addr → stats dict (cached from /api/stats)
 let compareSelection = new Set(); // addrs visible in compare mode
 let showCombined     = false;     // overlay combined portfolio curve
 let showUnderwater   = false;     // toggle underwater sub-chart
+let pctViewSingle    = false;     // single-wallet main chart: $ equity vs % return
+const usePctView     = () => compareMode || pctViewSingle;
 let sortCol          = 'score';
 let sortDir          = -1;        // -1 = desc
 let cmpTab           = 'leaderboard';
@@ -101,6 +103,13 @@ function toggleTheme() {
   document.getElementById('theme-btn').textContent = saved === 'light' ? '☾' : '☀';
 })();
 
+// Init chart value-mode ($ vs %) from localStorage
+pctViewSingle = localStorage.getItem('hl-chart-pct-view') === '1';
+if (pctViewSingle) {
+  const _btn = document.getElementById('btn-pct-view');
+  if (_btn) _btn.classList.add('on');
+}
+
 // ── Formatters ─────────────────────────────────────────────────────────────
 const fUsd  = n => n == null ? '—' : (n < 0 ? '-$' : '$') + Math.abs(n).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
 // Adaptive precision: shows 4 decimal places for sub-cent values so small PnL doesn't collapse to $0.00
@@ -159,14 +168,14 @@ function initChart() {
         tooltip: {
           backgroundColor: c.s1, borderColor: c.hr, borderWidth: 1,
           titleColor: c.t1, bodyColor: c.t2, padding: 12,
-          callbacks: { label: ctx => ` ${ctx.dataset.label}: ${compareMode ? fPct(ctx.parsed.y) : fUsd(ctx.parsed.y)}` }
+          callbacks: { label: ctx => ` ${ctx.dataset.label}: ${usePctView() ? fPct(ctx.parsed.y) : fUsd(ctx.parsed.y)}` }
         }
       },
       scales: {
         x: { type:'time', time:{ tooltipFormat:'HH:mm:ss', displayFormats:{minute:'HH:mm',hour:'HH:mm',day:'MMM d'} },
              ticks:{color:c.t3,maxTicksLimit:8,font:{size:10}}, grid:{color:c.hr+'88'}, border:{color:c.hr} },
         y: { ticks:{ color:c.t3, font:{size:10},
-                     callback: v => compareMode ? (v>=0?'+':'')+v.toFixed(1)+'%' : fUsd(v) },
+                     callback: v => usePctView() ? (v>=0?'+':'')+v.toFixed(1)+'%' : fUsd(v) },
              grid:{color:c.hr+'88'}, border:{color:c.hr} }
       }
     }
@@ -222,6 +231,14 @@ function renderUnderwaterChart(addr) {
       }
     }
   });
+}
+
+function toggleChartValueMode() {
+  pctViewSingle = !pctViewSingle;
+  localStorage.setItem('hl-chart-pct-view', pctViewSingle ? '1' : '0');
+  const btn = document.getElementById('btn-pct-view');
+  if (btn) btn.classList.toggle('on', pctViewSingle);
+  rebuildChart();
 }
 
 function toggleSubChart(which) {
@@ -320,7 +337,7 @@ function rebuildChart() {
   const ctx   = document.getElementById('chart-canvas').getContext('2d');
 
   document.getElementById('chart-ttl').textContent =
-    compareMode ? '% Return Comparison (normalized)' : 'Equity Curve';
+    compareMode ? '% Return Comparison (normalized)' : (pctViewSingle ? '% Return' : 'Equity Curve');
 
   // Update chart theme colors
   chart.options.plugins.legend.labels.color   = c.t2;
@@ -341,7 +358,7 @@ function rebuildChart() {
     const sb  = s.start_balance || 1;
     const data = filteredHistory(addr).map(p => ({
       x: p.t,
-      y: compareMode ? ((p.equity / sb) - 1) * 100 : p.equity
+      y: usePctView() ? ((p.equity / sb) - 1) * 100 : p.equity
     }));
     return {
       label: s.label || addr.slice(0,8), data, borderColor: col,
@@ -367,8 +384,9 @@ function rebuildChart() {
     const allY = chart.data.datasets.flatMap(d => d.data.map(p => p.y)).filter(Number.isFinite);
     if (allY.length > 0) {
       const lo = Math.min(...allY), hi = Math.max(...allY);
-      // ponytail: 0.4% of account value as floor for single-wallet, 0.5% pts for compare
-      const minRange = compareMode ? 0.5 : (cur && state[cur]?.start_balance ? state[cur].start_balance * 0.004 : 10);
+      // ponytail: 0.5% pts floor in % view (compare or single-wallet %), 0.4% of
+      // account value in $ view for single-wallet
+      const minRange = usePctView() ? 0.5 : (cur && state[cur]?.start_balance ? state[cur].start_balance * 0.004 : 10);
       const range    = Math.max(hi - lo, minRange);
       const mid      = (lo + hi) / 2;
       chart.options.scales.y.suggestedMin = mid - range * 0.6;
@@ -397,7 +415,7 @@ function addEquityPoint(addr, pt) {
 
   const ds = chart.data.datasets.find(d => d.label === state[addr].label);
   const sb = state[addr].start_balance || 1;
-  const y  = compareMode ? ((pt.equity / sb) - 1) * 100 : pt.equity;
+  const y  = usePctView() ? ((pt.equity / sb) - 1) * 100 : pt.equity;
   if (ds) {
     ds.data.push({ x: pt.t, y });
     if (ds.data.length > 5000) ds.data.shift();

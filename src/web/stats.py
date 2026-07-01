@@ -108,7 +108,7 @@ def _risk_stats(equity_rows: list) -> dict:
             return dict(sharpe=None, volatility=None)
         mean_r = statistics.mean(rets)
         std_r  = statistics.stdev(rets) if len(rets) > 1 else 0
-        ann    = (365 * 24 * 120) ** 0.5  # 30-sec periods/year
+        ann    = (365 * 24 * 360) ** 0.5  # 10-sec periods/year (snapshot tick is 10s, see sim.py _periodic_equity_snapshot)
         return dict(
             sharpe     = round(mean_r / std_r * ann, 2) if std_r > 0 else None,
             volatility = round(std_r * ann * 100, 2),

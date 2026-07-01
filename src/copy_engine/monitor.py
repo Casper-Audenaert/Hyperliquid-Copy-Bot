@@ -46,6 +46,7 @@ async def _release_wallet_from_pool(address: str, dexs: list):
         for ws in _ws_pool:
             if f"user:{addr_lower}" in ws.callbacks:
                 await ws.unsubscribe_user_events(address, dexs)
+                await ws.unsubscribe_user_fills(address)
                 # Remove the reconnect handler registered for this address
                 ws.on_reconnect_handlers = [
                     h for h in ws.on_reconnect_handlers
@@ -135,6 +136,12 @@ class WalletMonitor:
         await shared_ws.subscribe_user_events(
             self.target_address, self.client.dexs, self._handle_user_event
         )
+        # userFills backstops _replay_missed_fills: HL resends an isSnapshot=true
+        # fills list on every (re)subscribe (including reconnects), so this arrives
+        # for free without an extra per-DEX REST burst. Routed through the same
+        # _handle_fills() path, so tid-based dedup in sim.py makes any overlap with
+        # the REST replay safe.
+        await shared_ws.subscribe_user_fills(self.target_address, self._handle_user_fills_event)
         # Note: do NOT call await shared_ws.listen() here — it is already running
         # as an asyncio task created above (or by a previous monitor).
 
@@ -185,6 +192,18 @@ class WalletMonitor:
             logger.error(traceback.format_exc())
 
     # ── Fill handling ─────────────────────────────────────────────────────────
+
+    async def _handle_user_fills_event(self, update: WebSocketUpdate):
+        """Handle a userFills WS message (fills-only feed, separate from userEvents).
+        Reuses _handle_fills so address filtering and the on_order_fill dispatch
+        (and its downstream tid dedup) stay in one place."""
+        try:
+            inner = update.data.get("data", {})
+            fills = inner.get("fills", [])
+            if fills:
+                await self._handle_fills(fills)
+        except Exception as e:
+            logger.error(f"Error handling userFills WS event: {e}")
 
     async def _handle_fills(self, fills: List[dict]):
         from config.settings import settings
@@ -246,7 +265,7 @@ class WalletMonitor:
                         if not isinstance(fills, list):
                             continue
                         for f in fills:
-                            if f.get("time", 0) <= self._last_fill_time:
+                            if f.get("time", 0) < self._last_fill_time:
                                 continue
                             tid = f.get("tid")
                             if tid and tid in seen_tids:

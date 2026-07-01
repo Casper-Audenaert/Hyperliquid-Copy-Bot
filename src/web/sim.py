@@ -72,12 +72,16 @@ async def _get_shared_mids(client: HyperliquidClient) -> dict:
     if _mids_cache and (now - _mids_cache_ts) < _MIDS_TTL:
         return _mids_cache
     mids = await client.get_all_mids()
-    # Only cache if the response is non-empty — an empty dict from a failed/429 call
-    # would poison the cache and cause all subsequent calls to return {} for 3s.
+    # Merge (not replace) — get_all_mids() fetches per sub-dex and silently drops a
+    # dex's symbols on a transient per-dex failure. Replacing the whole cache would
+    # wipe out still-valid prices for every symbol on that dex until the next
+    # successful fetch, causing equity to intermittently compute UPNL=0 for held
+    # positions on that dex (visible as a synchronized square-wave chart across
+    # every wallet holding that symbol, since this cache is shared module-wide).
     if mids:
-        _mids_cache    = mids
+        _mids_cache.update(mids)
         _mids_cache_ts = now
-    return mids or {}
+    return _mids_cache or mids or {}
 
 
 @dataclass
@@ -430,9 +434,21 @@ def _equity_from_cache(session: "WalletSession") -> tuple[float, float, float]:
     Called immediately after a position close so the closed leg's UPNL is already
     settled into balance; only remaining open positions contribute upnl here."""
     mids = {sym: float(px) for sym, px in _mids_cache.items() if float(px) > 0}
+    ws: dict = {}
+    if session.monitor and session.monitor.current_state:
+        ws = {p.symbol: p.current_price
+              for p in session.monitor.current_state.positions if p.current_price > 0}
     upnl = 0.0
     for sym, pos in session.simulated_positions.items():
         px = mids.get(sym, 0)
+        if px <= 0:
+            # Mids-cache miss (e.g. a transient per-dex allMids failure) — fall back
+            # to the WS price with the same entry-deviation sanity guard _upnl() uses,
+            # instead of silently treating this position's UPNL as 0.
+            ws_px = ws.get(sym, 0)
+            entry = pos.get("entry_price", 0)
+            if ws_px and entry > 0 and abs(ws_px - entry) / entry <= 0.5:
+                px = ws_px
         if px <= 0:
             continue
         size  = abs(pos["size"])
@@ -716,28 +732,34 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
                 session.losses += 1
 
             new_size = pos_size - close_size
-            if new_size < 1e-8:
-                del session.simulated_positions[symbol]
-                await asyncio.to_thread(db_delete_position, session.address, symbol)
-            else:
-                pos["size"]        = new_size if pos["size"] > 0 else -new_size
-                pos["margin_used"] = pos.get("margin_used", 0) - margin_cr
-                pos["value"]       = new_size * entry
-                await asyncio.to_thread(db_upsert_position, session.address, symbol, pos)
+            try:
+                if new_size < 1e-8:
+                    del session.simulated_positions[symbol]
+                    await asyncio.to_thread(db_delete_position, session.address, symbol)
+                else:
+                    pos["size"]        = new_size if pos["size"] > 0 else -new_size
+                    pos["margin_used"] = pos.get("margin_used", 0) - margin_cr
+                    pos["value"]       = new_size * entry
+                    await asyncio.to_thread(db_upsert_position, session.address, symbol, pos)
 
-            await asyncio.to_thread(
-                db_record_fill, session.address, session.label, fill_id, symbol,
-                direction, position_side.value, close_size, price, our_leverage, fill_fee,
-                False, _is_debounced, _target_px, _copy_delay_ms,
-            )
-            await asyncio.to_thread(db_record_close, session.address, symbol, pnl)
+                await asyncio.to_thread(
+                    db_record_fill, session.address, session.label, fill_id, symbol,
+                    direction, position_side.value, close_size, price, our_leverage, fill_fee,
+                    False, _is_debounced, _target_px, _copy_delay_ms,
+                )
+                await asyncio.to_thread(db_record_close, session.address, symbol, pnl)
+            except Exception as e:
+                # In-memory state (balance/position) is already the source of truth for
+                # the live UI and is already mutated above; a DB write failure here means
+                # the on-disk record is out of sync, not that the fill was lost.
+                logger.error(f"[{session.label}] DB write failed for close fill {fill_id}: {e}")
             session._processed_fill_ids[fill_id] = None
             _evict_fill_ids(session)
             session.trades_copied_count += 1
             if pnl < 0:
                 _record_loss(session, abs(pnl))  # track daily loss for stats only — no auto-pause
-            _eq, _bal, _upnl = _equity_from_cache(session)
-            await asyncio.to_thread(db_snapshot_equity, session.address, _eq, _bal, _upnl, session.total_funding_paid)
+            _eq, _bal, _snap_upnl = _equity_from_cache(session)
+            await asyncio.to_thread(db_snapshot_equity, session.address, _eq, _bal, _snap_upnl, session.total_funding_paid)
             session._last_fill_snap_ts = time.monotonic()
 
         elif is_closing and not is_flip:
@@ -768,8 +790,8 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
                     del session.simulated_positions[symbol]
                     await asyncio.to_thread(db_record_close, session.address, symbol, opnl)
                     pnl_realized = opnl
-                    _eq, _bal, _upnl = _equity_from_cache(session)
-                    await asyncio.to_thread(db_snapshot_equity, session.address, _eq, _bal, _upnl, session.total_funding_paid)
+                    _eq, _bal, _snap_upnl = _equity_from_cache(session)
+                    await asyncio.to_thread(db_snapshot_equity, session.address, _eq, _bal, _snap_upnl, session.total_funding_paid)
                     session._last_fill_snap_ts = time.monotonic()
 
             position_value = our_size * price
@@ -813,12 +835,17 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             pos["leverage"]    = our_leverage
             session.simulated_balance -= margin_req
 
-            await asyncio.to_thread(db_upsert_position, session.address, symbol, pos)
-            await asyncio.to_thread(
-                db_record_fill, session.address, session.label, fill_id, symbol,
-                direction, position_side.value, our_size, price, our_leverage, fill_fee,
-                False, _is_debounced, _target_px, _copy_delay_ms,
-            )
+            try:
+                await asyncio.to_thread(db_upsert_position, session.address, symbol, pos)
+                await asyncio.to_thread(
+                    db_record_fill, session.address, session.label, fill_id, symbol,
+                    direction, position_side.value, our_size, price, our_leverage, fill_fee,
+                    False, _is_debounced, _target_px, _copy_delay_ms,
+                )
+            except Exception as e:
+                # Same reasoning as the close-fill path: in-memory position/balance is
+                # already correct; only the on-disk record may be out of sync.
+                logger.error(f"[{session.label}] DB write failed for open fill {fill_id}: {e}")
             session._processed_fill_ids[fill_id] = None
             _evict_fill_ids(session)
             session.trades_copied_count += 1
@@ -951,8 +978,8 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
             del session.simulated_positions[symbol]
             await asyncio.to_thread(db_delete_position, session.address, symbol)
             await asyncio.to_thread(db_record_close, session.address, symbol, pnl)
-            _eq, _bal, _upnl = _equity_from_cache(session)
-            await asyncio.to_thread(db_snapshot_equity, session.address, _eq, _bal, _upnl, session.total_funding_paid)
+            _eq, _bal, _snap_upnl = _equity_from_cache(session)
+            await asyncio.to_thread(db_snapshot_equity, session.address, _eq, _bal, _snap_upnl, session.total_funding_paid)
             session._last_fill_snap_ts = time.monotonic()
 
             if pnl < 0:
@@ -1200,7 +1227,7 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
             total_margin = sum(p.get("margin_used", 0) for p in session.simulated_positions.values())
 
             # HL `funding` field = current predicted 1-hour rate (not 8h).
-            # Pro-rate to this 30s tick: 1h = 3600s → 120 ticks of 30s each.
+            # Pro-rate to this 10s tick: 1h = 3600s → 360 ticks of 10s each.
             _funding_breakdown: list = []  # per-symbol charges this tick, for feed visibility
             try:
                 funding_map = await _get_shared_funding_rates(session.client)

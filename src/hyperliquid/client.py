@@ -210,7 +210,8 @@ class HyperliquidClient:
                                     for sym, px in data.items():
                                         if sym not in all_mids:
                                             all_mids[sym] = float(px)
-                    except Exception:
+                    except Exception as e:
+                        logger.warning(f"allMids fetch failed for dex={dex!r}: {e}")
                         continue
         except Exception as e:
             logger.error(f"Failed to get all mids: {e}")
