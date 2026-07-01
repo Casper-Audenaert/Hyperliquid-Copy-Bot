@@ -115,15 +115,19 @@ function sparklineSvg(addr) {
   const h = (state[addr]?._history || []).slice(-60);
   if (h.length < 2) return '<svg width="80" height="20"></svg>';
   const vals = h.map(p => p.equity);
-  const min = Math.min(...vals), max = Math.max(...vals), range = max - min || 1;
+  const sb       = state[addr]?.start_balance || vals[0] || 1;
+  const lo = Math.min(...vals), hi = Math.max(...vals);
+  // ponytail: same 0.4% floor as main chart so noise doesn't fill the frame
+  const range    = Math.max(hi - lo, sb * 0.004);
+  const mid      = (lo + hi) / 2;
+  const min = mid - range / 2, max = mid + range / 2;
   const W = 80, H = 20;
   const pts = vals.map((v, i) => {
     const x = (i / (vals.length - 1)) * W;
     const y = H - ((v - min) / range) * H * 0.85 - H * 0.075;
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   }).join(' ');
-  const ret = state[addr]?.return_pct || 0;
-  const col = ret >= 0 ? 'var(--green)' : 'var(--red)';
+  const col = vals[vals.length - 1] >= sb ? 'var(--green)' : 'var(--red)';
   return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" class="sparkline" preserveAspectRatio="none">
     <polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
   </svg>`;
