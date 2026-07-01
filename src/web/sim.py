@@ -424,6 +424,23 @@ async def _fetch_target_fills(session: WalletSession, limit: int = 50) -> list:
 
 # ── Core fill processor ───────────────────────────────────────────────────────
 
+def _equity_from_cache(session: "WalletSession") -> tuple[float, float, float]:
+    """Return (equity, balance, upnl) using module-level _mids_cache — no REST call.
+    Called immediately after a position close so the closed leg's UPNL is already
+    settled into balance; only remaining open positions contribute upnl here."""
+    mids = {sym: float(px) for sym, px in _mids_cache.items() if float(px) > 0}
+    upnl = 0.0
+    for sym, pos in session.simulated_positions.items():
+        px = mids.get(sym, 0)
+        if px <= 0:
+            continue
+        size  = abs(pos["size"])
+        entry = pos.get("entry_price", 0)
+        upnl += size * (px - entry) if pos.get("side", "").upper() == "LONG" else size * (entry - px)
+    margin = sum(p.get("margin_used", 0) for p in session.simulated_positions.values())
+    return session.simulated_balance + margin + upnl, session.simulated_balance, upnl
+
+
 async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_fn: Callable) -> None:
     """Process a confirmed fill: size, fee, slippage, guards, position update, DB, emit."""
     symbol      = fill_data.get("coin", "")
@@ -711,6 +728,8 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             session.trades_copied_count += 1
             if pnl < 0:
                 _record_loss(session, abs(pnl))  # track daily loss for stats only — no auto-pause
+            _eq, _bal, _upnl = _equity_from_cache(session)
+            await asyncio.to_thread(db_snapshot_equity, session.address, _eq, _bal, _upnl, session.total_funding_paid)
 
         elif is_closing and not is_flip:
             # Position was already force-closed by the liquidation check above —
@@ -740,6 +759,8 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
                     del session.simulated_positions[symbol]
                     await asyncio.to_thread(db_record_close, session.address, symbol, opnl)
                     pnl_realized = opnl
+                    _eq, _bal, _upnl = _equity_from_cache(session)
+                    await asyncio.to_thread(db_snapshot_equity, session.address, _eq, _bal, _upnl, session.total_funding_paid)
 
             position_value = our_size * price
             margin_req     = position_value / max(our_leverage, 1)
@@ -920,6 +941,8 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
             del session.simulated_positions[symbol]
             await asyncio.to_thread(db_delete_position, session.address, symbol)
             await asyncio.to_thread(db_record_close, session.address, symbol, pnl)
+            _eq, _bal, _upnl = _equity_from_cache(session)
+            await asyncio.to_thread(db_snapshot_equity, session.address, _eq, _bal, _upnl, session.total_funding_paid)
 
             if pnl < 0:
                 _record_loss(session, abs(pnl))  # track daily loss for stats only — no auto-pause
@@ -1111,7 +1134,7 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
             # regular time grid — wallets are already staggered via start_session's
             # offset_secs, and _funding_cache/_mids_cache dedupe REST calls by TTL
             # regardless of tick alignment, so jitter wasn't load-bearing here.
-            await asyncio.sleep(30)
+            await asyncio.sleep(10)
             if session.address not in _sessions:
                 logger.debug(f"[{session.label}] Snapshot task exiting — wallet removed")
                 return
