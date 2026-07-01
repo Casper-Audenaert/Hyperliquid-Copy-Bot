@@ -428,7 +428,8 @@ def compute_stats(wallet_addr: str, open_positions: dict = None, copy_ratio: flo
     total_fees         = round(sum(_eff_fee(t) for t in trades), 2)  # all trades incl. seeds
     total_volume       = round(sum(t.notional or 0 for t in live_trades), 2)  # copied fills only
     gross_pnl          = round(sum(closed_pnls), 2)
-    net_pnl            = round(gross_pnl - total_fees, 2)
+    total_funding      = round(equity_rows[-1].total_funding_paid if equity_rows else 0.0, 4)
+    net_pnl            = round(gross_pnl - total_fees - total_funding, 2)
     close_fills        = [t for t in live_trades if t.realized_pnl is not None]
     avg_fee_per_fill      = round(total_fees / len(trades), 4) if trades else 0.0
     avg_fee_per_roundtrip = round(total_fees / len(close_fills), 4) if close_fills else 0.0
@@ -552,6 +553,7 @@ def compute_stats(wallet_addr: str, open_positions: dict = None, copy_ratio: flo
         "score":              score,
         # Fee stats
         "total_fees":             total_fees,
+        "total_funding_paid":     total_funding,
         "gross_realized_pnl":     gross_pnl,
         "net_realized_pnl":       net_pnl,
         "avg_fee_per_fill":       avg_fee_per_fill,

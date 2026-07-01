@@ -658,11 +658,11 @@ function prependFill(f) {
     : `<span class="dim">—</span>`;
 
   const tr = document.createElement('tr');
-  tr.className = 'fnew';
+  tr.className = 'fnew' + (f.is_seed ? ' seed-fill' : '');
   tr.innerHTML = `
     <td class="mono dim">${fTime(f.timestamp||new Date().toISOString())}</td>
     <td><span class="sym-b">${f.symbol||'—'}</span></td>
-    <td><span class="dc ${dirCls(dir)}">${dir||f.side||'—'}</span></td>
+    <td><span class="dc ${dirCls(dir)}">${dir||f.side||'—'}${f.is_seed ? '<span class="seed-badge">seed</span>' : ''}</span></td>
     <td class="mono">${fNum(f.size)}</td>
     <td class="mono">$${fPx(f.price)}</td>
     <td class="mono">${feeH}</td>
@@ -869,7 +869,7 @@ function renderStats(st) {
       <div class="stat-section-title">Fees (HL Taker)</div>
       <div class="stat-grid">
         <div class="stat-row"><span class="stat-lbl">Taker Fees Paid</span>${sv(fUsd(st.total_fees),'var(--red)')}</div>
-        ${(()=>{const fp=state[activeWallet||Object.keys(state)[0]]?.total_funding_paid??0;return fp!==0?`<div class="stat-row"><span class="stat-lbl">Funding ${fp>0?'Paid':'Earned'}</span>${sv(fUsd(Math.abs(fp)),fp>0?'var(--red)':'var(--green)')}</div>`:'';})()}
+        ${(()=>{const fp=st.total_funding_paid??0;return fp!==0?`<div class="stat-row"><span class="stat-lbl">Funding ${fp>0?'Paid':'Earned'}</span>${sv(fUsd(Math.abs(fp)),fp>0?'var(--red)':'var(--green)')}</div>`:'';})()}
         <div class="stat-row"><span class="stat-lbl">Gross PnL</span>${sv(fUsd(st.gross_realized_pnl), pnlC(st.gross_realized_pnl))}</div>
         <div class="stat-row"><span class="stat-lbl">Net PnL (fees+funding)</span>${sv(fUsd(st.net_realized_pnl), pnlC(st.net_realized_pnl))}</div>
         <div class="stat-row" title="Fee per individual fill (open or close)"><span class="stat-lbl">Avg Fee / Fill</span>${sv(fUsd(st.avg_fee_per_fill),'var(--red)')}</div>
@@ -879,7 +879,7 @@ function renderStats(st) {
         ${st.fee_drag_pct!=null?`<div class="stat-row"><span class="stat-lbl">Fee Drag</span>${sv(st.fee_drag_pct+'% of gross profit','var(--red)')}</div>`:''}
         <div class="stat-row" title="Minimum fill notional needed so the expected price move covers the fee"><span class="stat-lbl">Break-even Size</span>${sv(st.breakeven_notional!=null?fUsd(st.breakeven_notional)+' notional':'—','var(--t2)')}</div>
       </div>
-      <div style="font-size:10px;color:var(--t3);margin-top:4px">* Funding pro-rated every 30s from live HL rates. Slippage model: 3 bps/side on every fill. Execution latency: 150 ms drift on opens (all-fills mode).</div>
+      <div style="font-size:10px;color:var(--t3);margin-top:4px">* Funding pro-rated every 10s from live HL rates. Slippage model: 3 bps/side on every fill. Execution latency: 150 ms drift on opens (all-fills mode).</div>
     </div>
 
     ${symbolStats.length ? `

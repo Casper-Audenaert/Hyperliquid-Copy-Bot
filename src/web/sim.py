@@ -103,6 +103,7 @@ class WalletSession:
     _style_last_checked: float = 0.0                       # monotonic time of last _detect_trading_style call
     _fill_timestamps: list = field(default_factory=list)   # monotonic times of recent live fills, for fast burst detection
     _last_equity_tick_ts: float = 0.0                      # monotonic time of last equity_tick emit from fills
+    _last_fill_snap_ts: float = 0.0                        # monotonic time of last fill-triggered equity snapshot
     median_hold_secs: float = 60.0                         # median position hold time (seconds) for this target
     simulated_pnl: float = 0.0        # cumulative realized PnL (gross, pre-fee)
     total_fees_paid: float = 0.0      # cumulative taker fees deducted from balance
@@ -444,6 +445,13 @@ def _equity_from_cache(session: "WalletSession") -> tuple[float, float, float]:
 async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_fn: Callable) -> None:
     """Process a confirmed fill: size, fee, slippage, guards, position update, DB, emit."""
     symbol      = fill_data.get("coin", "")
+    if ":" in symbol:
+        # Skip external-builder markets (pre-IPO stocks, tokenised assets, etc.)
+        # Coin names like "XYZ:SNDK" are routed via HL external builders, not perp fills.
+        logger.debug(f"[{session.label}] External-market fill skipped ({symbol})")
+        session._processed_fill_ids[fill_id] = None
+        _evict_fill_ids(session)
+        return
     side_str    = fill_data.get("side", "")
     target_size = abs(float(fill_data.get("sz", 0)))
     price       = float(fill_data.get("px", 0))
@@ -730,6 +738,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
                 _record_loss(session, abs(pnl))  # track daily loss for stats only — no auto-pause
             _eq, _bal, _upnl = _equity_from_cache(session)
             await asyncio.to_thread(db_snapshot_equity, session.address, _eq, _bal, _upnl, session.total_funding_paid)
+            session._last_fill_snap_ts = time.monotonic()
 
         elif is_closing and not is_flip:
             # Position was already force-closed by the liquidation check above —
@@ -761,6 +770,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
                     pnl_realized = opnl
                     _eq, _bal, _upnl = _equity_from_cache(session)
                     await asyncio.to_thread(db_snapshot_equity, session.address, _eq, _bal, _upnl, session.total_funding_paid)
+                    session._last_fill_snap_ts = time.monotonic()
 
             position_value = our_size * price
             margin_req     = position_value / max(our_leverage, 1)
@@ -943,6 +953,7 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
             await asyncio.to_thread(db_record_close, session.address, symbol, pnl)
             _eq, _bal, _upnl = _equity_from_cache(session)
             await asyncio.to_thread(db_snapshot_equity, session.address, _eq, _bal, _upnl, session.total_funding_paid)
+            session._last_fill_snap_ts = time.monotonic()
 
             if pnl < 0:
                 _record_loss(session, abs(pnl))  # track daily loss for stats only — no auto-pause
@@ -1202,7 +1213,7 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
                         if px <= 0:
                             continue
                         pos_value = abs(pos["size"]) * px
-                        charge    = pos_value * rate / 120  # 1h rate ÷ 120 thirty-second ticks
+                        charge    = pos_value * rate / 360  # 1h rate ÷ 360 ten-second ticks
                         is_long   = pos.get("side", "").upper() == "LONG"
                         if is_long:
                             session.simulated_balance   -= charge
@@ -1298,7 +1309,10 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
             _prev_snap = session.equity_history[-1]["equity"] if session.equity_history else equity
             _snap_ref  = max(abs(_prev_snap), 1.0)
             _snap_ok   = abs(equity - _prev_snap) / _snap_ref <= 0.10
-            if _snap_ok:
+            # Skip DB write if a fill-triggered snapshot was written recently —
+            # prevents stale-cache vs fresh-REST price disagreement spikes on the chart.
+            _since_fill_snap = time.monotonic() - session._last_fill_snap_ts
+            if _snap_ok and _since_fill_snap >= 7.0:
                 await asyncio.to_thread(db_snapshot_equity, session.address, equity, session.simulated_balance,
                                         total_upnl, session.total_funding_paid)
             session.equity_history.append({
