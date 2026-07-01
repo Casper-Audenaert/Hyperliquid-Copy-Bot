@@ -331,17 +331,6 @@ function rebuildChart() {
   chart.options.scales.y.grid.color           = c.hr + '88';
   chart.options.scales.y.border.color         = c.hr;
 
-  // Soft Y-axis bounds: always show at least ±2% of start balance so that
-  // tiny UPNL noise doesn't fill the full chart height and look like huge moves.
-  if (!compareMode && cur && state[cur]?.start_balance) {
-    const sb = state[cur].start_balance;
-    chart.options.scales.y.suggestedMin = sb * 0.98;
-    chart.options.scales.y.suggestedMax = sb * 1.02;
-  } else {
-    delete chart.options.scales.y.suggestedMin;
-    delete chart.options.scales.y.suggestedMax;
-  }
-
   chart.data.datasets = addrs.filter(a => state[a]).map(addr => {
     const s   = state[addr];
     const col = clr(addr);
@@ -367,6 +356,25 @@ function rebuildChart() {
       data: combined.map(p => ({ x: p.t, y: ((p.equity / sb) - 1) * 100 })),
     });
   }
+
+  // Dynamic Y-axis: compute actual data range AFTER datasets are built,
+  // then enforce a minimum floor so the chart never collapses to noise.
+  {
+    const allY = chart.data.datasets.flatMap(d => d.data.map(p => p.y)).filter(Number.isFinite);
+    if (allY.length > 0) {
+      const lo = Math.min(...allY), hi = Math.max(...allY);
+      // ponytail: 0.4% of account value as floor for single-wallet, 0.5% pts for compare
+      const minRange = compareMode ? 0.5 : (cur && state[cur]?.start_balance ? state[cur].start_balance * 0.004 : 10);
+      const range    = Math.max(hi - lo, minRange);
+      const mid      = (lo + hi) / 2;
+      chart.options.scales.y.suggestedMin = mid - range * 0.6;
+      chart.options.scales.y.suggestedMax = mid + range * 0.6;
+    } else {
+      delete chart.options.scales.y.suggestedMin;
+      delete chart.options.scales.y.suggestedMax;
+    }
+  }
+
   chart.update('none');
 }
 
