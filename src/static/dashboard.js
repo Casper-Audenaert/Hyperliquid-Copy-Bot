@@ -331,6 +331,17 @@ function rebuildChart() {
   chart.options.scales.y.grid.color           = c.hr + '88';
   chart.options.scales.y.border.color         = c.hr;
 
+  // Soft Y-axis bounds: always show at least ±2% of start balance so that
+  // tiny UPNL noise doesn't fill the full chart height and look like huge moves.
+  if (!compareMode && cur && state[cur]?.start_balance) {
+    const sb = state[cur].start_balance;
+    chart.options.scales.y.suggestedMin = sb * 0.98;
+    chart.options.scales.y.suggestedMax = sb * 1.02;
+  } else {
+    delete chart.options.scales.y.suggestedMin;
+    delete chart.options.scales.y.suggestedMax;
+  }
+
   chart.data.datasets = addrs.filter(a => state[a]).map(addr => {
     const s   = state[addr];
     const col = clr(addr);
