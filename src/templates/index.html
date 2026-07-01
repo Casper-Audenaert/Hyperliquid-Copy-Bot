@@ -30,6 +30,11 @@
   --r:8px; --r2:12px;
   --font:'Space Grotesk',-apple-system,BlinkMacSystemFont,sans-serif;
   --mono:'JetBrains Mono','Cascadia Code',monospace;
+
+  --ease: cubic-bezier(.4,0,.2,1);      /* standard ease-out — quick accel, gentle settle */
+  --ease-in: cubic-bezier(.4,0,1,1);    /* for elements leaving/collapsing */
+  --dur-fast: 150ms;
+  --dur-med: 220ms;
 }
 
 /* ── Light theme ── */
@@ -84,7 +89,7 @@ header{
   display:inline-flex;align-items:center;gap:5px;padding:5px 12px;
   border-radius:7px;border:1px solid var(--hr);background:var(--s2);
   color:var(--t2);cursor:pointer;font-size:12px;font-weight:500;
-  font-family:var(--font);transition:all .14s;white-space:nowrap
+  font-family:var(--font);transition:all var(--dur-fast) var(--ease);white-space:nowrap
 }
 .btn:hover{border-color:rgba(255,255,255,.15);color:var(--t1)}
 .btn-brand{border-color:var(--brand-b);color:var(--brand);background:var(--brand-a)}
@@ -94,7 +99,7 @@ header{
 .theme-btn{
   width:30px;height:30px;border-radius:8px;border:1px solid var(--hr);
   background:var(--s2);color:var(--t2);cursor:pointer;font-size:14px;
-  display:grid;place-items:center;transition:all .14s;flex-shrink:0
+  display:grid;place-items:center;transition:all var(--dur-fast) var(--ease);flex-shrink:0
 }
 .theme-btn:hover{color:var(--t1)}
 
@@ -113,7 +118,7 @@ header{
 .cmp-btn{
   display:flex;align-items:center;justify-content:space-between;
   padding:8px 10px;border-radius:var(--r);border:1px solid var(--hr);
-  background:var(--s2);cursor:pointer;font-size:12px;font-weight:500;color:var(--t2);transition:all .14s
+  background:var(--s2);cursor:pointer;font-size:12px;font-weight:500;color:var(--t2);transition:all var(--dur-fast) var(--ease)
 }
 .cmp-btn:hover{color:var(--t1);border-color:rgba(255,255,255,.13)}
 .cmp-btn.on{border-color:var(--brand-b);background:var(--brand-a);color:var(--brand)}
@@ -121,7 +126,7 @@ header{
 /* Wallet cards */
 .wcard{
   border:1px solid var(--hr);border-radius:var(--r);background:var(--s2);
-  cursor:pointer;transition:border-color .14s;position:relative;
+  cursor:pointer;transition:border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease), opacity var(--dur-med) var(--ease);position:relative;
 }
 .wcard:hover{border-color:rgba(255,255,255,.15)}
 .wcard.sel{border-color:var(--brand-b);background:var(--brand-a)}
@@ -131,20 +136,20 @@ header{
 .wc-dot{width:6px;height:6px;border-radius:50%;background:var(--green);flex-shrink:0}
 .wc-dot.paused{background:var(--warn)}
 .wc-name{font-weight:600;font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.wc-actions{display:flex;gap:3px;opacity:0;transition:opacity .14s;flex-shrink:0}
+.wc-actions{display:flex;gap:3px;opacity:0;transition:opacity var(--dur-fast) var(--ease);flex-shrink:0}
 .wcard:hover .wc-actions{opacity:1}
 .wc-act-btn{
   width:20px;height:20px;border-radius:4px;border:1px solid var(--hr);
   background:var(--s3);color:var(--t2);cursor:pointer;font-size:10px;
-  display:grid;place-items:center;transition:all .14s
+  display:grid;place-items:center;transition:all var(--dur-fast) var(--ease)
 }
 .wc-act-btn.del:hover{color:var(--red);border-color:var(--red-b);background:var(--red-a)}
 .wc-act-btn.rst:hover{color:var(--brand);border-color:var(--brand-b);background:var(--brand-a)}
 
 .wc-addr{font-size:9px;font-family:var(--mono);color:var(--t3);cursor:pointer;
-  display:flex;align-items:center;gap:3px;margin-bottom:5px;transition:color .12s}
+  display:flex;align-items:center;gap:3px;margin-bottom:5px;transition:color var(--dur-fast) var(--ease)}
 .wc-addr:hover{color:var(--brand)}
-.copy-icon{opacity:0;transition:opacity .12s}
+.copy-icon{opacity:0;transition:opacity var(--dur-fast) var(--ease)}
 .wc-addr:hover .copy-icon{opacity:1}
 .copy-flash{color:var(--green) !important}
 
@@ -160,7 +165,7 @@ header{
 .add-btn{
   display:flex;align-items:center;justify-content:center;gap:6px;
   padding:8px;border-radius:var(--r);border:1px dashed var(--hr);
-  color:var(--t3);cursor:pointer;font-size:12px;font-weight:500;transition:all .14s
+  color:var(--t3);cursor:pointer;font-size:12px;font-weight:500;transition:all var(--dur-fast) var(--ease)
 }
 .add-btn:hover{border-color:var(--brand-b);color:var(--brand);background:var(--brand-a)}
 
@@ -174,7 +179,7 @@ header{
 }
 .kpi{padding:11px 16px;border-right:1px solid var(--hr);position:relative;overflow:hidden}
 .kpi:last-child{border-right:none}
-.kpi::after{content:'';position:absolute;inset:0;background:transparent;transition:background .6s;pointer-events:none}
+.kpi::after{content:'';position:absolute;inset:0;background:transparent;transition:background .6s var(--ease);pointer-events:none}
 .kpi.flash-g::after{background:var(--green-a)}.kpi.flash-r::after{background:var(--red-a)}
 .kpi-lbl{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--t3);margin-bottom:5px}
 .kpi-val{font-size:19px;font-weight:700;font-family:var(--mono);letter-spacing:-.5px;line-height:1}
@@ -203,6 +208,8 @@ header{
   background:var(--s1);border:1px solid var(--hr);border-radius:var(--r2);
   display:flex;flex-direction:column;overflow:hidden;min-height:0
 }
+@keyframes panelIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+.panel.boot-in{animation:panelIn var(--dur-med) var(--ease) both}
 .phdr{
   display:flex;align-items:center;justify-content:space-between;
   padding:10px 14px;border-bottom:1px solid var(--hr);flex-shrink:0
@@ -218,8 +225,9 @@ header{
   flex:1;min-height:0;padding:12px 14px;position:relative;
   /* Chart.js reads this for responsive sizing */
 }
+.chart-wrap canvas{transition:opacity var(--dur-fast) var(--ease)}
 .range-row{display:flex;gap:2px;background:var(--s2);border:1px solid var(--hr);padding:3px;border-radius:7px}
-.rp{padding:3px 9px;border-radius:5px;font-size:10px;font-weight:700;cursor:pointer;color:var(--t3);transition:all .12s;font-family:var(--mono)}
+.rp{padding:3px 9px;border-radius:5px;font-size:10px;font-weight:700;cursor:pointer;color:var(--t3);transition:all var(--dur-fast) var(--ease);font-family:var(--mono)}
 .rp:hover{color:var(--t2)}.rp.on{background:var(--s3);color:var(--t1)}
 
 /* ── Stats panel (right column, scrollable) ── */
@@ -237,6 +245,15 @@ header{
 .stat-lbl{font-size:12px;color:var(--t2);flex-shrink:0}
 .stat-val{font-size:13px;font-weight:600;font-family:var(--mono);text-align:right}
 .stat-val.g{color:var(--green)}.stat-val.r{color:var(--red)}.stat-val.dim{color:var(--t2)}
+
+.stat-subgroup{margin-bottom:12px}
+.stat-subgroup:last-child{margin-bottom:0}
+.stat-subgroup + .stat-subgroup{border-top:1px solid var(--hr);padding-top:10px}
+.stat-subgroup-hdr{
+  font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.9px;
+  color:var(--t3);margin-bottom:6px
+}
+.stat-lbl.has-tip{border-bottom:1px dotted var(--t3);cursor:help}
 
 .pnl-chart-section{padding:12px 14px;flex-shrink:0;border-top:1px solid var(--hr)}
 .pnl-chart-wrap{height:120px;position:relative;margin-top:8px}
@@ -258,6 +275,7 @@ header{
 }
 .pc:last-child{margin-bottom:0}
 .pc.long{border-left-color:var(--green)}.pc.short{border-left-color:var(--red)}
+.pc.fnew{animation:fslide var(--dur-med) var(--ease)}
 .pc-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px}
 .pc-sym{font-size:14px;font-weight:700;letter-spacing:-.3px}
 .pc-tags{display:flex;gap:5px;align-items:center}
@@ -315,7 +333,7 @@ header{
 .cmp-tab{
   padding:4px 10px;border-radius:5px;font-size:10px;font-weight:700;cursor:pointer;
   color:var(--t3);border:1px solid var(--hr);background:var(--s2);
-  font-family:var(--font);transition:all .12s
+  font-family:var(--font);transition:all var(--dur-fast) var(--ease)
 }
 .cmp-tab:hover{color:var(--t2)}
 .cmp-tab.on{background:var(--brand-a);color:var(--brand);border-color:var(--brand-b)}
@@ -457,7 +475,7 @@ header{
 .stats-chip{
   padding:3px 10px;border-radius:20px;font-size:10px;font-weight:600;cursor:pointer;
   border:1px solid var(--hr);background:var(--s2);color:var(--t3);
-  transition:all .12s;font-family:var(--font)
+  transition:all var(--dur-fast) var(--ease);font-family:var(--font)
 }
 .stats-chip.on{background:var(--brand-a);border-color:var(--brand-b);color:var(--brand)}
 .stats-chip:hover:not(.on){color:var(--t1);border-color:rgba(255,255,255,.14)}

@@ -238,7 +238,7 @@ function toggleChartValueMode() {
   localStorage.setItem('hl-chart-pct-view', pctViewSingle ? '1' : '0');
   const btn = document.getElementById('btn-pct-view');
   if (btn) btn.classList.toggle('on', pctViewSingle);
-  rebuildChart();
+  softSwap(document.getElementById('chart-canvas'), rebuildChart);
 }
 
 function toggleSubChart(which) {
@@ -468,7 +468,7 @@ function renderSidebar() {
     const styleBadge = style === 'HFT'
       ? `<span class="style-pill hft" title="High-frequency target — copies use ${s.debounce_secs ?? 30}s debounce (median hold ${s.median_hold_secs ?? '?'}s)">HFT</span>`
       : `<span class="style-pill swing" title="Swing/long-term target — all fills copied immediately">Swing</span>`;
-    return `<div class="wcard${cardCls}" onclick="${clickFn}">
+    return `<div class="wcard${cardCls}" data-addr="${addr}" onclick="${clickFn}">
   <div class="wcard-inner">
     <div class="wc-header">
       <span class="wc-rank">#${rank+1}</span>
@@ -498,6 +498,13 @@ function renderSidebar() {
 
 function selectWallet(addr) {
   closeSidebar();
+  // Pre-toggle the .sel class on the existing DOM node before the full
+  // renderSidebar() re-render below — gives the browser one real frame to
+  // animate the border/background transition from; the re-render then just
+  // "snaps" to the same already-reached end state (no visible double-animation).
+  document.querySelectorAll('.wcard.sel').forEach(el => el.classList.remove('sel'));
+  const _card = document.querySelector(`.wcard[data-addr="${addr}"]`);
+  if (_card) _card.classList.add('sel');
   compareMode  = false;
   activeWallet = addr;
   document.getElementById('cmp-btn').classList.remove('on');
@@ -520,13 +527,20 @@ function toggleCompareWallet(addr) {
   } else {
     compareSelection.add(addr);
   }
+  // Same pre-toggle trick as selectWallet() so the fade actually has a frame to play.
+  const _card = document.querySelector(`.wcard[data-addr="${addr}"]`);
+  if (_card) {
+    const _in = compareSelection.has(addr);
+    _card.classList.toggle('cmp-on', _in);
+    _card.classList.toggle('cmp-off', !_in);
+  }
   renderSidebar(); renderKpis(); rebuildChart(); renderComparePanel();
 }
 
 function toggleCombined() {
   showCombined = !showCombined;
   document.getElementById('combined-btn').classList.toggle('on', showCombined);
-  rebuildChart();
+  softSwap(document.getElementById('chart-canvas'), rebuildChart);
 }
 
 function toggleCompare() {
@@ -631,23 +645,41 @@ function setKpi(id, val, sub, num) {
   }
 }
 
+// Brief opacity dip around a content swap (chart rebuild, tab switch) instead
+// of a hard cut — subtle "content changed" cue without a showy fade.
+function softSwap(el, renderFn) {
+  if (!el) { renderFn(); return; }
+  el.style.transition = 'opacity var(--dur-fast) var(--ease)';
+  el.style.opacity = '0.4';
+  requestAnimationFrame(() => setTimeout(() => {
+    renderFn();
+    el.style.opacity = '1';
+  }, 90));
+}
+
 // ── Positions ──────────────────────────────────────────────────────────────
+let _knownPositionKeys = new Set(); // symbol+side(+wallet) keys seen last render — new ones get a slide-in
+
 function renderPositions() {
   const cur  = curWallet();
   const sess = compareMode ? Object.values(state) : (state[cur] ? [state[cur]] : []);
   const all  = sess.flatMap(s=>(s.positions||[]).map(p=>({...p,_lbl:s.label})));
   document.getElementById('pos-cnt').textContent = all.length;
   const wrap = document.getElementById('pos-list');
-  if (!all.length) { wrap.innerHTML='<div class="no-pos">No open positions</div>'; return; }
+  if (!all.length) { wrap.innerHTML='<div class="no-pos">No open positions</div>'; _knownPositionKeys = new Set(); return; }
 
+  const _nextKeys = new Set();
   wrap.innerHTML = all.map(p => {
     const side   = (p.side||'LONG').toLowerCase();
+    const key    = `${p._lbl}:${p.symbol}:${side}`;
+    _nextKeys.add(key);
+    const isNew  = !_knownPositionKeys.has(key);
     const upnl   = p.upnl ?? 0;
     const pct    = p.pnl_pct ?? 0;
     const pnlCls = upnl>0?'pnl-g':upnl<0?'pnl-r':'pnl-n';
     const mark   = p.current_price || p.entry_price;
     const wlbl   = compareMode ? `<div class="wallet-badge">${p._lbl}</div>` : '';
-    return `<div class="pc ${side}">
+    return `<div class="pc ${side}${isNew?' fnew':''}">
   ${wlbl}
   <div class="pc-top">
     <span class="pc-sym">${p.symbol}</span>
@@ -671,6 +703,7 @@ function renderPositions() {
   </div>
 </div>`;
   }).join('');
+  _knownPositionKeys = _nextKeys;
 }
 
 // ── Trade feed ─────────────────────────────────────────────────────────────
@@ -912,32 +945,49 @@ function renderStats(st) {
 
     <div class="stat-section">
       <div class="stat-section-title">Accounting</div>
-      <div class="stat-grid">
-        ${(()=>{
-          const _s = state[addr];
-          const _bal = _s?.balance??0, _margin = _s?.total_margin??0, _upnl = _s?.upnl??0, _eq = _s?.equity??0;
-          return `
-            <div class="stat-row formula-row"><span class="stat-lbl">Free Cash</span>${sv(fUsd(_bal),'var(--t2)')}</div>
-            <div class="stat-row formula-row"><span class="stat-lbl">+ Margin Used</span>${sv(fUsd(_margin),'var(--t2)')}</div>
-            <div class="stat-row formula-row"><span class="stat-lbl">+ Unrealized PnL</span>${sv(fUsd(_upnl),pnlC(_upnl))}</div>
-            <div class="stat-row formula-total"><span class="stat-lbl">= Equity</span>${sv(fUsd(_eq),'var(--t1)')}</div>`;
-        })()}
-        ${(()=>{
-          const fp = st.total_funding_paid??0;
-          return `
-            <div class="stat-row formula-row" style="margin-top:8px"><span class="stat-lbl">Gross PnL</span>${sv(fUsd(st.gross_realized_pnl),pnlC(st.gross_realized_pnl))}</div>
-            <div class="stat-row formula-row"><span class="stat-lbl">− Taker Fees</span>${sv(fUsd(st.total_fees),'var(--red)')}</div>
-            ${fp!==0?`<div class="stat-row formula-row"><span class="stat-lbl">− Funding ${fp>0?'Paid':'Earned'}</span>${sv(fUsd(Math.abs(fp)),fp>0?'var(--red)':'var(--green)')}</div>`:''}
-            <div class="stat-row formula-total"><span class="stat-lbl">= Net PnL</span>${sv(fUsd(st.net_realized_pnl),pnlC(st.net_realized_pnl))}</div>`;
-        })()}
-        <div class="stat-row" style="margin-top:8px" title="Fee per individual fill (open or close)"><span class="stat-lbl">Avg Fee / Fill</span>${sv(fUsd(st.avg_fee_per_fill),'var(--red)')}</div>
-        <div class="stat-row" title="Fee per completed round-trip (open + close combined)"><span class="stat-lbl">Avg Fee / Round-trip</span>${sv(fUsd(st.avg_fee_per_roundtrip),'var(--red)')}</div>
-        <div class="stat-row"><span class="stat-lbl">Total Volume</span>${sv(fUsd(st.total_volume),'var(--t2)')}</div>
-        <div class="stat-row"><span class="stat-lbl">Fee % of Volume</span>${sv(st.fee_pct_vol!=null?st.fee_pct_vol+'%':'—','var(--t2)')}</div>
-        ${st.fee_drag_pct!=null?`<div class="stat-row"><span class="stat-lbl">Fee Drag</span>${sv(st.fee_drag_pct+'% of gross profit','var(--red)')}</div>`:''}
-        <div class="stat-row" title="Minimum fill notional needed so the expected price move covers the fee"><span class="stat-lbl">Break-even Size</span>${sv(st.breakeven_notional!=null?fUsd(st.breakeven_notional)+' notional':'—','var(--t2)')}</div>
+
+      <div class="stat-subgroup">
+        <div class="stat-subgroup-hdr">Equity Breakdown</div>
+        <div class="stat-grid">
+          ${(()=>{
+            const _s = state[addr];
+            const _bal = _s?.balance??0, _margin = _s?.total_margin??0, _upnl = _s?.upnl??0, _eq = _s?.equity??0;
+            return `
+              <div class="stat-row formula-row"><span class="stat-lbl">Free Cash</span>${sv(fUsd(_bal),'var(--t2)')}</div>
+              <div class="stat-row formula-row"><span class="stat-lbl">+ Margin Used</span>${sv(fUsd(_margin),'var(--t2)')}</div>
+              <div class="stat-row formula-row"><span class="stat-lbl">+ Unrealized PnL</span>${sv(fUsd(_upnl),pnlC(_upnl))}</div>
+              <div class="stat-row formula-total"><span class="stat-lbl">= Equity</span>${sv(fUsd(_eq),'var(--t1)')}</div>`;
+          })()}
+        </div>
       </div>
-      <div style="font-size:10px;color:var(--t3);margin-top:4px">* Funding pro-rated every 10s from live HL rates. Slippage model: 3 bps/side on every fill. Execution latency: 150 ms drift on opens (all-fills mode).</div>
+
+      <div class="stat-subgroup">
+        <div class="stat-subgroup-hdr">PnL Breakdown</div>
+        <div class="stat-grid">
+          ${(()=>{
+            const fp = st.total_funding_paid??0;
+            return `
+              <div class="stat-row formula-row"><span class="stat-lbl">Gross PnL</span>${sv(fUsd(st.gross_realized_pnl),pnlC(st.gross_realized_pnl))}</div>
+              <div class="stat-row formula-row"><span class="stat-lbl">− Taker Fees</span>${sv(fUsd(st.total_fees),'var(--red)')}</div>
+              ${fp!==0?`<div class="stat-row formula-row"><span class="stat-lbl">− Funding ${fp>0?'Paid':'Earned'}</span>${sv(fUsd(Math.abs(fp)),fp>0?'var(--red)':'var(--green)')}</div>`:''}
+              <div class="stat-row formula-total"><span class="stat-lbl">= Net PnL</span>${sv(fUsd(st.net_realized_pnl),pnlC(st.net_realized_pnl))}</div>`;
+          })()}
+        </div>
+      </div>
+
+      <div class="stat-subgroup">
+        <div class="stat-subgroup-hdr">Fee Analytics</div>
+        <div class="stat-grid">
+          <div class="stat-row"><span class="stat-lbl has-tip" title="Fee charged on each individual fill (open or close), averaged across all fills.">Avg Fee / Fill</span>${sv(fUsd(st.avg_fee_per_fill),'var(--red)')}</div>
+          <div class="stat-row"><span class="stat-lbl has-tip" title="Combined fee for one full trade: the open fill plus its matching close fill.">Avg Fee / Round-trip</span>${sv(fUsd(st.avg_fee_per_roundtrip),'var(--red)')}</div>
+          <div class="stat-row"><span class="stat-lbl">Total Volume</span>${sv(fUsd(st.total_volume),'var(--t2)')}</div>
+          <div class="stat-row"><span class="stat-lbl">Fee % of Volume</span>${sv(st.fee_pct_vol!=null?st.fee_pct_vol+'%':'—','var(--t2)')}</div>
+          ${st.fee_drag_pct!=null?`<div class="stat-row"><span class="stat-lbl has-tip" title="How much fees ate into your gross profit, as a percentage. Fee Drag = Total Fees ÷ Gross PnL × 100. Lower is better — a high fee drag means a trader's edge is being eaten by trading costs (common with HFT-style copy targets).">Fee Drag</span>${sv(st.fee_drag_pct+'% of gross profit','var(--red)')}</div>`:''}
+          <div class="stat-row"><span class="stat-lbl has-tip" title="The smallest trade size where the expected price move covers the taker fee. Trades below this notional are more likely to be fee-negative even when the trader's direction is right.">Break-even Size</span>${sv(st.breakeven_notional!=null?fUsd(st.breakeven_notional)+' notional':'—','var(--t2)')}</div>
+        </div>
+      </div>
+
+      <div style="font-size:10px;color:var(--t3);margin-top:4px">* Funding pro-rated every 3s from live HL rates. Slippage model: 3 bps/side on every fill. Execution latency: 150 ms drift on opens (all-fills mode).</div>
     </div>
 
     ${symbolStats.length ? `
@@ -1136,10 +1186,12 @@ function openCmpModal(tab) {
   const body  = document.getElementById('cmp-modal-body');
   const titles = { leaderboard: 'Leaderboard', stats: 'Side-by-Side Stats', correlation: 'Return Correlation Matrix', decision: '2-Week Evaluation — Decision Sheet' };
   document.getElementById('cmp-modal-title').textContent = titles[tab] || 'Compare';
-  if (tab === 'leaderboard')      renderLeaderboardInto(body);
-  else if (tab === 'stats')       renderStatsTableInto(body);
-  else if (tab === 'correlation') renderCorrelationInto(body);
-  else if (tab === 'decision')    renderDecisionTabInto(body);
+  softSwap(body, () => {
+    if (tab === 'leaderboard')      renderLeaderboardInto(body);
+    else if (tab === 'stats')       renderStatsTableInto(body);
+    else if (tab === 'correlation') renderCorrelationInto(body);
+    else if (tab === 'decision')    renderDecisionTabInto(body);
+  });
   if (!modal.open) {
     modal.showModal();
     modal.onclick = e => { if (e.target === modal) closeCmpModal(); };
@@ -1752,7 +1804,7 @@ function setRange(el) {
   document.querySelectorAll('.rp').forEach(r=>r.classList.remove('on'));
   el.classList.add('on');
   rangeHours = parseInt(el.dataset.h)||0;
-  rebuildChart();
+  softSwap(document.getElementById('chart-canvas'), rebuildChart);
   if (showUnderwater) {
     const cur = curWallet();
     if (cur) renderUnderwaterChart(cur);
@@ -2122,3 +2174,12 @@ if (_addrTa) _addrTa.addEventListener('input', () => {
 
 // ── Init ───────────────────────────────────────────────────────────────────
 initChart();
+
+// One-time load-in animation for the main panels — runs once per page load
+// (this file's top-level code executes exactly once), never replays on
+// socket reconnects or the frequent re-renders that follow.
+document.querySelectorAll('.panel').forEach((el, i) => {
+  el.style.animationDelay = `${i * 40}ms`;
+  el.classList.add('boot-in');
+  el.addEventListener('animationend', () => el.classList.remove('boot-in'), { once: true });
+});
