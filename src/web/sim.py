@@ -460,6 +460,41 @@ def _equity_from_cache(session: "WalletSession") -> tuple[float, float, float]:
     return session.simulated_balance + margin + upnl, session.simulated_balance, upnl
 
 
+def _ratio_for_new_position(session: WalletSession, target_size: float, price: float) -> float:
+    """Resolve the ratio to use when opening a position not already tracked.
+
+    Only called for brand-new positions (see _process_fill and
+    evaluate_startup_position callers) — an add to an existing position reuses
+    that position's own stored copy_ratio instead, so this never mutates an
+    in-flight one.
+    """
+    if session.ratio_mode == "proportional":
+        target_equity = 0.0
+        if session.monitor and session.monitor.current_state:
+            target_equity = session.monitor.current_state.balance or 0.0
+        if target_equity > 0:
+            your_equity, _, _ = _equity_from_cache(session)
+            session.copy_ratio = your_equity / target_equity
+        else:
+            logger.debug(
+                f"[{session.label}] Proportional ratio: target equity unavailable yet, "
+                f"falling back to frozen copy_ratio={session.copy_ratio}"
+            )
+        return session.copy_ratio
+
+    if session.ratio_mode == "fixed_amount":
+        notional = target_size * price
+        if notional > 0 and session.fixed_amount_usd:
+            return session.fixed_amount_usd / notional
+        logger.debug(
+            f"[{session.label}] Fixed Amount ratio: no usable size/price yet "
+            f"(target_size={target_size}, price={price}), falling back to frozen copy_ratio"
+        )
+        return session.copy_ratio
+
+    return session.copy_ratio  # "fixed" (default) — unchanged behavior
+
+
 async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_fn: Callable) -> None:
     """Process a confirmed fill: size, fee, slippage, guards, position update, DB, emit."""
     symbol      = fill_data.get("coin", "")
