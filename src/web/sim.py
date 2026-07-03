@@ -1910,7 +1910,7 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
                 symbol_notional = session.simulated_positions.get(pos.symbol, {}).get("value", 0.0)
 
                 decision, seed_size, reason = evaluate_startup_position(
-                    pos, mark_px, session.copy_ratio, session.simulated_balance,
+                    pos, mark_px, _ratio_for_new_position(session, abs(pos.size), mark_px), session.simulated_balance,
                     current_total_copied_notional=total_copied_notional,
                     current_symbol_notional=symbol_notional,
                     daily_loss_pct=daily_loss_pct,
@@ -2114,7 +2114,7 @@ async def _reinit_session(session: WalletSession, emit_fn: Callable):
                     continue
                 mark_px = float(mark_px_raw)
                 decision, seed_size, reason = evaluate_startup_position(
-                    pos, mark_px, session.copy_ratio, session.simulated_balance,
+                    pos, mark_px, _ratio_for_new_position(session, abs(pos.size), mark_px), session.simulated_balance,
                     current_total_copied_notional=total_copied_notional,
                     current_symbol_notional=0.0,
                     daily_loss_pct=0.0,  # fresh reset
