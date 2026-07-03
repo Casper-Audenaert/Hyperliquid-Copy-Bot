@@ -10,7 +10,8 @@
 
 ## Global Constraints
 
-- This repo is **not a git repository** (confirmed). Skip all `git add`/`git commit` steps in this plan — mark each step done by running its verification command successfully instead.
+- This repo **is** a git repository (`Hyperliquid-Copy-Bot/`, branch `main`, tracks `origin/main`). Commit after each task's verification passes, as usual. Working directly on `main` (no worktree) — confirmed with the user.
+- The scratch verification scripts in each task (`scratch_taskN.py` etc.) are throwaway — run them, confirm the expected output, then delete them before committing. Only the production code changes should be committed, not the scratch scripts.
 - Ratio mode is set once at wallet-add time and never changes for that wallet's lifetime (matches `start_balance` today) — no "edit wallet" UI is being added.
 - All three modes must produce byte-identical behavior to today's code for `ratio_mode="fixed"` (the default) — this is a strict regression requirement, not just a nice-to-have.
 - Full spec: `docs/superpowers/specs/2026-07-03-copy-ratio-modes-design.md`.
