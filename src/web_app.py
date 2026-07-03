@@ -75,6 +75,26 @@ def _emit_worker():
             logger.error(f"Emit worker error: {e}")
 
 
+# ── Add-wallet start stagger ──────────────────────────────────────────────────
+# /api/add-wallet previously started every session immediately (offset_secs=0),
+# unlike the process-startup loader which staggers by 5s per wallet — already
+# documented as necessary because starting many wallets at once can burst past
+# Hyperliquid's REST rate limit. A naive ever-incrementing counter would be wrong
+# here (this endpoint runs for a process's entire lifetime, not one fixed batch),
+# so this tracks *when the last scheduled start was* and self-resets once enough
+# real time has passed.
+_last_scheduled_start_time = 0.0  # time.monotonic() of the last wallet's scheduled start
+_STAGGER_SECS = 5.0
+
+
+def _next_start_offset() -> float:
+    global _last_scheduled_start_time
+    now = time.monotonic()
+    next_time = max(now, _last_scheduled_start_time + _STAGGER_SECS)
+    _last_scheduled_start_time = next_time
+    return next_time - now
+
+
 # ── Flask ──────────────────────────────────────────────────────────────────────
 app = Flask(__name__, template_folder="templates", static_folder="static")
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET", "hl-sim-secret")
@@ -158,7 +178,7 @@ def api_add_wallet():
                       ratio_mode=ratio_mode, fixed_amount_usd=fixed_amount_usd)
 
     # Start the session in the background loop; it emits state_update when ready
-    submit(start_session(session, _safe_emit))
+    submit(start_session(session, _safe_emit, offset_secs=_next_start_offset()))
     return jsonify({"ok": True, "address": address})
 
 
