@@ -135,13 +135,27 @@ def api_add_wallet():
     except (TypeError, ValueError):
         start_balance = settings.simulated_account_balance
 
+    ratio_mode = (data.get("ratio_mode") or "fixed").strip().lower()
+    if ratio_mode not in ("fixed", "proportional", "fixed_amount"):
+        ratio_mode = "fixed"
+    fixed_amount_usd = None
+    if ratio_mode == "fixed_amount":
+        try:
+            fixed_amount_usd = float(data.get("fixed_amount_usd"))
+        except (TypeError, ValueError):
+            fixed_amount_usd = None
+        if not fixed_amount_usd or fixed_amount_usd <= 0:
+            return jsonify({"error": "fixed_amount_usd must be a positive number for Fixed Amount mode"}), 400
+
     if not address:
         return jsonify({"error": "address required"}), 400
     if address in _sessions:
         return jsonify({"error": "already monitored"}), 409
 
-    session = _create_session(address, label, start_balance)
-    add_wallet_to_db(address, label, start_balance)  # copy_mode/detected_style set after detection in start_session
+    session = _create_session(address, label, start_balance,
+                               ratio_mode=ratio_mode, fixed_amount_usd=fixed_amount_usd)
+    add_wallet_to_db(address, label, start_balance,  # copy_mode/detected_style set after detection in start_session
+                      ratio_mode=ratio_mode, fixed_amount_usd=fixed_amount_usd)
 
     # Start the session in the background loop; it emits state_update when ready
     submit(start_session(session, _safe_emit))
@@ -322,6 +336,8 @@ if __name__ == "__main__":
             copy_mode=getattr(w, "copy_mode", "all_fills") or "all_fills",
             debounce_secs=getattr(w, "debounce_secs", 30) or 30,
             detected_style=getattr(w, "detected_style", "Swing") or "Swing",
+            ratio_mode=getattr(w, "ratio_mode", "fixed") or "fixed",
+            fixed_amount_usd=getattr(w, "fixed_amount_usd", None),
         )
         # Stagger starts by 5s each — 2s was too tight for 20+ wallets each making
         # 9+ REST calls during startup (fill history + style detection)

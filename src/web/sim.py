@@ -102,6 +102,8 @@ class WalletSession:
     ghost_positions: dict = field(default_factory=dict)    # symbol → ghost metadata; never generate orders for these
     copy_mode: str      = "all_fills"       # "all_fills" | "debounced" — auto-detected from fill history
     debounce_secs: int  = 30               # seconds to wait before confirming a debounced copy
+    ratio_mode: str = "fixed"                    # "fixed" | "proportional" | "fixed_amount" — set once at add-time, never mutated
+    fixed_amount_usd: Optional[float] = None      # only used when ratio_mode == "fixed_amount"
     detected_style: str = "Swing"          # "HFT" | "Swing" — surfaced to UI as a badge
     _pending_debounce: dict = field(default_factory=dict)  # symbol → asyncio.Task
     _style_last_checked: float = 0.0                       # monotonic time of last _detect_trading_style call
@@ -1399,7 +1401,8 @@ async def _periodic_liquidation_check(session: WalletSession, emit_fn: Callable)
 
 def _create_session(address: str, label: str, start_balance: float = None,
                     copy_mode: str = "all_fills", debounce_secs: int = 30,
-                    detected_style: str = "Swing") -> "WalletSession":
+                    detected_style: str = "Swing", ratio_mode: str = "fixed",
+                    fixed_amount_usd: float | None = None) -> "WalletSession":
     address = address.lower()
     balance = float(start_balance) if start_balance else settings.simulated_account_balance
     client  = HyperliquidClient(settings.hyperliquid.api_url)
@@ -1412,6 +1415,7 @@ def _create_session(address: str, label: str, start_balance: float = None,
         simulated_balance=balance, start_balance=balance,
         bot_start_time=datetime.now(),
         copy_mode=copy_mode, debounce_secs=debounce_secs, detected_style=detected_style,
+        ratio_mode=ratio_mode, fixed_amount_usd=fixed_amount_usd,
     )
     _sessions[address] = session
     return session
