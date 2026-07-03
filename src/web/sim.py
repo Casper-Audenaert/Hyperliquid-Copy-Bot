@@ -94,7 +94,7 @@ class WalletSession:
     client: HyperliquidClient
 
     is_paused: bool = False
-    copy_ratio: float = 1.0          # fixed at session start, never mutated during trading
+    copy_ratio: float = 1.0          # frozen for ratio_mode="fixed"; recomputed on each new position for "proportional" (via _ratio_for_new_position)
     trades_copied_count: int = 0
     simulated_balance: float = 10_000.0
     start_balance: float = 10_000.0
@@ -1910,8 +1910,9 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
 
                 symbol_notional = session.simulated_positions.get(pos.symbol, {}).get("value", 0.0)
 
+                seed_ratio = _ratio_for_new_position(session, abs(pos.size), mark_px)
                 decision, seed_size, reason = evaluate_startup_position(
-                    pos, mark_px, _ratio_for_new_position(session, abs(pos.size), mark_px), session.simulated_balance,
+                    pos, mark_px, seed_ratio, session.simulated_balance,
                     current_total_copied_notional=total_copied_notional,
                     current_symbol_notional=symbol_notional,
                     daily_loss_pct=daily_loss_pct,
@@ -1959,7 +1960,7 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
                     "side":              "LONG" if is_long else "SHORT",
                     "value":             pos_value,
                     "margin_used":       margin,
-                    "copy_ratio":        session.copy_ratio,
+                    "copy_ratio":        seed_ratio,
                     "seeded_on_startup": True,
                 }
                 session.simulated_positions[pos.symbol] = seed_pos
@@ -2114,8 +2115,9 @@ async def _reinit_session(session: WalletSession, emit_fn: Callable):
                     ghost_reasons["no_mark_price"] = ghost_reasons.get("no_mark_price", 0) + 1
                     continue
                 mark_px = float(mark_px_raw)
+                seed_ratio = _ratio_for_new_position(session, abs(pos.size), mark_px)
                 decision, seed_size, reason = evaluate_startup_position(
-                    pos, mark_px, _ratio_for_new_position(session, abs(pos.size), mark_px), session.simulated_balance,
+                    pos, mark_px, seed_ratio, session.simulated_balance,
                     current_total_copied_notional=total_copied_notional,
                     current_symbol_notional=0.0,
                     daily_loss_pct=0.0,  # fresh reset
@@ -2157,7 +2159,7 @@ async def _reinit_session(session: WalletSession, emit_fn: Callable):
                     "side":              "LONG" if is_long else "SHORT",
                     "value":             pos_value,
                     "margin_used":       margin,
-                    "copy_ratio":        session.copy_ratio,
+                    "copy_ratio":        seed_ratio,
                     "seeded_on_startup": True,
                 }
                 session.simulated_positions[pos.symbol] = reinit_pos
