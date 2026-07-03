@@ -416,6 +416,7 @@ print("PROPORTIONAL_FALLBACK_OK")
 class _FakeState:
     def __init__(self, balance):
         self.balance = balance
+        self.positions = []  # _equity_from_cache reads this unconditionally
 s2.monitor.current_state = _FakeState(balance=1_000_000.0)
 s2.simulated_balance = 15_000.0  # no open positions -> equity == simulated_balance
 ratio = _ratio_for_new_position(s2, target_size=1.0, price=100.0)
