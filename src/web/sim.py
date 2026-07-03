@@ -547,8 +547,18 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
         else:
             is_opening = True
 
-    # Scale size by fixed copy_ratio
-    our_size = target_size * session.copy_ratio
+    # Resolve which ratio to use for this fill. A flip always starts a brand-new
+    # position (the old side is being closed out below), an add to an existing
+    # tracked position reuses that position's own stored ratio (keeps it
+    # internally consistent regardless of mode), anything else is a genuinely
+    # new position.
+    if is_flip:
+        ratio = _ratio_for_new_position(session, target_size, price)
+    elif symbol in session.simulated_positions:
+        ratio = session.simulated_positions[symbol]["copy_ratio"]
+    else:
+        ratio = _ratio_for_new_position(session, target_size, price)
+    our_size = target_size * ratio
 
     # Per-position and portfolio exposure caps (settings.sizing) — opens/adds only;
     # closes derive their size from the existing position, not from this value.
@@ -739,7 +749,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             if target_pos_size > 0:
                 fraction = min(target_size / target_pos_size, 1.0)
             else:
-                our_expected_close = target_size * session.copy_ratio
+                our_expected_close = target_size * pos.get("copy_ratio", session.copy_ratio)
                 fraction = min(our_expected_close / pos_size, 1.0) if pos_size > 0 else 1.0
             close_size = pos_size * fraction
             emit_size  = close_size
@@ -858,7 +868,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
                 session.simulated_positions[symbol] = {
                     "size": 0, "entry_price": 0, "leverage": our_leverage,
                     "side": position_side.value, "value": 0.0, "margin_used": 0.0,
-                    "copy_ratio": session.copy_ratio,
+                    "copy_ratio": ratio,
                 }
 
             pos      = session.simulated_positions[symbol]
