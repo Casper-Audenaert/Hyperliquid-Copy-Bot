@@ -6,9 +6,17 @@ import statistics
 from collections import defaultdict, Counter
 from datetime import date, datetime, timedelta
 
-from web.db import _db_engine, TradeRecord, EquitySnapshot, Wallet
+from web.db import _db_engine, TradeRecord, EquitySnapshot, Wallet, db_get_trade_counters
 from sqlalchemy.orm import Session as DbSession
 from config.settings import settings
+
+# How far back compute_stats() looks for row-level breakdowns (win/loss streaks,
+# day/week/month PnL, symbol/histogram breakdowns, rolling Sharpe/drawdown) — these
+# need the actual trade/equity rows, not just totals, so they can't be served from
+# stats_counters. Lifetime totals (trade count, PnL, fees, volume, win count) come
+# from stats_counters instead and stay exact regardless of this window.
+TRADE_STATS_WINDOW_DAYS  = 180
+EQUITY_STATS_WINDOW_DAYS = 90
 
 
 def _win_stats(closed_pnls: list) -> dict:
@@ -391,64 +399,58 @@ def _compute_decision(score, sharpe, max_dd, win_rate, consistency_pct,
     return "SKIP", [f"Score {score}/100 below 45 minimum threshold"]
 
 
-def _eff_fee(t: TradeRecord) -> float:
-    """Return the fee for a trade record, falling back to notional×rate only for
-    truly unset rows (NULL — from before the fee column existed). An explicitly
-    stored 0.0 means no fee was charged for this fill and must not trigger the
-    fallback, which would invent a phantom fee from the notional."""
-    if t.fee is not None:
-        return t.fee
-    if t.notional:
-        is_flip = bool(t.direction and '>' in t.direction)
-        return t.notional * settings.taker_fee_rate * (2 if is_flip else 1)
-    return 0.0
-
-
 def compute_stats(wallet_addr: str, open_positions: dict = None, copy_ratio: float = 1.0) -> dict:
     """Return the full stats dict for one wallet."""
+    counters = db_get_trade_counters(wallet_addr)  # exact lifetime totals — O(1), no table scan
+
+    cutoff_trades = datetime.utcnow() - timedelta(days=TRADE_STATS_WINDOW_DAYS)
+    cutoff_equity = datetime.utcnow() - timedelta(days=EQUITY_STATS_WINDOW_DAYS)
     with DbSession(_db_engine) as db:
         wallet_row    = db.get(Wallet, wallet_addr)
         start_balance = wallet_row.start_balance if wallet_row else None
         trades = (db.query(TradeRecord)
-                  .filter(TradeRecord.wallet_addr == wallet_addr)
+                  .filter(TradeRecord.wallet_addr == wallet_addr,
+                          TradeRecord.timestamp >= cutoff_trades)
                   .order_by(TradeRecord.timestamp)
                   .all())
         equity_rows = (db.query(EquitySnapshot)
-                       .filter(EquitySnapshot.wallet_addr == wallet_addr)
+                       .filter(EquitySnapshot.wallet_addr == wallet_addr,
+                               EquitySnapshot.timestamp >= cutoff_equity)
                        .order_by(EquitySnapshot.timestamp)
                        .all())
 
     # Seed fills are real entry costs but are NOT copied trades from the target wallet.
     # Exclude them from trade-count stats (wins, streaks, volume) but keep in fee totals.
+    # `trades`/`live_trades` are windowed (see TRADE_STATS_WINDOW_DAYS) — only used below
+    # for breakdowns that need real per-trade rows (streaks, day/week/month, symbol,
+    # histogram). Lifetime totals come from `counters` instead, further down.
     live_trades = [t for t in trades if not t.is_seed]
     closed_pnls = [t.realized_pnl for t in live_trades if t.realized_pnl is not None]
     equities    = [r.equity for r in equity_rows]
 
-    # ── Fee stats ──────────────────────────────────────────────────────────────
-    total_fees         = round(sum(_eff_fee(t) for t in trades), 2)       # all fills incl. seeds — used for net_pnl
-    live_fees          = round(sum(_eff_fee(t) for t in live_trades), 2)  # live fills only — used for rates/averages
-    total_volume       = round(sum(t.notional or 0 for t in live_trades), 2)
-    gross_pnl          = round(sum(closed_pnls), 2)
+    # ── Fee/PnL stats — lifetime, from counters (never rescans trade history) ──
+    total_fees         = round(counters["all_fees_sum"], 2)   # all fills incl. seeds — used for net_pnl
+    live_fees          = round(counters["live_fees_sum"], 2)  # live fills only — used for rates/averages
+    total_volume       = round(counters["volume_sum"], 2)
+    gross_pnl          = round(counters["gross_pnl_sum"], 2)
     total_funding      = round(equity_rows[-1].total_funding_paid if equity_rows else 0.0, 4)
     net_pnl            = round(gross_pnl - total_fees - total_funding, 2)
-    close_fills        = [t for t in live_trades if t.realized_pnl is not None]
-    avg_fee_per_fill      = round(live_fees / len(live_trades), 4) if live_trades else 0.0
-    avg_fee_per_roundtrip = round(live_fees / len(close_fills), 4)  if close_fills else 0.0
+    n_live_trades      = counters["trades_count"]
+    n_closed           = counters["closed_count"]
+    avg_fee_per_fill      = round(live_fees / n_live_trades, 4) if n_live_trades else 0.0
+    avg_fee_per_roundtrip = round(live_fees / n_closed, 4)      if n_closed else 0.0
     fee_pct_vol        = round(live_fees / total_volume * 100, 4)   if total_volume else 0.0
     fee_drag_pct       = round(live_fees / gross_pnl * 100, 1) if gross_pnl > live_fees else None
     breakeven_notional = round(0.10 / settings.taker_fee_rate, 2)
 
     # ── Copy capital brackets ──────────────────────────────────────────────────
-    # Only opening fills >= $10 count (HL minimum — matches the live dust guard).
-    # Tiny sim fills from old sessions (pre $10 dust guard) are excluded so they
-    # don't inflate the minimum capital calculation.
-    open_notionals = [t.notional for t in live_trades if t.notional and t.notional >= 10.0
-                      and t.direction
-                      and ('open' in t.direction.lower() or 'add' in t.direction.lower()
-                           or '>' in t.direction)]
+    # Uses the lifetime-smallest qualifying (>=$10) opening notional (counters),
+    # not the windowed `trades` query — otherwise this would silently drift as
+    # the wallet's actual smallest-ever trade ages out of the window.
     capital_brackets = None
-    if open_notionals and start_balance and copy_ratio > 0:
-        n = min(open_notionals)                # smallest valid sim opening notional
+    min_notional_ever = counters["min_open_notional"]
+    if min_notional_ever and start_balance and copy_ratio > 0:
+        n = min_notional_ever                  # smallest valid sim opening notional, lifetime
         b_trader = start_balance / copy_ratio  # the trader's actual balance
         # At each bracket, the smallest trade's real notional = threshold below
         capital_brackets = {
@@ -464,7 +466,19 @@ def compute_stats(wallet_addr: str, open_positions: dict = None, copy_ratio: flo
         }
     min_real_capital = capital_brackets["min"] if capital_brackets else None  # backward compat
 
+    # avg_win/avg_loss/best/worst/profit_factor/expectancy need the actual per-trade
+    # pnl values (not just totals), so these stay windowed (recent form) rather than
+    # lifetime; total_trades/wins/losses/win_rate are overridden below with the exact
+    # lifetime counts from `counters`.
     win_st  = _win_stats(closed_pnls)
+    win_st["total_trades"] = n_closed
+    win_st["wins"]         = counters["wins_count"]
+    win_st["losses"]       = counters["losses_count"]
+    win_st["win_rate"]     = round(counters["wins_count"] / n_closed * 100, 1) if n_closed else None
+
+    profit_st = _profit_stats(closed_pnls)
+    profit_st["total_realized_pnl"] = gross_pnl  # lifetime-exact, overrides the windowed sum
+
     dd_st   = _drawdown_stats(equities)
     risk_st = _risk_stats(equity_rows)
     rolling_sharpe  = _rolling_sharpe_series(equity_rows)
@@ -524,8 +538,7 @@ def compute_stats(wallet_addr: str, open_positions: dict = None, copy_ratio: flo
     else:
         pnl_trend = None
 
-    # Sample size confidence
-    n_closed = len(close_fills)
+    # Sample size confidence (n_closed is the lifetime count from counters, set above)
     sample_confidence = ("high" if n_closed >= 50 else
                          "medium" if n_closed >= 20 else
                          "low" if n_closed >= 5 else "insufficient")
@@ -539,7 +552,7 @@ def compute_stats(wallet_addr: str, open_positions: dict = None, copy_ratio: flo
 
     return {
         **win_st,
-        **_profit_stats(closed_pnls),
+        **profit_st,
         **dd_st,
         **risk_st,
         **act_st,

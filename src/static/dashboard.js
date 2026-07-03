@@ -24,6 +24,12 @@ function curWallet() {
 }
 let compareMode  = false;
 let rangeHours   = 24;
+// Cap for the "ALL history" range (rangeHours===0). EquitySnapshot rows are
+// never pruned server-side (kept forever, ticking every 3s) — this is purely
+// an interactive-chart fetch/render safety net, not a retention limit, so
+// "ALL" here means "last 90 days", not literally every row ever recorded.
+// The full unbounded history is always available via /api/export/equity/<wallet>.
+const MAX_HISTORY_HOURS = 90 * 24;
 let chart        = null;
 let pnlChart     = null;
 let underwaterChart    = null;
@@ -162,6 +168,10 @@ function initChart() {
     data: { datasets: [] },
     options: {
       animation: false, responsive: true, maintainAspectRatio: false,
+      // parsing:false + numeric x (ms epoch, set in rebuildChart) is required for the
+      // decimation plugin below — it downsamples points at render time so a long-running
+      // wallet's full history doesn't cost proportionally more to draw on every redraw.
+      parsing: false,
       interaction: { mode: 'index', intersect: false },
       plugins: {
         legend: { labels: { color: c.t2, boxWidth: 10, font: { size: 11 }, padding: 16 } },
@@ -169,7 +179,8 @@ function initChart() {
           backgroundColor: c.s1, borderColor: c.hr, borderWidth: 1,
           titleColor: c.t1, bodyColor: c.t2, padding: 12,
           callbacks: { label: ctx => ` ${ctx.dataset.label}: ${usePctView() ? fPct(ctx.parsed.y) : fUsd(ctx.parsed.y)}` }
-        }
+        },
+        decimation: { enabled: true, algorithm: 'min-max' },
       },
       scales: {
         x: { type:'time', time:{ tooltipFormat:'HH:mm:ss', displayFormats:{minute:'HH:mm',hour:'HH:mm',day:'MMM d'} },
@@ -357,7 +368,7 @@ function rebuildChart() {
     const col = clr(addr);
     const sb  = s.start_balance || 1;
     const data = filteredHistory(addr).map(p => ({
-      x: p.t,
+      x: new Date(p.t).getTime(),
       y: usePctView() ? ((p.equity / sb) - 1) * 100 : p.equity
     }));
     return {
@@ -374,7 +385,7 @@ function rebuildChart() {
       label: 'Combined', borderColor: '#ffffff', borderWidth: 2,
       borderDash: [5, 3], backgroundColor: 'transparent',
       pointRadius: 0, pointHoverRadius: 4, tension: 0.35, fill: false,
-      data: combined.map(p => ({ x: p.t, y: ((p.equity / sb) - 1) * 100 })),
+      data: combined.map(p => ({ x: new Date(p.t).getTime(), y: ((p.equity / sb) - 1) * 100 })),
     });
   }
 
@@ -417,7 +428,7 @@ function addEquityPoint(addr, pt) {
   const sb = state[addr].start_balance || 1;
   const y  = usePctView() ? ((pt.equity / sb) - 1) * 100 : pt.equity;
   if (ds) {
-    ds.data.push({ x: pt.t, y });
+    ds.data.push({ x: new Date(pt.t).getTime(), y });
     if (ds.data.length > 5000) ds.data.shift();
     // Debounce to one redraw per animation frame (~16 ms).
     // Calling chart.update('none') on every HFT fill (hundreds/sec) locks up
@@ -1735,7 +1746,7 @@ function renderHistChart(data) {
 // ── Data loading ───────────────────────────────────────────────────────────
 async function loadHistory(addr) {
   try {
-    const r = await fetch(`/api/history/${addr}?hours=${rangeHours||9999}`);
+    const r = await fetch(`/api/history/${addr}?hours=${rangeHours||MAX_HISTORY_HOURS}`);
     const d = await r.json();
     if (state[addr]) state[addr]._history = d;
   } catch(e) { console.warn('loadHistory', e); }

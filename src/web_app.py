@@ -25,7 +25,7 @@ from utils.logger import setup_logger
 from web.db import (
     _db_engine,
     add_wallet_to_db, remove_wallet_from_db,
-    list_wallets_from_db, purge_wallet_data, prune_old_snapshots,
+    list_wallets_from_db, purge_wallet_data,
     db_get_equity_history, db_get_trades, db_get_hft_calibration_stats,
     TradeRecord, EquitySnapshot,
 )
@@ -312,10 +312,7 @@ if __name__ == "__main__":
     while _loop is None or not _loop.is_running():
         time.sleep(0.05)
 
-    # 2. Prune equity snapshots older than 90 days (keeps full simulation history)
-    prune_old_snapshots(days=90)
-
-    # 3. Load persisted wallets (added via GUI — no auto-seeding from env)
+    # 2. Load persisted wallets (added via GUI — no auto-seeding from env)
     db_wallets = list_wallets_from_db()
 
     for i, w in enumerate(db_wallets):
@@ -331,7 +328,7 @@ if __name__ == "__main__":
         submit(start_session(session, _safe_emit, offset_secs=i * 5))
         logger.info(f"Queued: {w.label} ({w.address[:10]}…) [start in {i*5}s]")
 
-    # 4. Drain the emit queue from a Flask-SocketIO background task
+    # 3. Drain the emit queue from a Flask-SocketIO background task
     socketio.start_background_task(_emit_worker)
 
     port = int(os.getenv("WEB_PORT", 5000))

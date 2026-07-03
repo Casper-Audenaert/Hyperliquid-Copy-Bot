@@ -1,4 +1,5 @@
 """Database models, engine, and all DB helper functions."""
+import json
 import os
 from datetime import datetime, timedelta
 from typing import List, Optional
@@ -33,6 +34,7 @@ class Wallet(Base):
     copy_mode      = Column(String, default="all_fills")   # auto-detected, not user-input
     debounce_secs  = Column(Integer, default=30)
     detected_style = Column(String, default="Swing")       # "HFT" | "Swing" — for UI badge
+    stats_counters = Column(String, nullable=True)         # JSON blob of lifetime trade aggregates, see db_get_trade_counters
 
 
 class TradeRecord(Base):
@@ -147,6 +149,7 @@ for _col, _ddl in [
     ("debounce_secs",  "ALTER TABLE wallets ADD COLUMN debounce_secs INTEGER DEFAULT 30"),
     ("detected_style", "ALTER TABLE wallets ADD COLUMN detected_style TEXT DEFAULT 'Swing'"),
     ("total_funding_paid", "ALTER TABLE web_equity ADD COLUMN total_funding_paid REAL"),
+    ("stats_counters", "ALTER TABLE wallets ADD COLUMN stats_counters TEXT"),
 ]:
     try:
         with _db_engine.connect() as conn:
@@ -156,6 +159,22 @@ for _col, _ddl in [
         if "duplicate column" not in str(_e).lower() and "already exists" not in str(_e).lower():
             import logging as _log
             _log.getLogger(__name__).warning(f"DB migration ({_col}): {_e}")
+
+# Composite indexes: EquitySnapshot/TradeRecord only had a single-column index on
+# wallet_addr, so even a date-bounded query (e.g. "last 90 days") still had to
+# scan/sort every historical row for that wallet before the timestamp filter could
+# apply — cost scaled with total lifetime rows, not the requested window.
+for _idx_ddl in [
+    "CREATE INDEX IF NOT EXISTS ix_web_equity_wallet_ts ON web_equity(wallet_addr, timestamp)",
+    "CREATE INDEX IF NOT EXISTS ix_web_trades_wallet_ts ON web_trades(wallet_addr, timestamp)",
+]:
+    try:
+        with _db_engine.connect() as conn:
+            conn.execute(text(_idx_ddl))
+            conn.commit()
+    except Exception as _e:
+        import logging as _log
+        _log.getLogger(__name__).warning(f"DB migration (index): {_e}")
 
 # One-time table rebuild: web_trades.fill_id used to be globally unique, silently
 # dropping a wallet's own copy of a fill whenever another wallet's row already
@@ -213,6 +232,97 @@ except Exception as _e:
     _log.getLogger(__name__).warning(f"DB migration (fill_id uniqueness rebuild): {_e}")
 
 
+# ── Lifetime trade counters ───────────────────────────────────────────────────
+# compute_stats() used to derive fee/volume/PnL/win-count totals by summing the
+# *entire* TradeRecord history on every call (re-run on every fill for an active
+# wallet) — cost grew with total lifetime rows, not the size of any useful
+# window. These counters are maintained incrementally at the exact points a
+# fill is recorded/closed (db_record_fill/db_record_close, both of which already
+# know is_seed) so lifetime totals stay exact without ever rescanning history.
+# Stored as one JSON blob on the wallet row rather than dedicated columns —
+# it's a handful of related numbers with no independent query need of their own.
+
+def _default_counters() -> dict:
+    return {
+        "trades_count":     0,     # live (non-seed) fills ever recorded
+        "closed_count":     0,     # of those, how many have since closed
+        "wins_count":       0,
+        "losses_count":     0,
+        "gross_pnl_sum":    0.0,   # cumulative realized PnL, live fills only
+        "all_fees_sum":     0.0,   # cumulative fees, ALL fills incl. seed (matches old total_fees)
+        "live_fees_sum":    0.0,   # cumulative fees, live fills only (matches old live_fees)
+        "volume_sum":       0.0,   # cumulative notional, live fills only
+        "min_open_notional": None, # smallest qualifying (>=$10) opening notional ever — feeds capital_brackets
+    }
+
+
+def _eff_fee_raw(fee, notional, direction) -> float:
+    """Same fallback as stats.py's _eff_fee, duplicated here (not imported) to avoid
+    a circular import between db.py and stats.py — only fires for legacy rows
+    recorded before the `fee` column existed."""
+    if fee is not None:
+        return fee
+    if notional:
+        is_flip = bool(direction and '>' in direction)
+        return notional * settings.taker_fee_rate * (2 if is_flip else 1)
+    return 0.0
+
+
+def _is_qualifying_open(notional, direction) -> bool:
+    return bool(notional and notional >= 10.0 and direction and
+                ('open' in direction.lower() or 'add' in direction.lower() or '>' in direction))
+
+
+def db_get_trade_counters(wallet_addr: str) -> dict:
+    """Exact lifetime aggregates for a wallet — O(1), never scans TradeRecord."""
+    with DbSession(_db_engine) as db:
+        w = db.get(Wallet, wallet_addr)
+    c = _default_counters()
+    if w and w.stats_counters:
+        c.update(json.loads(w.stats_counters))
+    return c
+
+
+def _backfill_stats_counters():
+    """One-time migration: populate stats_counters for any wallet that predates
+    this feature, from its full existing TradeRecord history. Runs once per
+    wallet (guarded by stats_counters IS NULL) — after this, counters are only
+    ever updated incrementally, never rescanned."""
+    with DbSession(_db_engine) as db:
+        wallets = db.query(Wallet).filter(Wallet.stats_counters.is_(None)).all()
+        for w in wallets:
+            rows = db.query(TradeRecord).filter(TradeRecord.wallet_addr == w.address).all()
+            c = _default_counters()
+            for r in rows:
+                eff_fee = _eff_fee_raw(r.fee, r.notional, r.direction)
+                c["all_fees_sum"] += eff_fee
+                if not r.is_seed:
+                    c["trades_count"]  += 1
+                    c["live_fees_sum"] += eff_fee
+                    c["volume_sum"]    += r.notional or 0
+                    if _is_qualifying_open(r.notional, r.direction):
+                        if c["min_open_notional"] is None or r.notional < c["min_open_notional"]:
+                            c["min_open_notional"] = r.notional
+                    if r.realized_pnl is not None:
+                        c["closed_count"]  += 1
+                        c["gross_pnl_sum"] += r.realized_pnl
+                        if r.realized_pnl > 0:
+                            c["wins_count"] += 1
+                        elif r.realized_pnl < 0:
+                            c["losses_count"] += 1
+            w.stats_counters = json.dumps(c)
+        if wallets:
+            db.commit()
+            from loguru import logger
+            logger.info(f"Backfilled stats_counters for {len(wallets)} wallet(s)")
+
+try:
+    _backfill_stats_counters()
+except Exception as _e:
+    import logging as _log
+    _log.getLogger(__name__).warning(f"stats_counters backfill: {_e}")
+
+
 # ── Wallet registry ───────────────────────────────────────────────────────────
 
 def add_wallet_to_db(address: str, label: str, start_balance: float,
@@ -259,17 +369,6 @@ def purge_wallet_data(address: str):
         db.commit()
 
 
-def prune_old_snapshots(days: int = 30):
-    """Delete equity snapshots older than `days` days on startup."""
-    cutoff = datetime.utcnow() - timedelta(days=days)
-    with DbSession(_db_engine) as db:
-        deleted = db.query(EquitySnapshot).filter(EquitySnapshot.timestamp < cutoff).delete()
-        db.commit()
-    if deleted:
-        from loguru import logger
-        logger.info(f"Pruned {deleted} equity snapshots older than {days} days")
-
-
 # ── Trade records ─────────────────────────────────────────────────────────────
 
 def db_record_fill(wallet_addr: str, wallet_label: str, fill_id, symbol: str,
@@ -291,19 +390,40 @@ def db_record_fill(wallet_addr: str, wallet_label: str, fill_id, symbol: str,
             target_entry_px=target_entry_px, copy_delay_ms=copy_delay_ms,
             fill_id=str(fill_id),
         ))
+        w = db.get(Wallet, wallet_addr)
+        if w:
+            c = _default_counters()
+            if w.stats_counters:
+                c.update(json.loads(w.stats_counters))
+            eff_fee = _eff_fee_raw(fee, notional, direction)
+            c["all_fees_sum"] += eff_fee
+            if not is_seed:
+                c["trades_count"]  += 1
+                c["live_fees_sum"] += eff_fee
+                c["volume_sum"]    += notional
+                if _is_qualifying_open(notional, direction):
+                    if c["min_open_notional"] is None or notional < c["min_open_notional"]:
+                        c["min_open_notional"] = notional
+            w.stats_counters = json.dumps(c)
         db.commit()
 
 
-def db_get_hft_calibration_stats(wallet_addr: str) -> dict:
+def db_get_hft_calibration_stats(wallet_addr: str, days: int = 180) -> dict:
     """Aggregate calibration data for measuring the HFT simulation accuracy gap.
 
     Returns metrics that quantify how far debounced copy entries deviate from
     the target's original fills. Use this data to tune debounce_secs and the
     slippage model after accumulating real live-trading results.
+
+    Bounded to the last `days` days — this used to be an unfiltered .all() over
+    the wallet's entire trade history, getting slower every week regardless of
+    how much of that history was actually relevant to current calibration.
     """
+    cutoff = datetime.utcnow() - timedelta(days=days)
     with DbSession(_db_engine) as db:
         rows = (db.query(TradeRecord)
                 .filter(TradeRecord.wallet_addr == wallet_addr,
+                        TradeRecord.timestamp >= cutoff,
                         TradeRecord.is_debounced == True,   # noqa: E712
                         TradeRecord.is_seed == False,       # noqa: E712
                         TradeRecord.target_entry_px.isnot(None))
@@ -348,6 +468,19 @@ def db_record_close(wallet_addr: str, symbol: str, realized_pnl: float):
                .first())
         if rec:
             rec.realized_pnl = realized_pnl
+            if not rec.is_seed:
+                w = db.get(Wallet, wallet_addr)
+                if w:
+                    c = _default_counters()
+                    if w.stats_counters:
+                        c.update(json.loads(w.stats_counters))
+                    c["closed_count"]  += 1
+                    c["gross_pnl_sum"] += realized_pnl
+                    if realized_pnl > 0:
+                        c["wins_count"] += 1
+                    elif realized_pnl < 0:
+                        c["losses_count"] += 1
+                    w.stats_counters = json.dumps(c)
             db.commit()
 
 
