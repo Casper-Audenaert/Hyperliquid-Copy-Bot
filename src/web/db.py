@@ -35,6 +35,8 @@ class Wallet(Base):
     debounce_secs  = Column(Integer, default=30)
     detected_style = Column(String, default="Swing")       # "HFT" | "Swing" — for UI badge
     stats_counters = Column(String, nullable=True)         # JSON blob of lifetime trade aggregates, see db_get_trade_counters
+    ratio_mode        = Column(String, default="fixed")    # "fixed" | "proportional" | "fixed_amount"
+    fixed_amount_usd  = Column(Float, nullable=True)        # only meaningful when ratio_mode == "fixed_amount"
 
 
 class TradeRecord(Base):
@@ -150,6 +152,8 @@ for _col, _ddl in [
     ("detected_style", "ALTER TABLE wallets ADD COLUMN detected_style TEXT DEFAULT 'Swing'"),
     ("total_funding_paid", "ALTER TABLE web_equity ADD COLUMN total_funding_paid REAL"),
     ("stats_counters", "ALTER TABLE wallets ADD COLUMN stats_counters TEXT"),
+    ("ratio_mode",       "ALTER TABLE wallets ADD COLUMN ratio_mode TEXT DEFAULT 'fixed'"),
+    ("fixed_amount_usd", "ALTER TABLE wallets ADD COLUMN fixed_amount_usd REAL"),
 ]:
     try:
         with _db_engine.connect() as conn:
@@ -327,12 +331,14 @@ except Exception as _e:
 
 def add_wallet_to_db(address: str, label: str, start_balance: float,
                      copy_mode: str = "all_fills", debounce_secs: int = 30,
-                     detected_style: str = "Swing"):
+                     detected_style: str = "Swing", ratio_mode: str = "fixed",
+                     fixed_amount_usd: float | None = None):
     with DbSession(_db_engine) as db:
         if not db.get(Wallet, address):
             db.add(Wallet(address=address, label=label, start_balance=start_balance,
                           copy_mode=copy_mode, debounce_secs=debounce_secs,
-                          detected_style=detected_style))
+                          detected_style=detected_style, ratio_mode=ratio_mode,
+                          fixed_amount_usd=fixed_amount_usd))
             db.commit()
 
 
