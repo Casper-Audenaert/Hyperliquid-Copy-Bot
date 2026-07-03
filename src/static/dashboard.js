@@ -1884,6 +1884,9 @@ function closeModal() {
   document.getElementById('m-addr').value='';
   document.getElementById('m-lbl').value='';
   document.getElementById('m-bal').value='';
+  document.getElementById('m-ratio-mode').value='fixed';
+  document.getElementById('m-fixed-amt').value='';
+  document.getElementById('mf-fixed-amt').style.display='none';
   document.getElementById('merr').classList.remove('show');
 }
 
