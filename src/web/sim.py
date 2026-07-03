@@ -353,6 +353,7 @@ def _session_to_dict(s: WalletSession, price_override: dict | None = None) -> di
         "copy_mode": s.copy_mode,
         "median_hold_secs": round(s.median_hold_secs, 1),
         "debounce_secs": s.debounce_secs,
+        "ratio_mode": s.ratio_mode,
     }
 
 

@@ -730,6 +730,18 @@ header{
     </div>
     <div class="mf" id="mf-lbl"><label>Label (single wallet)</label><input id="m-lbl" placeholder="e.g. Trader A" autocomplete="off"></div>
     <div class="mf"><label>Default Starting Balance ($)</label><input id="m-bal" type="number" min="1" step="100" placeholder="10000" autocomplete="off"></div>
+    <div class="mf">
+      <label>Ratio Mode</label>
+      <select id="m-ratio-mode" onchange="document.getElementById('mf-fixed-amt').style.display = this.value === 'fixed_amount' ? '' : 'none'">
+        <option value="fixed" selected>Fixed Ratio — locked at add-time</option>
+        <option value="proportional">Proportional — recalculated from live equity</option>
+        <option value="fixed_amount">Fixed Amount — flat $ per trade</option>
+      </select>
+    </div>
+    <div class="mf" id="mf-fixed-amt" style="display:none">
+      <label>$ per trade</label>
+      <input id="m-fixed-amt" type="number" min="1" step="1" placeholder="1000" autocomplete="off">
+    </div>
     <div class="mfoot">
       <button class="btn" onclick="closeModal()">Cancel</button>
       <button class="btn btn-brand" id="m-submit" onclick="addWallet()">Start Monitoring</button>

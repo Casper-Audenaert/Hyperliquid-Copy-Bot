@@ -479,6 +479,14 @@ function renderSidebar() {
     const styleBadge = style === 'HFT'
       ? `<span class="style-pill hft" title="High-frequency target — copies use ${s.debounce_secs ?? 30}s debounce (median hold ${s.median_hold_secs ?? '?'}s)">HFT</span>`
       : `<span class="style-pill swing" title="Swing/long-term target — all fills copied immediately">Swing</span>`;
+    const ratioMode = s.ratio_mode || 'fixed';
+    const ratioBadgeText = ratioMode === 'proportional' ? 'PROP' : ratioMode === 'fixed_amount' ? '$AMT' : 'FIXED';
+    const ratioBadgeTitle = ratioMode === 'proportional'
+      ? 'Proportional ratio — recalculated from live equity on every new position'
+      : ratioMode === 'fixed_amount'
+      ? 'Fixed Amount — flat $ per trade regardless of ratio'
+      : 'Fixed Ratio — locked at add-time';
+    const ratioBadge = `<span class="style-pill ratio-${ratioMode.replace('_','-')}" title="${ratioBadgeTitle}">${ratioBadgeText}</span>`;
     return `<div class="wcard${cardCls}" data-addr="${addr}" onclick="${clickFn}">
   <div class="wcard-inner">
     <div class="wc-header">
@@ -486,6 +494,7 @@ function renderSidebar() {
       <div class="wc-dot${s.is_paused?' paused':''}" style="background:${s.is_paused?'var(--warn)':clr(addr)}"></div>
       <span class="wc-name" title="${addr}">${s.label}</span>
       ${styleBadge}
+      ${ratioBadge}
       ${s.liquidation_risk ? `<span class="score-pill bad" title="A position is within 5% of its liquidation price">⚠ LIQ</span>` : (score != null ? `<span class="score-pill ${scoreCls}">${score}</span>` : '')}
       <div class="wc-actions">
         <button class="wc-act-btn rst" onclick="event.stopPropagation();resetWallet('${addr}')" title="Reset">⟳</button>
@@ -1901,6 +1910,9 @@ async function addWallet() {
   const defaultBal = balRaw ? parseFloat(balRaw) : null;
   const errEl     = document.getElementById('merr');
   const btn       = document.getElementById('m-submit');
+  const ratioMode = document.getElementById('m-ratio-mode').value;
+  const fixedAmtRaw = document.getElementById('m-fixed-amt').value.trim();
+  const fixedAmountUsd = fixedAmtRaw ? parseFloat(fixedAmtRaw) : null;
 
   errEl.classList.remove('show');
   const entries = parseAddrLines(rawText);
@@ -1912,6 +1924,11 @@ async function addWallet() {
   }
   if (defaultBal !== null && (isNaN(defaultBal) || defaultBal <= 0)) {
     errEl.textContent = 'Starting balance must be a positive number.';
+    errEl.classList.add('show');
+    return;
+  }
+  if (ratioMode === 'fixed_amount' && (fixedAmountUsd === null || isNaN(fixedAmountUsd) || fixedAmountUsd <= 0)) {
+    errEl.textContent = 'Enter a positive $ per trade for Fixed Amount mode.';
     errEl.classList.add('show');
     return;
   }
@@ -1928,7 +1945,11 @@ async function addWallet() {
     try {
       const r = await fetch('/api/add-wallet', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ address, label, start_balance }),
+        body: JSON.stringify({
+          address, label, start_balance,
+          ratio_mode: ratioMode,
+          fixed_amount_usd: ratioMode === 'fixed_amount' ? fixedAmountUsd : null,
+        }),
       });
       const d = await r.json();
       if (d.ok) succeeded++; else failed++;
