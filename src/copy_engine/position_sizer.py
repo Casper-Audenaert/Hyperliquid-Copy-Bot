@@ -21,7 +21,7 @@ class PositionSizer:
     def calculate_leverage(
         self,
         target_leverage: float,
-        adjustment_ratio: float = 0.5,
+        adjustment_ratio: float = 1.0,
         max_leverage: float = 10.0,
         min_leverage: float = 1.0,
         symbol: str = "",
@@ -29,6 +29,10 @@ class PositionSizer:
         """
         Return an integer leverage adjusted from the target's leverage.
         Hyperliquid only accepts integer values; per-asset caps are enforced.
+        adjustment_ratio=1.0 (the default) mirrors the target's leverage
+        exactly, subject to those caps -- every call site in this codebase
+        passes settings.leverage.adjustment_ratio explicitly, so this default
+        only matters as documentation / a safe fallback for any future caller.
         """
         asset_cap = self._MAX_LEVERAGE.get(symbol.upper(), int(max_leverage))
         adjusted = target_leverage * adjustment_ratio

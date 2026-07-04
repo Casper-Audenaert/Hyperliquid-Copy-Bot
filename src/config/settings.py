@@ -23,7 +23,13 @@ class SizingConfig(BaseModel):
     max_total_exposure: float = 5000.0
 
 class LeverageConfig(BaseModel):
-    adjustment_ratio: float = 0.5
+    # 1.0 = mirror the target's leverage exactly (still clamped to the real
+    # per-asset Hyperliquid cap below, same as it would be on a live exchange).
+    # Matches how real copy-trading platforms actually behave: they either
+    # mirror the leader's leverage exactly or let you pick one fixed leverage
+    # for all copies -- a ratio scaling the leader's leverage isn't a mode any
+    # real platform offers, so mirroring is the faithful default here.
+    adjustment_ratio: float = 1.0
     max_leverage: float = 10.0
     min_leverage: float = 1.0
 
@@ -181,8 +187,10 @@ class Settings(BaseModel):
         use_limit = os.getenv('USE_LIMIT_ORDERS', 'false').lower()
         settings.copy_rules.use_limit_orders = use_limit in ('true', '1', 'yes')
         
-        # Leverage adjustment
-        leverage_adj = os.getenv('LEVERAGE_ADJUSTMENT', '0.5')
+        # Leverage adjustment (default 1.0 = mirror target's leverage exactly;
+        # this fallback must match LeverageConfig.adjustment_ratio's default
+        # above, since this line unconditionally overwrites it either way)
+        leverage_adj = os.getenv('LEVERAGE_ADJUSTMENT', '1.0')
         settings.leverage.adjustment_ratio = float(leverage_adj)
         
         max_trades = os.getenv('MAX_OPEN_TRADES', 'x')

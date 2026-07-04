@@ -241,7 +241,7 @@ All settings are loaded from `.env` on startup. Once wallets are persisted in th
 | `TARGET_WALLETS` | — | Comma-separated list: `0xabc...,0xdef...` Seeds multiple wallets on first start. |
 | `WALLET_LABELS` | — | Display names matching `TARGET_WALLETS` order: `Alice,Bob` |
 | `SIMULATED_ACCOUNT_BALANCE` | `1000` | Default starting balance ($) for new wallets. |
-| `LEVERAGE_ADJUSTMENT` | `0.5` | Scale the target's leverage: `0.5` = half, `1.0` = match, `2.0` = double. |
+| `LEVERAGE_ADJUSTMENT` | `1.0` | Scale the target's leverage: `1.0` = match exactly (default), `0.5` = half, `2.0` = double. |
 | `BLOCKED_ASSETS` | — | Assets to skip: `BTC,ETH` |
 | `MAX_OPEN_TRADES` | `x` | Max concurrent copied positions. `x` = unlimited. |
 | `MAX_OPEN_ORDERS` | `x` | Max concurrent copied orders. `x` = unlimited. |
@@ -259,7 +259,7 @@ your_leverage = target_leverage × LEVERAGE_ADJUSTMENT
 your_leverage = clamped to [min_leverage, max_leverage]
 ```
 
-Defaults: `min_leverage = 1.0`, `max_leverage = 10.0`, `adjustment_ratio = 0.5`.
+Defaults: `min_leverage = 1.0`, `max_leverage = 10.0`, `adjustment_ratio = 1.0` (mirrors the target's leverage exactly, subject to the per-asset and min/max caps above).
 
 ---
 
