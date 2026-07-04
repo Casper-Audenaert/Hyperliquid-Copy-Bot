@@ -200,8 +200,35 @@ class WalletMonitor:
         try:
             inner = update.data.get("data", {})
             fills = inner.get("fills", [])
-            if fills:
-                await self._handle_fills(fills)
+            if not fills:
+                return
+            if inner.get("isSnapshot"):
+                # HL resends the target's recent HISTORICAL fills on every
+                # (re)subscribe. They must never be copied as live trades: on a
+                # fresh DB the tid dedup has never seen them, so hours-old fills
+                # would be "copied" at their original prices the instant the
+                # wallet connects, minting phantom PnL (violates "copy from
+                # now" — startup seeding already mirrors pre-existing positions
+                # at current mark). First snapshot after process start
+                # (_last_fill_time == 0) is pure history: advance the fill
+                # clock past it and drop everything. A reconnect snapshot
+                # (_last_fill_time > 0) keeps only fills newer than the clock,
+                # preserving its role as a missed-fill backstop for disconnect
+                # gaps (tid dedup downstream absorbs overlap with the REST
+                # replay).
+                if self._last_fill_time == 0:
+                    newest = max((f.get("time", 0) for f in fills), default=0)
+                    if newest > self._last_fill_time:
+                        self._last_fill_time = newest
+                    logger.info(
+                        f"userFills snapshot: skipped {len(fills)} historical "
+                        f"fill(s) for {self.target_address[:10]}… (copy-from-now)"
+                    )
+                    return
+                fills = [f for f in fills if f.get("time", 0) > self._last_fill_time]
+                if not fills:
+                    return
+            await self._handle_fills(fills)
         except Exception as e:
             logger.error(f"Error handling userFills WS event: {e}")
 
