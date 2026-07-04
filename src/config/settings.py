@@ -60,7 +60,11 @@ class SimAccuracyConfig(BaseModel):
     maker_close_rate: float = 0.0      # fraction of close fills charged at maker fee rate
 
 class StartupSeedingPolicy(BaseModel):
-    startup_mode: str = "smart_safe"              # "smart_safe" | "always_seed" | "always_skip"
+    # always_skip = "new trades only", matching how Bybit/Binance/OKX copy trading
+    # works: a target's pre-existing positions are never seeded — they become
+    # ghosts, and each symbol unblocks for copying once the target closes it.
+    # (eToro-style "copy open trades" = always_seed + startup_seed_size_multiplier 1.0)
+    startup_mode: str = "always_skip"             # "smart_safe" | "always_seed" | "always_skip"
     max_seed_drift_pct: float = 0.015             # 1.5% max entry drift before ghosting
     max_seed_leverage: int = 4                    # cap leverage at seed time
     startup_seed_size_multiplier: float = 0.35    # scale down seed size vs live copy size
