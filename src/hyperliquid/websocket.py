@@ -183,11 +183,14 @@ class HyperliquidWebSocket:
 
             if channel == "user":
                 # Route "user" channel messages to the correct monitor.
-                # HL may include the subscribed user's address in multiple places:
-                #   1. inner["user"]  — outer envelope (most reliable)
-                #   2. inner["fills"][0]["user"] — each fill carries the user address
-                # If neither is present, dispatch to ALL registered user callbacks and
-                # let each monitor's _handle_user_event filter by address.
+                # Try to extract the subscribed user's address:
+                #   1. inner["user"] — outer envelope, if present
+                #   2. inner["fills"][0]["user"] — defensive; NOTE: per HL's actual
+                #      WsFill schema, fill objects do NOT carry a user field, so
+                #      this rarely (if ever) matches. Most userEvents payloads are
+                #      unattributable on a shared connection.
+                # If no address is found, see the ambiguity rule in the else
+                # branch below — never broadcast to multiple monitors.
                 inner = data.get("data", {})
                 user_addr = (inner.get("user") or "").lower()
 
@@ -210,11 +213,24 @@ class HyperliquidWebSocket:
                     else:
                         logger.debug(f"No callback registered for user={user_addr}")
                 else:
-                    # No user address found — broadcast to all registered monitors
-                    # and let each one filter by its own target address.
-                    for key, cb in list(self.callbacks.items()):
-                        if not key.startswith("user:"):
-                            continue
+                    # No user address found. HL's userEvents payloads don't
+                    # identify the user at all (WsUserEvent has no user field,
+                    # and fill objects carry no per-fill address either), so an
+                    # unattributable message CANNOT be routed safely on a
+                    # shared connection. The old behavior broadcast it to every
+                    # monitor "to filter by address" — but the filter is
+                    # vacuous for exactly these messages (there is no address
+                    # to filter on), so with 2+ wallets per connection every
+                    # wallet copied every other wallet's fills as its own
+                    # (cross-wallet position contamination). Deliver only when
+                    # unambiguous — exactly one monitor on this connection —
+                    # otherwise drop: fills still arrive via the userFills
+                    # channel, whose envelope always carries the user address
+                    # and routes exactly (tid dedup absorbs the overlap).
+                    user_cbs = [(k, cb) for k, cb in list(self.callbacks.items())
+                                if k.startswith("user:")]
+                    if len(user_cbs) == 1:
+                        key, cb = user_cbs[0]
                         try:
                             if asyncio.iscoroutinefunction(cb):
                                 await cb(update)
@@ -222,10 +238,21 @@ class HyperliquidWebSocket:
                                 cb(update)
                         except Exception as e:
                             logger.error(f"User broadcast callback error ({key}): {e}")
+                    elif user_cbs:
+                        logger.debug(
+                            f"Dropped unattributable user-channel message "
+                            f"({len(user_cbs)} monitors share this connection); "
+                            f"fills are covered by the userFills channel"
+                        )
                 return  # handled above — skip the generic callback path below
             elif channel == "userFills":
-                # Same routing pattern as "user": match by embedded user address,
-                # falling back to broadcast if HL omits it.
+                # Same routing pattern as "user": match by embedded user address.
+                # HL's userFills envelope always carries `user` per its schema, so
+                # the no-address case should never happen — but if it ever does,
+                # apply the same ambiguity rule as the user channel: deliver only
+                # when exactly one monitor shares this connection, never broadcast
+                # (broadcasting an unattributable fill message means every wallet
+                # copies it as its own — cross-wallet position contamination).
                 inner = data.get("data", {})
                 user_addr = (inner.get("user") or "").lower()
                 if user_addr:
@@ -241,9 +268,10 @@ class HyperliquidWebSocket:
                     else:
                         logger.debug(f"No userFills callback registered for user={user_addr}")
                 else:
-                    for key, cb in list(self.callbacks.items()):
-                        if not key.startswith("userFills:"):
-                            continue
+                    fills_cbs = [(k, cb) for k, cb in list(self.callbacks.items())
+                                 if k.startswith("userFills:")]
+                    if len(fills_cbs) == 1:
+                        key, cb = fills_cbs[0]
                         try:
                             if asyncio.iscoroutinefunction(cb):
                                 await cb(update)
@@ -251,6 +279,11 @@ class HyperliquidWebSocket:
                                 cb(update)
                         except Exception as e:
                             logger.error(f"userFills broadcast callback error ({key}): {e}")
+                    elif fills_cbs:
+                        logger.warning(
+                            f"Dropped unattributable userFills message "
+                            f"({len(fills_cbs)} monitors share this connection)"
+                        )
                 return
             else:
                 callback = self.callbacks.get(channel)
