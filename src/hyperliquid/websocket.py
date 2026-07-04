@@ -70,7 +70,33 @@ class HyperliquidWebSocket:
                 await self.ws.send(json.dumps(data))
                 logger.debug(f"Sent subscription: {data}")
             except Exception as e:
-                logger.error(f"Failed to send subscription: {e}")
+                sub = data.get("subscription", {})
+                addr = (sub.get("user") or "").lower()
+                sub_type = sub.get("type", "unknown")
+                logger.warning(
+                    f"Failed to send {sub_type} subscription for "
+                    f"{addr[:10] + '…' if addr else 'unknown address'}: {e}"
+                )
+                self._alert_subscription_failure(addr, sub_type, e)
+
+    def _alert_subscription_failure(self, addr: str, sub_type: str, err: Exception):
+        """Surface a failed subscription send via the owning monitor's on_alert
+        hook. Without this, a wallet whose subscribe message never actually
+        reached HL (transient send failure, no exception surfaced past this
+        log-and-forget) looks fully monitored — session exists, no error
+        anywhere the operator would see — while silently receiving nothing
+        until the next full reconnect resubscribes everything."""
+        if not addr:
+            return
+        for key in (f"user:{addr}", f"userFills:{addr}"):
+            cb = self.callbacks.get(key)
+            monitor = getattr(cb, "__self__", None)
+            on_alert = getattr(monitor, "on_alert", None)
+            if on_alert:
+                try:
+                    on_alert(f"{sub_type} subscription failed to send: {err}")
+                except Exception:
+                    pass
 
     async def _send_ping(self):
         if self.ws and not self.ws.closed:

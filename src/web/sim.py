@@ -614,9 +614,15 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     # ponytail: constant slippage; per-asset liquidity bucket if accuracy gap is measured
 
     # ── Latency model (all_fills mode only) ───────────────────────────────────
-    # Approximates the price drift during execution latency.
+    # Approximates the price drift during execution latency. A confirmed
+    # debounced fill (_is_debounced) is treated as all_fills-equivalent here —
+    # previously _debounced_copy_task flipped session.copy_mode to "all_fills"
+    # around its _process_fill call just to pass this gate, but that global
+    # save/restore raced when two debounce tasks interleaved (both awaiting
+    # inside _process_fill concurrently), which could permanently strand the
+    # session in all_fills mode and disable debouncing entirely.
     lat_ms = settings.sim_accuracy.sim_latency_ms
-    if lat_ms > 0 and is_opening and not is_flip and session.copy_mode == "all_fills":
+    if lat_ms > 0 and is_opening and not is_flip and (session.copy_mode == "all_fills" or _is_debounced):
         drift_pct = (lat_ms / 1000) * 0.0001 * random.uniform(0.5, 1.5)
         price = price * (1 + drift_pct) if position_side == PositionSide.LONG else price * (1 - drift_pct)
     # ponytail: fixed volatility proxy; per-asset vol model if needed
@@ -1663,12 +1669,13 @@ async def _debounced_copy_task(session: "WalletSession", symbol: str,
         f"(target was ${pending['original_px']:,.4f})"
     )
 
-    orig_mode = session.copy_mode
-    session.copy_mode = "all_fills"
-    try:
-        await _process_fill(session, patched, fill_id, emit_fn)
-    finally:
-        session.copy_mode = orig_mode
+    # _process_fill is called directly (bypassing on_order_fill's debounce-
+    # scheduling gate, so this can't re-trigger scheduling), and the only place
+    # inside it that reads session.copy_mode (the latency-model gate) already
+    # treats _is_debounced fills as all_fills-equivalent — no mode mutation
+    # needed here anymore. Removed a global copy_mode save/restore that raced
+    # when two debounce tasks interleaved (see the latency-gate comment above).
+    await _process_fill(session, patched, fill_id, emit_fn)
 
 
 def evaluate_startup_position(

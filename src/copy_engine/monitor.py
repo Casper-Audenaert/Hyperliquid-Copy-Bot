@@ -23,14 +23,37 @@ def _get_pool_lock() -> asyncio.Lock:
     return _ws_pool_lock
 
 
+def _wallets_on(ws: HyperliquidWebSocket) -> int:
+    """Count distinct wallets already routed to this connection (by their
+    'user:' callback registration — subscribe_user_events registers this key
+    right after a monitor acquires its connection)."""
+    return sum(1 for k in ws.callbacks if k.startswith("user:"))
+
+
 async def _acquire_shared_ws(ws_url: str) -> HyperliquidWebSocket:
-    """Return the WS connection with fewest subscriptions, or create a new one if
-    the pool has space.  Never creates more than _MAX_WS_CONNECTIONS connections."""
+    """Distribute wallets one-per-connection up to _MAX_WS_CONNECTIONS, then
+    fall back to the least-loaded connection once the pool is full.
+
+    Previously this always returned _ws_pool[0] once the pool held anything
+    (`if _ws_pool: return min(...)` on a list that could never grow past its
+    first entry) — every wallet funneled onto ONE socket regardless of
+    _MAX_WS_CONNECTIONS, making it a single point of failure for the whole
+    deployment and, combined with the userEvents-contamination fix (which
+    only delivers unattributable messages when exactly one monitor shares a
+    connection), silently dropping ALL userEvents traffic once 2+ wallets
+    existed. See _periodic_state_refresh's REST-driven safety net below for
+    the position-close signal that dropping restores.
+    """
     async with _get_pool_lock():
-        # Prefer an existing connected WS (fewest subscribers = most balanced)
         if _ws_pool:
-            best = min(_ws_pool, key=lambda w: len(w.subscriptions))
-            return best
+            free = [w for w in _ws_pool if _wallets_on(w) == 0]
+            if free:
+                return free[0]
+            if len(_ws_pool) < _MAX_WS_CONNECTIONS:
+                ws = HyperliquidWebSocket(ws_url)
+                _ws_pool.append(ws)
+                return ws
+            return min(_ws_pool, key=_wallets_on)
 
         # Pool is empty — create the first shared connection
         ws = HyperliquidWebSocket(ws_url)
@@ -73,6 +96,14 @@ class WalletMonitor:
         self.current_state: Optional[UserState] = None
         self.last_positions: List[Position] = []
         self.last_orders: List[Order] = []
+        self._state_refresh_task: Optional[asyncio.Task] = None
+        # Bounds concurrent in-flight fill callbacks (each does a DB write + REST
+        # fetch and contends on the session's state lock). Without this, a burst
+        # of fills (an HFT target, or a post-reconnect replay of up to 500 fills)
+        # spawns one task per fill with no concurrency limit — tasks still queue
+        # up instantly (create_task is never blocked), only their execution is
+        # throttled, so no fill is dropped, just serialized in slices of 25.
+        self._fill_sem = asyncio.Semaphore(25)
 
         # Track the timestamp of the last processed fill for gap recovery
         self._last_fill_time: int = 0
@@ -130,7 +161,7 @@ class WalletMonitor:
 
         # Background state refresh — decoupled from fill events so high-frequency
         # fills don't trigger REST calls on every message.
-        asyncio.create_task(self._periodic_state_refresh())
+        self._state_refresh_task = asyncio.create_task(self._periodic_state_refresh())
 
         # Subscribe this wallet's address to the shared WS
         await shared_ws.subscribe_user_events(
@@ -148,16 +179,48 @@ class WalletMonitor:
     async def stop_monitoring(self):
         logger.info(f"Stopping monitoring for {self.target_address}")
         await _release_wallet_from_pool(self.target_address, self.client.dexs)
+        # _periodic_state_refresh is an unconditional `while True:` loop with no
+        # other exit path — without this it outlives the wallet forever, issuing
+        # a REST get_user_state every 50-70s indefinitely. Over a 24/7 deployment
+        # with repeated add/remove churn this accumulates one orphan loop per
+        # removed wallet.
+        if self._state_refresh_task is not None:
+            self._state_refresh_task.cancel()
+            self._state_refresh_task = None
 
     async def _periodic_state_refresh(self):
-        """Refresh current_state every ~60s independent of fill events."""
+        """Refresh current_state every ~60s independent of fill events.
+
+        Also the REST-driven safety net for position closes: once a wallet's
+        connection is shared with others (pool full, _MAX_WS_CONNECTIONS
+        reached), unattributable userEvents messages are dropped by design
+        (see websocket.py), so on_position_close never fires from WS for that
+        wallet. This periodic REST comparison against the previous snapshot
+        is the only remaining signal for "target closed a position with no
+        fill we saw" in that case, restoring the safety net's documented
+        purpose independent of WS delivery.
+        """
         import random
         await asyncio.sleep(random.uniform(0, 30))  # initial stagger
         while True:
             await asyncio.sleep(50 + random.uniform(0, 20))  # 50–70s jitter
             try:
+                prev_positions = {p.symbol: p for p in self.last_positions}
                 await self.get_current_state()
                 logger.debug(f"State refreshed for {self.target_address[:10]}…")
+                if self.current_state is not None and self.on_position_close:
+                    new_symbols = {p.symbol for p in self.current_state.positions}
+                    for sym in prev_positions:
+                        if sym in new_symbols:
+                            continue
+                        pos_data = {"coin": sym}
+                        try:
+                            if asyncio.iscoroutinefunction(self.on_position_close):
+                                await self.on_position_close(pos_data)
+                            else:
+                                self.on_position_close(pos_data)
+                        except Exception as e:
+                            logger.error(f"REST-driven position-close callback error: {e}")
             except Exception as e:
                 logger.warning(f"Periodic state refresh failed: {e}")
 
@@ -256,8 +319,10 @@ class WalletMonitor:
                 if asyncio.iscoroutinefunction(self.on_order_fill):
                     # Dispatch as a task so slow callbacks (DB write + REST fetch) don't
                     # block subsequent fills.  session._state_lock inside _process_fill
-                    # serializes per-session mutations so concurrency is safe.
-                    _t = asyncio.create_task(self.on_order_fill(fill))
+                    # serializes per-session mutations so concurrency is safe. The
+                    # semaphore bounds how many run AT ONCE (not how many get queued —
+                    # every fill still gets a task immediately, none are dropped).
+                    _t = asyncio.create_task(self._run_fill_callback(fill))
                     _t.add_done_callback(
                         lambda t: logger.error(f"Fill callback error: {t.exception()!r}")
                         if not t.cancelled() and t.exception() else None
@@ -267,6 +332,10 @@ class WalletMonitor:
                         self.on_order_fill(fill)
                     except Exception as e:
                         logger.error(f"Fill callback error: {e}")
+
+    async def _run_fill_callback(self, fill: dict):
+        async with self._fill_sem:
+            await self.on_order_fill(fill)
 
     async def _replay_missed_fills(self):
         """Fetch fills newer than last_fill_time after a WS reconnect and replay them."""
