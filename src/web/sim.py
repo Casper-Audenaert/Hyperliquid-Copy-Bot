@@ -30,7 +30,7 @@ from copy_engine.executor import TradeExecutor
 from copy_engine.position_sizer import PositionSizer
 from web.db import (
     db_record_fill, db_record_close, db_snapshot_equity, db_update_latest_funding,
-    db_get_trades, purge_wallet_data,
+    db_get_trades, purge_wallet_data, purge_equity_snapshots,
     db_get_latest_equity_snapshot, db_restore_session_counters,
     db_get_known_fill_ids, db_update_trade_equity,
     db_upsert_position, db_delete_position, db_load_positions,
@@ -1133,24 +1133,29 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
                 ghost["target_size"]   = target_size
                 ghost["last_seen_at"]  = datetime.utcnow().isoformat(timespec='milliseconds')
 
-                if _g_closing and not _g_flip:
+                if _g_flip:
+                    # Target reversed a ghosted position: remove the ghost and let
+                    # THIS SAME FILL continue into normal processing below. A flip
+                    # is a single fill that is never redelivered — the old code
+                    # marked it processed and returned here (its comment claimed
+                    # the open side "will re-enter the handler next iteration",
+                    # which never happens), silently dropping the new side. With
+                    # no sim position held, the flip's close-old-side branch
+                    # no-ops and the open side is copied as a fresh entry with a
+                    # freshly resolved ratio.
                     session.ghost_positions.pop(symbol)
                     db_delete_ghost(session.address, symbol)
-                    logger.debug(f"[{session.label}] Ghost {symbol} closed by target — removed")
-                elif _g_flip:
-                    # Target reversed direction: remove ghost so the new open-side fill
-                    # is treated as a fresh live copy event (no ghost, no existing position).
-                    session.ghost_positions.pop(symbol)
-                    db_delete_ghost(session.address, symbol)
-                    logger.info(f"[{session.label}] Ghost {symbol} flipped — tracking as fresh entry")
-                    # Fall through: the open-side portion of the flip fill will re-enter
-                    # the handler next iteration with no ghost and no sim position.
+                    logger.info(f"[{session.label}] Ghost {symbol} flipped — copying new side as fresh entry")
                 else:
-                    db_upsert_ghost(session.address, symbol, ghost)
-
-                session._processed_fill_ids[fill_id] = None
-                _evict_fill_ids(session)
-                return
+                    if _g_closing:
+                        session.ghost_positions.pop(symbol)
+                        db_delete_ghost(session.address, symbol)
+                        logger.debug(f"[{session.label}] Ghost {symbol} closed by target — removed")
+                    else:
+                        db_upsert_ghost(session.address, symbol, ghost)
+                    session._processed_fill_ids[fill_id] = None
+                    _evict_fill_ids(session)
+                    return
 
             assert symbol not in session.ghost_positions, f"BUG: {symbol} still in ghost_positions at order placement"
 
@@ -1837,8 +1842,14 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
         # Load persisted ghost positions then cross-check against live target.
         # Prune ghosts the target no longer holds; update last_seen for the rest.
         # Must run even when _saved_positions exists so ghost state stays fresh.
+        # Runs whenever ANY ghosts exist — including when the target is fully
+        # flat (state.positions == []), which is exactly when ALL ghosts are
+        # stale. The old `and state.positions` guard skipped that case, leaving
+        # undead ghosts that silently absorbed the target's future re-opens.
+        # (The enclosing `if state and state.balance > 0` already guarantees
+        # the state fetch itself succeeded, so an empty list means truly flat.)
         session.ghost_positions = db_load_ghosts(session.address)
-        if session.ghost_positions and state.positions:
+        if session.ghost_positions:
             live_symbols = {p.symbol for p in state.positions}
             for sym in list(session.ghost_positions.keys()):
                 if sym not in live_symbols:
@@ -2052,28 +2063,51 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
 
 
 async def _reinit_session(session: WalletSession, emit_fn: Callable):
-    """Full reset: clear PnL state, re-seed from exchange, restart monitoring."""
-    logger.info(f"[{session.label}] Re-initialising from ${session.start_balance:.2f}…")
+    """Full reset: clear PnL state, re-seed from exchange, restart monitoring.
 
+    Holds _state_lock for the ENTIRE reinit (zeroing + re-seed + DB writes):
+    the monitor keeps dispatching fills throughout, and a fill landing in an
+    unlocked window would be applied to half-reset state (clobbered position,
+    double-deducted balance) with no dedup protection (the dedup dict is
+    cleared below and its DB hydration source was purged by the caller).
+    Fills arriving mid-reinit now queue on the lock and apply to the fully
+    reset account afterward. Nothing awaited in the body acquires this lock
+    (REST fetches, pure seeding math, db helpers) — verified, no deadlock.
+    """
+    logger.info(f"[{session.label}] Re-initialising from ${session.start_balance:.2f}…")
     async with session._state_lock:
-        session.simulated_balance    = session.start_balance
-        session.simulated_positions  = {}
-        session.ghost_positions      = {}
-        session.simulated_pnl        = 0.0
-        session.total_fees_paid      = 0.0
-        session.total_funding_paid   = 0.0
-        session.trades_copied_count  = 0
-        session.wins                 = 0
-        session.losses               = 0
-        session._processed_fill_ids  = {}
-        session._daily_loss_usd      = 0.0
-        session._daily_loss_date     = None
-        session.bot_start_time       = datetime.now()
-        session.equity_history       = []
-        session.recent_fills         = []
-        session._last_equity_tick_ts = 0.0   # reset rate-limit so first tick fires immediately
-        session._style_last_checked  = 0.0   # force style re-detection after reinit
-        session._pending_debounce    = {}     # cancel any queued debounce tasks
+        await _reinit_session_body(session, emit_fn)
+
+
+async def _reinit_session_body(session: WalletSession, emit_fn: Callable):
+    """Reinit body — caller MUST hold session._state_lock for the duration."""
+    # Cancel pending debounce tasks BEFORE clearing the dict — clearing alone
+    # does not cancel the live asyncio tasks, and a task waking after this
+    # reset would apply a stale pre-reset fill to the fresh account (its
+    # wake-up guard only checks _sessions membership, which a reinit keeps).
+    for _entry in session._pending_debounce.values():
+        _task = _entry.get("task")
+        if _task is not None:
+            _task.cancel()
+
+    session.simulated_balance    = session.start_balance
+    session.simulated_positions  = {}
+    session.ghost_positions      = {}
+    session.simulated_pnl        = 0.0
+    session.total_fees_paid      = 0.0
+    session.total_funding_paid   = 0.0
+    session.trades_copied_count  = 0
+    session.wins                 = 0
+    session.losses               = 0
+    session._processed_fill_ids  = {}
+    session._daily_loss_usd      = 0.0
+    session._daily_loss_date     = None
+    session.bot_start_time       = datetime.now()
+    session.equity_history       = []
+    session.recent_fills         = []
+    session._last_equity_tick_ts = 0.0   # reset rate-limit so first tick fires immediately
+    session._style_last_checked  = 0.0   # force style re-detection after reinit
+    session._pending_debounce    = {}
 
     state = await session.monitor.get_current_state()
     if state and state.balance > 0:
@@ -2208,10 +2242,13 @@ async def _reinit_session(session: WalletSession, emit_fn: Callable):
     session.recent_fills = await _fetch_target_fills(session)
     await _detect_trading_style(session)
 
-    # Second purge: catches any stale EquitySnapshot rows written by
-    # _periodic_equity_snapshot while we were awaiting network calls above.
-    # Those rows would contain old equity values and corrupt loadHistory on refresh.
-    purge_wallet_data(session.address)
+    # Final sweep: a snapshot-loop tick already past its lock acquisitions when
+    # this reinit grabbed the state lock can still write ONE pre-reset equity
+    # row concurrently — drop any such stale chart rows. Scoped to
+    # EquitySnapshot only: the old full purge_wallet_data here also deleted
+    # the ghost rows, seed TradeRecords, trade feed, and stats_counters this
+    # reinit had just written.
+    purge_equity_snapshots(session.address)
 
     upnl         = _upnl(session)
     total_margin = sum(p.get("margin_used", 0) for p in session.simulated_positions.values())

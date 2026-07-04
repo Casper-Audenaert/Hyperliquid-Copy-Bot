@@ -210,12 +210,16 @@ def api_reset_wallet(wallet):
 
 @app.route("/api/clear", methods=["POST"])
 def api_clear():
-    """Wipe all trade + equity history and re-initialise every session."""
-    from sqlalchemy.orm import Session as DbSession
-    with DbSession(_db_engine) as db:
-        db.query(TradeRecord).delete()
-        db.query(EquitySnapshot).delete()
-        db.commit()
+    """Wipe all trade + equity history and re-initialise every session.
+
+    Routes through purge_wallet_data per wallet (not raw table deletes) so
+    every wipe path shares one code path: trades, equity, positions, ghosts,
+    AND the wallet's lifetime stats_counters blob all reset together —
+    previously this deleted only 2 of the 4 tables and left stats_counters
+    intact, permanently corrupting lifetime stats for every wallet.
+    """
+    for addr in list(_sessions.keys()):
+        purge_wallet_data(addr)
     for s in list(_sessions.values()):
         submit(_reinit_session(s, _safe_emit))
     return jsonify({"ok": True})

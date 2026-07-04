@@ -372,6 +372,30 @@ def purge_wallet_data(address: str):
         db.query(EquitySnapshot).filter(EquitySnapshot.wallet_addr == address).delete()
         db.query(SimulatedPosition).filter(SimulatedPosition.wallet_addr == address).delete()
         db.query(GhostPosition).filter(GhostPosition.wallet_addr == address).delete()
+        # Lifetime stats_counters must die with the history rows they summarize.
+        # Leaving the blob intact after a purge makes compute_stats() report
+        # pre-reset lifetime totals on an empty trades table, and every new fill
+        # then increments ON TOP of the stale blob — permanent drift, with no
+        # self-heal (_backfill_stats_counters only runs while the blob IS NULL,
+        # which conveniently is exactly the state this reset restores).
+        w = db.get(Wallet, address)
+        if w:
+            w.stats_counters = None
+        db.commit()
+
+
+def purge_equity_snapshots(address: str):
+    """Delete only this wallet's EquitySnapshot rows.
+
+    _reinit_session uses this (NOT purge_wallet_data) as its end-of-reinit
+    cleanup: a snapshot-loop tick already past its lock acquisitions when the
+    reinit grabbed the state lock can still write one pre-reset equity row
+    concurrently, so a final sweep is needed — but the old full purge also
+    nuked the ghost rows, seed TradeRecords, and stats_counters the reinit
+    itself had just written.
+    """
+    with DbSession(_db_engine) as db:
+        db.query(EquitySnapshot).filter(EquitySnapshot.wallet_addr == address).delete()
         db.commit()
 
 
