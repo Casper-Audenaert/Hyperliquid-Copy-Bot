@@ -14,10 +14,14 @@ _db_engine = create_engine(settings.database_url, connect_args={"check_same_thre
 
 # WAL mode: prevents DB corruption on crash by using write-ahead logging.
 # Must be set per-connection; SQLAlchemy's connect event is the right hook.
+# busy_timeout: WAL still allows only one writer at a time — with many wallets
+# writing fills/snapshots roughly concurrently, wait up to 5s for the writer
+# lock to clear instead of raising "database is locked" immediately.
 from sqlalchemy import event as _sa_event
 @_sa_event.listens_for(_db_engine, "connect")
 def _set_wal_mode(conn, _):
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
 
 
 class Base(DeclarativeBase):
@@ -705,18 +709,37 @@ def _despike(rows: list) -> list:
     return result
 
 
+# Max points returned by db_get_equity_history — a long-running wallet logs a
+# point every 3s (never pruned, kept forever in the DB), so a 90-day window can
+# hold ~2.6M rows. The chart only has a few hundred horizontal pixels to draw
+# into, so anything past this is wasted JSON/network/render cost, not signal.
+_EQUITY_HISTORY_MAX_POINTS = 2000
+
+
+def _downsample(points: list, max_points: int = _EQUITY_HISTORY_MAX_POINTS) -> list:
+    n = len(points)
+    if n <= max_points:
+        return points
+    # (max_points-1) denominator anchors index 0 -> 0 and the last index -> n-1,
+    # so the most recent point (what a live dashboard cares about most) is
+    # always included instead of falling just short of the tail.
+    step = (n - 1) / (max_points - 1)
+    return [points[round(i * step)] for i in range(max_points)]
+
+
 def db_get_equity_history(wallet_addr: str, hours: int = 24) -> list:
     cutoff = datetime.utcnow() - timedelta(hours=hours if hours else 9999)
     with DbSession(_db_engine) as db:
-        rows = (db.query(EquitySnapshot)
+        rows = (db.query(EquitySnapshot.timestamp, EquitySnapshot.equity,
+                          EquitySnapshot.balance, EquitySnapshot.upnl)
                 .filter(EquitySnapshot.wallet_addr == wallet_addr,
                         EquitySnapshot.timestamp >= cutoff)
                 .order_by(EquitySnapshot.timestamp)
                 .all())
     # timespec='milliseconds' → "YYYY-MM-DDTHH:MM:SS.mmm" — safe for all browsers
-    raw = [{"t": r.timestamp.isoformat(timespec='milliseconds'), "equity": r.equity,
-            "balance": r.balance, "upnl": r.upnl} for r in rows]
-    return _despike(raw)
+    raw = [{"t": ts.isoformat(timespec='milliseconds'), "equity": equity,
+            "balance": balance, "upnl": upnl} for ts, equity, balance, upnl in rows]
+    return _downsample(_despike(raw))
 
 
 def db_get_trades(wallet_addr: str, limit: int = 200,

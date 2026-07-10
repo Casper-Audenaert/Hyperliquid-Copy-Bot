@@ -12,6 +12,16 @@ function closeSidebar() {
   document.querySelector('.main').style.overflowY = '';
 }
 
+// fetch() with a timeout — plain fetch() never times out on its own, so a hung
+// request on a flaky Pi network stalls its .then() indefinitely (e.g. a stuck
+// "loading" button with no recovery). Drop-in replacement for fetch(); same
+// Promise<Response> contract, so every call site just swaps fetch( -> fetchT(.
+function fetchT(url, opts={}, timeoutMs=15000) {
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), timeoutMs);
+  return fetch(url, {...opts, signal: ctrl.signal}).finally(() => clearTimeout(id));
+}
+
 // ── State ──────────────────────────────────────────────────────────────────
 const socket = io({ transports: ['websocket'] });
 let state        = {};      // addr → session dict
@@ -40,6 +50,8 @@ let sharpeSeriesChart  = null;
 let fillCount    = 0;
 const recentFillsBuffer = []; // ponytail: ring buffer — all wallet fills regardless of compareMode
 let _chartUpdatePending = false; // debounce flag — prevents chart.update() storm from HFT equity_ticks
+let _stateRenderPending = false; // debounce flag — coalesces per-wallet state_update renders into one frame
+let _cmpPanelRenderPending = false; // debounce flag — coalesces per-wallet loadStats() resolutions in compare mode
 let statsCache   = {};      // addr → stats dict (cached from /api/stats)
 let compareSelection = new Set(); // addrs visible in compare mode
 let showCombined     = false;     // overlay combined portfolio curve
@@ -123,7 +135,7 @@ const fPnl  = n => { if (n == null) return null; const a = Math.abs(n); const d 
 const fNum  = n => n == null ? '—' : Number(n).toLocaleString(undefined,{minimumFractionDigits:4,maximumFractionDigits:4});
 const fPct  = (n,plus=true) => n == null ? '—' : (plus&&n>=0?'+':'') + Number(n).toFixed(2) + '%';
 const fPx   = n => !n ? '—' : n>=1000 ? n.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}) : n>=1 ? n.toFixed(4) : n.toFixed(6);
-const fTime = iso => { try { const d=new Date(iso.endsWith('Z')?iso:iso+'Z'); return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'}); } catch { return iso?.slice(11,19)||''; }};
+const fTime = iso => { try { const d=new Date(iso.endsWith('Z')?iso:iso+'Z'); return `${d.toLocaleDateString([],{month:'short',day:'numeric'})}, ${d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}`; } catch { return iso?.slice(0,19).replace('T',' ')||''; }};
 
 // ── Sparkline ──────────────────────────────────────────────────────────────
 function sparklineSvg(addr) {
@@ -456,8 +468,13 @@ function renderSidebar() {
     return;
   }
 
-  // Sort by return_pct descending (leader first)
-  const sorted = [...addrs].sort((a, b) => (state[b]?.return_pct || 0) - (state[a]?.return_pct || 0));
+  // Sort by return_pct descending (leader first). `?? 0` (not `|| 0`) so a real
+  // negative-zero (-0.0 rounds from a razor-thin loss, falsy in JS) or a tiny
+  // negative value isn't discarded; equity is a stable secondary tiebreaker so
+  // wallets with missing/tied return_pct don't fall back to insertion order.
+  const sorted = [...addrs].sort((a, b) =>
+    (state[b]?.return_pct ?? 0) - (state[a]?.return_pct ?? 0) ||
+    (state[b]?.equity ?? 0) - (state[a]?.equity ?? 0));
 
   el.innerHTML = sorted.map((addr, rank) => {
     const s   = state[addr];
@@ -501,7 +518,7 @@ function renderSidebar() {
         <button class="wc-act-btn del" onclick="event.stopPropagation();removeWallet('${addr}')" title="Remove">✕</button>
       </div>
     </div>
-    <div class="wc-addr" onclick="event.stopPropagation();copyAddr('${addr}')" title="Copy address">
+    <div class="wc-addr" onclick="event.stopPropagation();copyAddr('${addr}')" title="${addr} — click to copy">
       ${shortAddr}<span class="copy-icon">⎘</span>
     </div>
     <div class="wc-eq mono">${fUsd(eq)}</div>
@@ -802,15 +819,28 @@ function prependFundingRow(f) {
   while (tbody.children.length > 200) tbody.removeChild(tbody.lastChild);
 }
 
+// Debounced wrapper for loadStats()'s compare-panel refresh — the periodic 25s
+// refresh and per-fill refreshes each resolve loadStats() once per wallet
+// independently, so without this an 11-wallet compare view would do 11
+// uncoalesced full renderComparePanel() DOM rebuilds in a tight window.
+function _scheduleComparePanelRender() {
+  if (_cmpPanelRenderPending) return;
+  _cmpPanelRenderPending = true;
+  requestAnimationFrame(() => {
+    _cmpPanelRenderPending = false;
+    renderComparePanel();
+  });
+}
+
 // ── Stats tearsheet ────────────────────────────────────────────────────────
 async function loadStats(addr) {
   try {
-    const r  = await fetch(`/api/stats/${addr}`);
+    const r  = await fetchT(`/api/stats/${addr}`);
     const st = await r.json();
     statsCache[addr] = st;
     const isCur = !compareMode && (activeWallet||Object.keys(state)[0]) === addr;
     if (isCur) renderStats(st);
-    if (compareMode) renderComparePanel(); // refresh active tab, not just leaderboard
+    if (compareMode) _scheduleComparePanelRender(); // refresh active tab, not just leaderboard
   } catch(e) { console.warn('loadStats', e); }
 }
 
@@ -1755,10 +1785,17 @@ function renderHistChart(data) {
 // ── Data loading ───────────────────────────────────────────────────────────
 async function loadHistory(addr) {
   try {
-    const r = await fetch(`/api/history/${addr}?hours=${rangeHours||MAX_HISTORY_HOURS}`);
+    // Always fetch the full window (server downsamples to a fixed point budget) —
+    // filteredHistory() already slices client-side per the active rangeHours, so
+    // there's no need to couple this fetch to whatever range happened to be
+    // selected at the moment this wallet was first discovered.
+    const r = await fetchT(`/api/history/${addr}?hours=${MAX_HISTORY_HOURS}`);
     const d = await r.json();
     if (state[addr]) state[addr]._history = d;
-  } catch(e) { console.warn('loadHistory', e); }
+  } catch(e) {
+    console.warn('loadHistory', e);
+    showToast('Failed to load chart history', addr.slice(0,8), '⚠');
+  }
 }
 
 async function loadTrades(addr, from='', to='') {
@@ -1768,12 +1805,16 @@ async function loadTrades(addr, from='', to='') {
     if (from) params.push(`from=${from}`);
     if (to)   params.push(`to=${to}`);
     if (params.length) url += '?' + params.join('&');
-    const r    = await fetch(url);
+    const r    = await fetchT(url);
     const rows = await r.json();
+    if (addr !== curWallet()) return; // stale — wallet selection changed while this was in flight
     document.getElementById('feed-body').innerHTML=''; fillCount=0;
     if (!rows.length) return;
     rows.slice().reverse().forEach(t=>prependFill({...t,wallet_label:state[addr]?.label||''}));
-  } catch(e) { console.warn('loadTrades', e); }
+  } catch(e) {
+    console.warn('loadTrades', e);
+    showToast('Failed to load trade feed', addr.slice(0,8), '⚠');
+  }
 }
 
 let _cmpReloadGen = 0;
@@ -1788,7 +1829,7 @@ function reloadFeedForCompare(from = '', to = '') {
     if (from) qs.set('from', from);
     if (to)   qs.set('to', to);
     const url = `/api/trades/${addr}` + (qs.size ? '?' + qs : '');
-    return fetch(url)
+    return fetchT(url)
       .then(r => r.json())
       .then(rows => rows.map(t => ({...t, wallet_label: state[addr]?.label || '', wallet: addr})))
       .catch(() => []);
@@ -1835,7 +1876,7 @@ async function togglePause() {
   const addr = curWallet();
   if (!addr) return;
   const action = state[addr]?.is_paused ? 'resume' : 'pause';
-  await fetch(`/api/${action}/${addr}`, {method:'POST'});
+  await fetchT(`/api/${action}/${addr}`, {method:'POST'});
 }
 
 async function clearSelected() {
@@ -1843,32 +1884,63 @@ async function clearSelected() {
   if (!addr) return;
   const lbl = state[addr]?.label || addr;
   if (!confirm(`Clear all data for "${lbl}"?\n\nThis permanently removes all trade history and equity snapshots from the database and resets the simulated balance to ${fUsd(state[addr]?.start_balance)}.`)) return;
-  await fetch(`/api/reset/${addr}`, {method:'POST'});
+  await fetchT(`/api/reset/${addr}`, {method:'POST'});
 }
 
 async function resetWallet(addr) {
   const lbl = state[addr]?.label || addr;
   if (!confirm(`Clear all data for "${lbl}"?\n\nThis permanently removes all trade history and equity snapshots from the database and resets to ${fUsd(state[addr]?.start_balance)}.`)) return;
-  await fetch(`/api/reset/${addr}`, {method:'POST'});
+  await fetchT(`/api/reset/${addr}`, {method:'POST'});
 }
 
 async function removeWallet(addr) {
   const lbl = state[addr]?.label || addr;
   if (!confirm(`Remove "${lbl}"?\n\nAll its data will be permanently deleted.`)) return;
-  await fetch(`/api/remove-wallet/${addr}`, {method:'POST'});
+  try {
+    const r = await fetchT(`/api/remove-wallet/${addr}`, {method:'POST'});
+    // The socket 'wallet_removed' event normally does the actual UI removal —
+    // this was previously unchecked, so a failed request (e.g. wallet already
+    // gone, network hiccup) looked identical to "the button doesn't work."
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  } catch(e) {
+    console.warn('removeWallet', e);
+    showToast('Failed to remove wallet', lbl, '⚠');
+  }
+}
+
+function _flashCopiedCard(addr) {
+  document.querySelectorAll(`.wcard`).forEach(card => {
+    if (card.querySelector(`[id="spark-${addr}"]`)) {
+      const el = card.querySelector('.wc-addr');
+      if (el) { el.classList.add('copy-flash'); setTimeout(()=>el.classList.remove('copy-flash'),900); }
+    }
+  });
 }
 
 async function copyAddr(addr) {
+  // navigator.clipboard requires a secure context (HTTPS or localhost) — it's
+  // undefined when the dashboard is served over plain HTTP on a LAN IP (e.g.
+  // the Pi deployment), which is why this silently did nothing before. Fall
+  // back to the old execCommand trick, and surface a toast if both fail
+  // instead of leaving the user guessing whether the click did anything.
   try {
-    await navigator.clipboard.writeText(addr);
-    // flash every .wc-addr for this card briefly
-    document.querySelectorAll(`.wcard`).forEach(card => {
-      if (card.querySelector(`[id="spark-${addr}"]`)) {
-        const el = card.querySelector('.wc-addr');
-        if (el) { el.classList.add('copy-flash'); setTimeout(()=>el.classList.remove('copy-flash'),900); }
-      }
-    });
-  } catch(e) { /* clipboard not available */ }
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(addr);
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = addr;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus(); ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      if (!ok) throw new Error('execCommand copy failed');
+    }
+    _flashCopiedCard(addr);
+  } catch(e) {
+    showToast('Could not copy address', addr, '⚠');
+  }
 }
 
 function openModal() {
@@ -1946,7 +2018,7 @@ async function addWallet() {
     const label = lineLabel || (entries.length === 1 ? labelFld : '') || address.slice(2, 10);
     const start_balance = lineBal || defaultBal || null;
     try {
-      const r = await fetch('/api/add-wallet', {
+      const r = await fetchT('/api/add-wallet', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           address, label, start_balance,
@@ -1969,7 +2041,7 @@ async function addWallet() {
 
 // ── Test Wallets Modal ────────────────────────────────────────────────────
 async function openTestModal() {
-  const res = await fetch('/api/test-wallets');
+  const res = await fetchT('/api/test-wallets');
   const { wallets } = await res.json();
   document.getElementById('tw-addrs').value = wallets.join('\n');
   document.getElementById('tw-bal').value = '';
@@ -2003,7 +2075,7 @@ async function addTestWallets() {
     const address = addrs[i].toLowerCase();
     const label = address.slice(2, 10);
     try {
-      const r = await fetch('/api/add-wallet', {
+      const r = await fetchT('/api/add-wallet', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ address, label, start_balance: defaultBal }),
       });
@@ -2027,6 +2099,21 @@ socket.on('disconnect', () => {
   el.textContent='○ disconnected'; el.className='conn-dot';
 });
 
+// Each wallet ticks independently every ~3s, so with N wallets a naive render
+// on every state_update is O(N) DOM work fired N times per tick window — O(N²).
+// Coalescing into one requestAnimationFrame per window collapses that to O(N).
+function _scheduleStateRender() {
+  if (_stateRenderPending) return;
+  _stateRenderPending = true;
+  requestAnimationFrame(() => {
+    _stateRenderPending = false;
+    renderSidebar();
+    renderKpis();
+    renderPositions();
+    if (compareMode) renderComparePanel();
+  });
+}
+
 socket.on('state_update', s => {
   const isNew = !state[s.address];
   state[s.address] = {...(state[s.address]||{}), ...s};
@@ -2038,10 +2125,7 @@ socket.on('state_update', s => {
     // selectWallet() handles it for any wallet the user explicitly clicks.
     if (!activeWallet && Object.keys(state).length === 1) loadTrades(s.address);
   }
-  renderSidebar();
-  renderKpis();
-  renderPositions();
-  if (compareMode) renderComparePanel();
+  _scheduleStateRender();
 });
 
 socket.on('fill', f => {
@@ -2206,6 +2290,17 @@ if (_addrTa) _addrTa.addEventListener('input', () => {
   const lf = document.getElementById('mf-lbl');
   if (lf) lf.style.display = parseAddrLines(_addrTa.value).length > 1 ? 'none' : '';
 });
+
+// The stats panel (compute_stats(), equity/drawdown/exposure-derived figures)
+// only refreshes on wallet-select and ~1s after a fill, while the KPI bar moves
+// every ~3s with live mark price — so between fills the two can visibly disagree.
+// A slow periodic refresh closes that gap without recomputing stats for every
+// wallet every tick (which would reintroduce the O(N) load already fixed).
+// Scoped to only the wallet(s) currently on screen.
+setInterval(() => {
+  const addrs = compareMode ? [...compareSelection] : (curWallet() ? [curWallet()] : []);
+  addrs.forEach(loadStats);
+}, 25_000);
 
 // ── Init ───────────────────────────────────────────────────────────────────
 initChart();

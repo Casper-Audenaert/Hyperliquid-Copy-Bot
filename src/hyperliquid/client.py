@@ -47,7 +47,10 @@ class HyperliquidClient:
         return self
         
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
+        await self.close()
+
+    async def close(self):
+        if self.session and not self.session.closed:
             await self.session.close()
     
     async def _post(self, url: str, data: dict, _retries: int = 3) -> dict:

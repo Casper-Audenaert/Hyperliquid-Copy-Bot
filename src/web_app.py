@@ -185,12 +185,12 @@ def api_add_wallet():
 @app.route("/api/remove-wallet/<wallet>", methods=["POST"])
 def api_remove_wallet(wallet):
     wallet = wallet.lower()
-    s = _sessions.get(wallet)
+    s = _sessions.pop(wallet, None)  # pop (not del) — idempotent against a double-submitted delete
     if not s:
         return jsonify({"error": "not found"}), 404
 
     submit(s.monitor.stop_monitoring())
-    del _sessions[wallet]
+    submit(s.client.close())  # otherwise each removal leaks an open aiohttp connector/socket
     remove_wallet_from_db(wallet)
     purge_wallet_data(wallet)
     _safe_emit("wallet_removed", {"address": wallet})

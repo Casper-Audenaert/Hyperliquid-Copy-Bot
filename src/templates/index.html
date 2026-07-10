@@ -136,20 +136,21 @@ header{
 .wc-dot{width:6px;height:6px;border-radius:50%;background:var(--green);flex-shrink:0}
 .wc-dot.paused{background:var(--warn)}
 .wc-name{font-weight:600;font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.wc-actions{display:flex;gap:3px;opacity:0;transition:opacity var(--dur-fast) var(--ease);flex-shrink:0}
+.wc-actions{display:flex;gap:5px;opacity:.75;transition:opacity var(--dur-fast) var(--ease);flex-shrink:0}
 .wcard:hover .wc-actions{opacity:1}
 .wc-act-btn{
-  width:20px;height:20px;border-radius:4px;border:1px solid var(--hr);
-  background:var(--s3);color:var(--t2);cursor:pointer;font-size:10px;
+  width:26px;height:26px;border-radius:5px;border:1px solid var(--hr);
+  background:var(--s3);color:var(--t2);cursor:pointer;font-size:12px;
   display:grid;place-items:center;transition:all var(--dur-fast) var(--ease)
 }
 .wc-act-btn.del:hover{color:var(--red);border-color:var(--red-b);background:var(--red-a)}
 .wc-act-btn.rst:hover{color:var(--brand);border-color:var(--brand-b);background:var(--brand-a)}
 
-.wc-addr{font-size:9px;font-family:var(--mono);color:var(--t3);cursor:pointer;
-  display:flex;align-items:center;gap:3px;margin-bottom:5px;transition:color var(--dur-fast) var(--ease)}
+.wc-addr{font-size:11px;font-family:var(--mono);color:var(--t3);cursor:pointer;
+  display:flex;align-items:center;gap:4px;margin-bottom:5px;padding:3px 0;
+  transition:color var(--dur-fast) var(--ease)}
 .wc-addr:hover{color:var(--brand)}
-.copy-icon{opacity:0;transition:opacity var(--dur-fast) var(--ease)}
+.copy-icon{opacity:.55;transition:opacity var(--dur-fast) var(--ease)}
 .wc-addr:hover .copy-icon{opacity:1}
 .copy-flash{color:var(--green) !important}
 

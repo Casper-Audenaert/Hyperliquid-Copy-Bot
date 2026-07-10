@@ -206,9 +206,12 @@ async def _check_and_liquidate(session: WalletSession, symbol: str, price: float
     pnl    = size * (liq_px - entry) if is_long else size * (entry - liq_px)
     pnl    = _clamp_close_pnl(pnl, margin)
     session.simulated_balance += margin + pnl
-    session.simulated_pnl     += pnl
-    if pnl < 0:
-        session.losses += 1
+    if not pos.get("seeded_on_startup"):
+        session.simulated_pnl += pnl
+        if pnl >= 0:
+            session.wins   += 1
+        else:
+            session.losses += 1
     del session.simulated_positions[symbol]
     await asyncio.to_thread(db_delete_position, session.address, symbol)
     await asyncio.to_thread(db_record_close, session.address, symbol, pnl)
@@ -577,6 +580,11 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
 
     if our_notional < DUST_GUARD:
         session.skipped_fills_count += 1
+        # Mark processed even though skipped — otherwise a WS-reconnect replay of this
+        # same fill re-triggers this branch every time, inflating skipped_fills_count
+        # (and the displayed copy_efficiency_pct) without bound on every reconnect.
+        session._processed_fill_ids[fill_id] = None
+        _evict_fill_ids(session)
         return
 
     # ── Entry deviation guard ─────────────────────────────────────────────────
@@ -734,6 +742,16 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
                 break
 
     async with session._state_lock:
+        # Re-check dedup INSIDE the lock: on_order_fill's pre-lock check (top of this
+        # function's caller) only protects against a fill that arrived twice AFTER the
+        # first arrival finished; two tasks racing for the SAME fill (this app deliberately
+        # double-subscribes userEvents+userFills per wallet, relying on this dedup to
+        # absorb the overlap) can both pass that check before either has reached the
+        # `_processed_fill_ids[fill_id] = None` mark below (which only happens after an
+        # `await asyncio.to_thread(db_...)` call made while still holding this lock) —
+        # same race class as the affordability re-check further down, just for dedup.
+        if fill_id in session._processed_fill_ids:
+            return
         session.simulated_balance -= fill_fee
         session.total_fees_paid   += fill_fee
 
@@ -778,12 +796,17 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             pnl      = _clamp_close_pnl(pnl, margin_cr)
 
             session.simulated_balance += margin_cr + pnl
-            session.simulated_pnl     += pnl
             pnl_realized = pnl
-            if pnl > 0:
-                session.wins   += 1
-            elif pnl < 0:
-                session.losses += 1
+            # Seed-originated positions are excluded from live win/loss/PnL counters,
+            # matching db_record_close's `if not rec.is_seed` convention — fees still
+            # count (session.total_fees_paid tracks ALL fees, seed included, same as
+            # db.py's all_fees_sum) since those were genuinely paid either way.
+            if not pos.get("seeded_on_startup"):
+                session.simulated_pnl += pnl
+                if pnl > 0:
+                    session.wins   += 1
+                elif pnl < 0:
+                    session.losses += 1
 
             new_size = pos_size - close_size
             try:
@@ -836,11 +859,12 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
                     omarg  = old_pos.get("margin_used", 0)
                     opnl   = _clamp_close_pnl(opnl, omarg)
                     session.simulated_balance += omarg + opnl
-                    session.simulated_pnl     += opnl
-                    if opnl > 0:
-                        session.wins   += 1
-                    elif opnl < 0:
-                        session.losses += 1
+                    if not old_pos.get("seeded_on_startup"):
+                        session.simulated_pnl += opnl
+                        if opnl > 0:
+                            session.wins   += 1
+                        elif opnl < 0:
+                            session.losses += 1
                     del session.simulated_positions[symbol]
                     await asyncio.to_thread(db_record_close, session.address, symbol, opnl)
                     pnl_realized = opnl
@@ -851,6 +875,50 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             position_value = our_size * price
             margin_req     = position_value / max(our_leverage, 1)
 
+            # Re-validate the position-count and net-exposure guards atomically too —
+            # same race as the affordability re-check just below: the pre-lock checks
+            # (Position count guard / Net exposure guard, above) read session state
+            # before any concurrent fill for this session has mutated it, so several
+            # opens can each pass against the same stale snapshot and all get admitted.
+            if is_opening and not is_flip:
+                max_trades = settings.copy_rules.max_open_trades
+                if max_trades and len(session.simulated_positions) >= max_trades:
+                    session.skipped_fills_count += 1
+                    session._processed_fill_ids[fill_id] = None
+                    _evict_fill_ids(session)
+                    logger.warning(
+                        f"[{session.label}] Position cap re-check failed (lost race to a "
+                        f"concurrent fill): {symbol} — skip"
+                    )
+                    return
+                cap = settings.risk_management.max_net_exposure_pct
+                if cap > 0:
+                    _px_map = {p.symbol: p.current_price
+                               for p in (session.monitor.current_state.positions
+                                         if session.monitor and session.monitor.current_state else [])
+                               if p.current_price > 0}
+                    def _cur_notional(p: dict, sym: str) -> float:
+                        px = _px_map.get(sym) or p.get("entry_price", 1)
+                        return abs(p.get("size", 0)) * px
+                    long_n  = sum(_cur_notional(p, s) for s, p in session.simulated_positions.items()
+                                  if p.get("side", "").upper() == "LONG")
+                    short_n = sum(_cur_notional(p, s) for s, p in session.simulated_positions.items()
+                                  if p.get("side", "").upper() == "SHORT")
+                    eq = (session.simulated_balance
+                          + sum(p.get("margin_used", 0) for p in session.simulated_positions.values())
+                          + _upnl(session))
+                    new_long  = long_n  + (our_notional if position_side == PositionSide.LONG  else 0)
+                    new_short = short_n + (our_notional if position_side == PositionSide.SHORT else 0)
+                    if eq > 0 and abs(new_long - new_short) / eq > cap:
+                        session.skipped_fills_count += 1
+                        session._processed_fill_ids[fill_id] = None
+                        _evict_fill_ids(session)
+                        logger.warning(
+                            f"[{session.label}] Net exposure re-check failed (lost race to a "
+                            f"concurrent fill): {symbol} — skip"
+                        )
+                        return
+
             # Re-validate affordability atomically, inside the lock, using the live
             # balance. monitor.py dispatches each fill via asyncio.create_task, so
             # several fills for this session can run _process_fill concurrently; the
@@ -858,8 +926,8 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             # before any of them have deducted, so concurrent fills can all pass that
             # check against the same stale balance and then all deduct sequentially
             # once they reach this lock — over-committing margin beyond real capital.
-            # This is the single point that actually spends the balance, so it's the
-            # only check that's safe against that race.
+            # This is the point that actually spends the balance, so — together with
+            # the position-count/net-exposure re-checks just above — it's race-safe.
             if margin_req > session.simulated_balance:
                 session.skipped_fills_count += 1
                 session._processed_fill_ids[fill_id] = None
@@ -1030,11 +1098,12 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
             session.simulated_balance += margin + pnl - close_fee
             session.simulated_balance  = max(session.simulated_balance, 0.0)
             session.total_fees_paid   += close_fee
-            session.simulated_pnl     += pnl
-            if pnl > 0:
-                session.wins   += 1
-            elif pnl < 0:
-                session.losses += 1
+            if not pos.get("seeded_on_startup"):
+                session.simulated_pnl += pnl
+                if pnl > 0:
+                    session.wins   += 1
+                elif pnl < 0:
+                    session.losses += 1
             del session.simulated_positions[symbol]
             await asyncio.to_thread(db_delete_position, session.address, symbol)
             await asyncio.to_thread(db_record_close, session.address, symbol, pnl)
@@ -1588,6 +1657,14 @@ def _schedule_debounced_copy(session: "WalletSession", fill_data: dict,
     target_sz   = abs(float(fill_data.get("sz", 0)))
     pending     = session._pending_debounce.get(symbol)
 
+    # Otherwise an unhandled exception in _debounced_copy_task (network blip, stale
+    # cache, DB error) only reaches asyncio's default handler on GC — logged via
+    # stdlib logging, never through loguru's sinks — so a dropped debounced copy
+    # (this is specifically the HFT-detected-wallet path) leaves no trace anywhere.
+    def _log_debounce_error(t: asyncio.Task) -> None:
+        if not t.cancelled() and t.exception():
+            logger.error(f"[{session.label}] Debounced copy task error: {t.exception()!r}")
+
     if pending:
         # Add fill arrives while debounce is running → cancel the timer, accumulate size,
         # restart the timer so the window resets (keeps counting from the latest signal).
@@ -1596,6 +1673,7 @@ def _schedule_debounced_copy(session: "WalletSession", fill_data: dict,
         task = asyncio.create_task(
             _debounced_copy_task(session, symbol, pending, fill_id, emit_fn, session.debounce_secs)
         )
+        task.add_done_callback(_log_debounce_error)
         pending["task"] = task
     else:
         entry = {
@@ -1608,6 +1686,7 @@ def _schedule_debounced_copy(session: "WalletSession", fill_data: dict,
         task = asyncio.create_task(
             _debounced_copy_task(session, symbol, entry, fill_id, emit_fn, session.debounce_secs)
         )
+        task.add_done_callback(_log_debounce_error)
         entry["task"] = task
         session._pending_debounce[symbol] = entry
 
