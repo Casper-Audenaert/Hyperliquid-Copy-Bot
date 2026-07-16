@@ -720,16 +720,6 @@ function renderKpis() {
   document.getElementById('pdot').className       = 'pulse-dot'+(paused?' paused':'');
   document.getElementById('live-txt').textContent = paused ? 'PAUSED' : 'LIVE';
 
-  // Global Pause All / Resume All button — reflects ALL wallets, not just the
-  // ones currently on screen (unlike the LIVE/PAUSED dot above, which is
-  // deliberately scoped to the current view).
-  const allWallets = Object.values(state);
-  const allPaused  = allWallets.length > 0 && allWallets.every(s => s.is_paused);
-  const pAllBtn = document.getElementById('btn-pause-all');
-  if (pAllBtn) pAllBtn.innerHTML = allPaused
-    ? '▶ <span class="btn-label">Resume All</span>'
-    : '⏸ <span class="btn-label">Pause All</span>';
-
   const uptime = Math.max(0, ...sess.map(s => s.uptime_h || 0));
   // Auto-advance default range so users see full history after extended runs
   if (rangeHours === 24 && uptime > 168) {       // > 7 days running → show ALL
@@ -2108,32 +2098,6 @@ function setRange(el) {
     const cur = curWallet();
     if (cur) renderUnderwaterChart(cur);
   }
-}
-
-// Pauses (or resumes) every wallet in one action. Mixed state (some paused,
-// some not) is treated as "pause the rest" — matches the button label logic
-// in renderKpis(), which only switches to "Resume All" once every wallet is
-// paused.
-async function toggleGlobalPause() {
-  const addrs = Object.keys(state);
-  if (!addrs.length) return;
-  const action = addrs.every(a => state[a]?.is_paused) ? 'resume' : 'pause';
-  let ok = 0, fail = 0;
-  await Promise.all(addrs.map(async addr => {
-    try {
-      const r = await fetchT(`/api/${action}/${addr}`, {method:'POST'});
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      ok++;
-    } catch(e) {
-      console.warn('toggleGlobalPause', addr, e);
-      fail++;
-    }
-  }));
-  showToast(
-    `${action === 'pause' ? 'Paused' : 'Resumed'} ${ok} wallet${ok!==1?'s':''}`,
-    fail ? `${fail} failed` : '',
-    action === 'pause' ? '⏸' : '▶'
-  );
 }
 
 async function resetWallet(addr) {

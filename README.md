@@ -289,7 +289,7 @@ Resets the wallet to its original starting balance and wipes all trade history a
 
 ### Pause / Resume
 
-Pauses or resumes copying fills for a wallet without removing it. Paused wallets still appear in the dashboard with their existing state frozen. The **Pause All** button in the header does this for every wallet at once — it toggles to **Resume All** once every wallet is paused.
+Pauses or resumes copying fills for a wallet without removing it. Paused wallets still appear in the dashboard with their existing state frozen.
 
 ---
 
