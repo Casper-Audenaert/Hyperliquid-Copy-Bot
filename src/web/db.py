@@ -4,8 +4,9 @@ import os
 from datetime import datetime, timedelta
 from typing import List, Optional
 
-from sqlalchemy import (create_engine, Column, Integer, String, Float, Boolean, DateTime, text,
-                         UniqueConstraint, func)
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Float, Boolean, DateTime, text, UniqueConstraint, func,
+)
 from sqlalchemy.orm import DeclarativeBase, Session as DbSession
 
 from config.settings import settings
@@ -748,8 +749,9 @@ def db_get_equity_history(wallet_addr: str, hours: int = 0,
         if not count:
             return []
 
-        q = db.query(EquitySnapshot.timestamp, EquitySnapshot.equity,
-                      EquitySnapshot.balance, EquitySnapshot.upnl).filter(*filters)
+        q = db.query(
+            EquitySnapshot.timestamp, EquitySnapshot.equity, EquitySnapshot.balance, EquitySnapshot.upnl,
+        ).filter(*filters)
         if count > max_points:
             # One representative row per bucket, chosen via rowid modulo — id is
             # SQLite's implicit rowid, so this predicate is evaluated against the

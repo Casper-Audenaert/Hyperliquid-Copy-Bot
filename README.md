@@ -42,7 +42,7 @@ HL Sim Desk connects to any Hyperliquid wallet via WebSocket and mirrors every t
 | **Correct equity** | `equity = free_cash + locked_margin + unrealized_pnl` — equity never drops on trade open. |
 | **Copy from now** | Existing positions are seeded at the current mark price, so starting uPnL is always zero. |
 | **Fixed ratio** | The copy ratio is locked at session start and never drifts as trades happen. |
-| **Persistent** | Wallets, trades, and equity history survive server restarts via SQLite. |
+| **Persistent** | Wallets, trades, and equity history survive server restarts via SQLite, backed by a daily online backup (`data/backups/`, last 7 kept) so months of retained history survive disk corruption too. |
 | **Compare mode** | Switch to normalized % return curves across all wallets with a ranked leaderboard. |
 
 ---
@@ -289,7 +289,7 @@ Resets the wallet to its original starting balance and wipes all trade history a
 
 ### Pause / Resume
 
-Pauses or resumes copying fills for a wallet without removing it. Paused wallets still appear in the dashboard with their existing state frozen.
+Pauses or resumes copying fills for a wallet without removing it. Paused wallets still appear in the dashboard with their existing state frozen. The **Pause All** button in the header does this for every wallet at once — it toggles to **Resume All** once every wallet is paused.
 
 ---
 
@@ -357,6 +357,8 @@ Where each component is normalized to a 0–100 range:
 
 Higher scores indicate better copy candidates. The score is informational — it has no effect on the simulation.
 
+The score feeds an automated **COPY / MONITOR / SKIP / INSUFFICIENT DATA** decision (`_compute_decision` in `web/stats.py`), surfaced on each wallet's dashboard as a gauge card: a speedometer-style arc (red 0–34 / yellow 35–64 / green 65–100) plus the decision reasons, sample-size confidence, week-over-week trend, and % of profitable trading days. It refreshes automatically alongside the rest of the tearsheet and is display-only — same as the score, it never changes how the simulation copies trades.
+
 ---
 
 ## Architecture
@@ -370,7 +372,6 @@ src/
 │   └── stats.py             # compute_stats() — all analytics derived from DB records
 ├── copy_engine/
 │   ├── monitor.py           # WebSocket wallet monitor (fills, positions, reconnect loop)
-│   ├── executor.py          # Simulation-only executor (no real orders — returns fake IDs)
 │   └── position_sizer.py    # Leverage calculation + per-asset caps
 ├── hyperliquid/
 │   ├── client.py            # REST API client (multi-dex, retry, get_all_mids)
@@ -406,7 +407,7 @@ Three tables:
 |---|---|
 | `wallets` | Wallet registry — persists address, label, start balance across restarts |
 | `web_trades` | Every fill copied, with `realized_pnl` attached when the position closes |
-| `web_equity` | Equity snapshots every 30 seconds + on every fill, pruned at 30 days |
+| `web_equity` | Equity snapshots every 3 seconds + on every fill. Kept forever (never pruned) — history queries downsample in SQL rather than limiting retention, so the chart stays fast without losing data. |
 
 ---
 
@@ -430,7 +431,7 @@ The SQLite database and logs are mounted as volumes so they survive container re
 ## FAQ
 
 **Does this place real orders?**
-No. `TradeExecutor` is simulation-only. It logs every order and returns a fake order ID. No signing, no API key, no real orders — ever.
+No. The bot only reads the target wallet's public fill stream and mirrors it into an in-memory/database position — there is no order-signing or order-submission code path anywhere in the project. No signing, no API key, no real orders — ever.
 
 **Does it need my private key?**
 No. All it needs is a target wallet address to watch. Everything is read-only from the public Hyperliquid API.

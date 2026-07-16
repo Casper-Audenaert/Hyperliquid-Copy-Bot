@@ -6,6 +6,7 @@ All simulation logic is in web/sim.py; DB in web/db.py; stats in web/stats.py.
 import csv
 import io
 import os
+import sqlite3
 import sys
 import time
 import queue
@@ -80,8 +81,6 @@ def _emit_worker():
 # DB file or bad disk doesn't erase months of simulation history, and the WAL
 # checkpoint keeps the -wal file from growing unbounded under a constant
 # write rate.
-import sqlite3
-
 _DB_PATH = settings.database_url.removeprefix("sqlite:///")
 _BACKUP_DIR = Path(_DB_PATH).parent / "backups"
 _BACKUP_INTERVAL_SECS = 24 * 3600
