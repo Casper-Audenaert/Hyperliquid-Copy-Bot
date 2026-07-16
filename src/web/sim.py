@@ -478,9 +478,13 @@ def _ratio_for_new_position(session: WalletSession, target_size: float, price: f
             your_equity, _, _ = _equity_from_cache(session)
             session.copy_ratio = your_equity / target_equity
         else:
-            logger.debug(
-                f"[{session.label}] Proportional ratio: target equity unavailable yet, "
-                f"falling back to frozen copy_ratio={session.copy_ratio}"
+            # BUG FIX: this fallback path was previously silent (debug-level) —
+            # sizing a new position off a stale/frozen ratio because the target's
+            # live account value wasn't available yet is worth surfacing to an
+            # operator, not just a log file no one is tailing.
+            logger.warning(
+                f"[{session.label}] Proportional ratio: target equity unavailable, "
+                f"using last known copy_ratio={session.copy_ratio}"
             )
         return session.copy_ratio
 
@@ -488,9 +492,9 @@ def _ratio_for_new_position(session: WalletSession, target_size: float, price: f
         notional = target_size * price
         if notional > 0 and session.fixed_amount_usd:
             return session.fixed_amount_usd / notional
-        logger.debug(
+        logger.warning(
             f"[{session.label}] Fixed Amount ratio: no usable size/price yet "
-            f"(target_size={target_size}, price={price}), falling back to frozen copy_ratio"
+            f"(target_size={target_size}, price={price}), using last known copy_ratio={session.copy_ratio}"
         )
         return session.copy_ratio
 
@@ -1031,7 +1035,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
         session._last_equity_tick_ts = _now_mono
         emit_fn("equity_tick", {"wallet": session.address,
                                  "t": datetime.utcnow().isoformat(timespec='milliseconds'),
-                                 "equity": round(equity, 2)})
+                                 "equity": round(equity, 2), "upnl": round(upnl, 2)})
 
 
 # ── Callbacks ─────────────────────────────────────────────────────────────────
@@ -1492,7 +1496,7 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
             if _snap_ok:
                 emit_fn("equity_tick", {"wallet": session.address,
                                         "t": datetime.utcnow().isoformat(timespec='milliseconds'),
-                                        "equity": round(equity, 2)})
+                                        "equity": round(equity, 2), "upnl": round(total_upnl, 2)})
             # Re-evaluate trading style every 6 hours so wallets that change behaviour
             # (e.g. HFT bot goes idle, swing trader starts scalping) are reclassified.
             _STYLE_RECHECK_SECS = 6 * 3600

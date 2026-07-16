@@ -2211,7 +2211,7 @@ socket.on('equity_tick', tick => {
     }
   }
 
-  addEquityPoint(tick.wallet, {t:tick.t, equity:tick.equity});
+  addEquityPoint(tick.wallet, {t:tick.t, equity:tick.equity, upnl:tick.upnl});
 });
 
 socket.on('position_close', d => {

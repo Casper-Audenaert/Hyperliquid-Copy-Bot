@@ -297,7 +297,7 @@ def _send_telegram(msg: str):
         return
     try:
         _requests.post(
-            f"https://api.telegram.org/bot{tok}/sendMessage",
+            f"{settings.telegram.api_base_url}/bot{tok}/sendMessage",
             json={"chat_id": chat, "text": msg, "parse_mode": "HTML"},
             timeout=5,
         )

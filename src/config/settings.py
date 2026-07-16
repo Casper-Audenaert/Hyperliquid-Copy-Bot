@@ -17,6 +17,7 @@ class TelegramConfig(BaseModel):
     bot_token: Optional[str] = None
     chat_id: Optional[str] = None
     report_interval_hours: int = 1
+    api_base_url: str = "https://api.telegram.org"
 
 class SizingConfig(BaseModel):
     max_position_size: float = 1000.0
@@ -210,6 +211,7 @@ class Settings(BaseModel):
         
         settings.telegram.bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
         settings.telegram.chat_id = os.getenv('TELEGRAM_CHAT_ID')
+        settings.telegram.api_base_url = os.getenv('TELEGRAM_API_BASE_URL', settings.telegram.api_base_url)
         
         settings.log_level = os.getenv('LOG_LEVEL', settings.log_level)
         settings.log_file = os.getenv('LOG_FILE', settings.log_file)
