@@ -632,6 +632,12 @@ function toggleCompare() {
   renderPositions();
   rebuildChart();
   if (compareMode) {
+    // The decision widget is a single-wallet view — hide it rather than leave
+    // stale data from whichever wallet was active before switching to compare
+    // (renderStats(), which repopulates it, isn't called again until compare
+    // mode exits).
+    const dp = document.getElementById('decision-panel');
+    if (dp) dp.style.display = 'none';
     // Pre-fetch stats for all wallets so Decision tab is populated immediately
     Promise.all([...compareSelection].map(addr => loadStats(addr))).then(() => renderComparePanel());
     renderComparePanel();
@@ -2431,6 +2437,8 @@ socket.on('wallet_removed', d => {
     document.getElementById('stats-content').innerHTML = activeWallet
       ? '<div class="no-stats">Loading…</div>'
       : '<div class="no-stats">Select a wallet to see<br>performance stats</div>';
+    const dp = document.getElementById('decision-panel');
+    if (dp) dp.style.display = 'none';
     if (activeWallet) { loadTrades(activeWallet); loadStats(activeWallet); }
   }
 });
@@ -2466,6 +2474,11 @@ socket.on('clear', async d => {
       _applyFeedPagination();
       document.getElementById('stats-content').innerHTML =
         '<div class="no-stats">No trade history yet — stats appear after the first fill.</div>';
+      // The decision widget lives outside stats-content, so it isn't cleared
+      // by the innerHTML replacement above — hide it explicitly rather than
+      // leave the pre-reset gauge/decision visible until the next stats poll.
+      const dp = document.getElementById('decision-panel');
+      if (dp) dp.style.display = 'none';
     }
 
     // Toast notification
@@ -2490,6 +2503,8 @@ socket.on('clear', async d => {
     _applyFeedPagination();
     document.getElementById('stats-content').innerHTML =
       '<div class="no-stats">Select a wallet to see advanced stats</div>';
+    const dp = document.getElementById('decision-panel');
+    if (dp) dp.style.display = 'none';
     showToast('All wallets cleared', 'Sessions restarted from starting balance', '⟳');
   }
 
