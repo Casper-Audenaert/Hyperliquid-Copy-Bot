@@ -1218,7 +1218,96 @@ function renderStats(st) {
   if (rollingSharp.length)          renderSharpSeriesChart(rollingSharp);
   if (symbolPnl.length)             renderSymPnlChart(symbolPnl);
   if (pnlHistogram.length)          renderHistChart(pnlHistogram);
+
+  renderDecisionWidget(st, addr);
 }
+
+// ── Copy decision indicator (gauge widget) ──────────────────────────────
+// Pure data-display layer — the score/decision logic itself lives entirely
+// in stats.py's _compute_score/_compute_decision and is not duplicated here.
+let _decisionLastUpdatedAt = 0; // Date.now() ms of the most recent render, for the "Xs ago" ticker
+
+function _dgZoneColor(score) {
+  if (score == null) return 'var(--t3)';
+  return score >= 65 ? 'var(--green)' : score >= 35 ? 'var(--warn)' : 'var(--red)';
+}
+
+function renderDecisionWidget(st, addr) {
+  const panel = document.getElementById('decision-panel');
+  const el    = document.getElementById('decision-widget');
+  if (!panel || !el) return;
+  if (!st || !st.decision) { panel.style.display = 'none'; return; }
+  panel.style.display = '';
+
+  const score   = st.score;
+  const t       = Math.max(0, Math.min(100, score ?? 0)) / 100;
+  const needleDeg = t * 180 - 90;
+  const col     = _dgZoneColor(score);
+  const decCol  = st.decision === 'COPY' ? 'var(--green)' : st.decision === 'MONITOR' ? 'var(--warn)'
+                 : st.decision === 'SKIP' ? 'var(--red)' : 'var(--t3)';
+
+  const confCol = st.sample_confidence === 'high' ? 'var(--green)' : st.sample_confidence === 'medium' ? 'var(--warn)'
+                 : st.sample_confidence === 'low' ? 'var(--t2)' : 'var(--red)';
+  const trendIcon = st.pnl_trend === 'improving' ? '↑' : st.pnl_trend === 'declining' ? '↓' : st.pnl_trend === 'stable' ? '→' : '—';
+  const trendCol  = st.pnl_trend === 'improving' ? 'var(--green)' : st.pnl_trend === 'declining' ? 'var(--red)' : 'var(--t2)';
+
+  const pnlByDay = st.pnl_by_day || [];
+  const sparkPts = pnlByDay.slice(-30).map(d => d.pnl);
+  const sparkSvg = sparkPts.length >= 2 ? (() => {
+    const w = 60, h = 18, lo = Math.min(...sparkPts, 0), hi = Math.max(...sparkPts, 0);
+    const range = Math.max(hi - lo, 1);
+    const pts = sparkPts.map((v,i) => `${(i/(sparkPts.length-1)*w).toFixed(1)},${(h - (v-lo)/range*h).toFixed(1)}`).join(' ');
+    return `<svg width="${w}" height="${h}" class="dg-spark"><polyline points="${pts}" fill="none" stroke="${sparkPts[sparkPts.length-1]>=0?'var(--green)':'var(--red)'}" stroke-width="1.5"/></svg>`;
+  })() : '';
+
+  el.innerHTML = `
+    <div class="dg-body">
+      <div class="dg-gauge">
+        <svg viewBox="0 0 200 110">
+          <path d="M 20 100 A 80 80 0 0 1 62.4 29.4" fill="none" stroke="var(--red)" stroke-width="14" stroke-linecap="round"/>
+          <path d="M 62.4 29.4 A 80 80 0 0 1 135.2 28.2" fill="none" stroke="var(--warn)" stroke-width="14" stroke-linecap="round"/>
+          <path d="M 135.2 28.2 A 80 80 0 0 1 180 100" fill="none" stroke="var(--green)" stroke-width="14" stroke-linecap="round"/>
+          <g class="dg-needle" style="transform:rotate(${needleDeg}deg);transform-origin:100px 100px">
+            <line x1="100" y1="100" x2="100" y2="30" stroke="var(--t1)" stroke-width="3" stroke-linecap="round"/>
+            <circle cx="100" cy="100" r="6" fill="var(--t1)"/>
+          </g>
+        </svg>
+        <div class="dg-score-txt">
+          <div class="dg-score-num" style="color:${col}">${score!=null?score:'—'}</div>
+          <div class="dg-score-lbl">score</div>
+        </div>
+      </div>
+      <div class="dg-info">
+        <div class="dg-decision" style="color:${decCol}">${st.decision}</div>
+        <ul class="dg-reasons">${(st.decision_reasons||[]).map(r=>`<li>${r}</li>`).join('')}</ul>
+        <div class="dg-row">
+          <span>Sample: <span class="dg-badge" style="background:${confCol}22;color:${confCol}">${(st.sample_confidence||'—').toUpperCase()}</span></span>
+          <span>Trend: <span style="color:${trendCol};font-weight:700">${trendIcon} ${st.pnl_trend||'—'}</span></span>
+          ${st.consistency_pct!=null?`<span>${st.consistency_pct}% profitable days${sparkSvg}</span>`:''}
+        </div>
+        <div class="dg-meta">
+          Based on ${TRADE_STATS_WINDOW_DAYS}-day trade window, ${EQUITY_STATS_WINDOW_DAYS}-day equity window ·
+          <span class="dg-ticker" id="dg-ticker">updated just now</span>
+        </div>
+      </div>
+    </div>`;
+  _decisionLastUpdatedAt = Date.now();
+}
+
+// Matches stats.py's TRADE_STATS_WINDOW_DAYS/EQUITY_STATS_WINDOW_DAYS constants
+// (180/90) — display-only, not read from the API response since compute_stats()
+// doesn't currently echo them back; update both places together if they change.
+const TRADE_STATS_WINDOW_DAYS = 180;
+const EQUITY_STATS_WINDOW_DAYS = 90;
+
+// 1s ticker for "Last updated Xs ago" — independent of the 25s stats refresh
+// interval so the counter itself feels alive between refreshes.
+setInterval(() => {
+  const elT = document.getElementById('dg-ticker');
+  if (!elT || !_decisionLastUpdatedAt) return;
+  const secs = Math.floor((Date.now() - _decisionLastUpdatedAt) / 1000);
+  elT.textContent = secs < 2 ? 'updated just now' : `updated ${secs}s ago`;
+}, 1000);
 
 // ── Compare panel — wallet stat cards ────────────────────────────────────
 function renderComparePanel() {

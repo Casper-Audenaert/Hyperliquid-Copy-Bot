@@ -173,6 +173,30 @@ header{
 /* ── Main — flex column ── */
 .main{grid-row:2;display:flex;flex-direction:column;overflow:hidden;min-height:0}
 
+/* ── Copy decision indicator ── */
+.decision-panel{margin:10px 12px 0;flex-shrink:0}
+.dg-body{display:flex;align-items:center;gap:20px;padding:16px 20px;flex-wrap:wrap}
+.dg-gauge{position:relative;width:180px;height:104px;flex-shrink:0}
+.dg-gauge svg{width:100%;height:100%;overflow:visible}
+.dg-needle{transition:transform .5s var(--ease)}
+.dg-score-txt{position:absolute;left:50%;bottom:0;transform:translateX(-50%);text-align:center}
+.dg-score-num{font-size:26px;font-weight:800;font-family:var(--mono);line-height:1}
+.dg-score-lbl{font-size:9px;color:var(--t3);text-transform:uppercase;letter-spacing:1px}
+.dg-info{flex:1;min-width:240px}
+.dg-decision{font-size:22px;font-weight:800;letter-spacing:.5px;margin-bottom:4px}
+.dg-reasons{margin:6px 0 10px;padding-left:16px;font-size:11px;color:var(--t2);line-height:1.6}
+.dg-row{display:flex;align-items:center;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--t2);margin-bottom:6px}
+.dg-badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700}
+.dg-spark{display:inline-flex;vertical-align:middle;margin-left:6px}
+.dg-meta{font-size:10px;color:var(--t3);margin-top:8px}
+.dg-ticker{font-size:10px;color:var(--t3)}
+@media(max-width:768px){
+  .decision-panel{margin:8px 10px 0}
+  .dg-body{padding:12px;gap:12px}
+  .dg-gauge{width:140px;height:82px}
+  .dg-score-num{font-size:20px}
+}
+
 /* KPI strip */
 .kpi-bar{
   display:grid;grid-template-columns:repeat(auto-fit,minmax(115px,1fr));flex-shrink:0;
@@ -657,6 +681,11 @@ header{
     <div class="kpi" id="kc-f"><div class="kpi-lbl">Fees Paid</div><div class="kpi-val mono" id="kv-f">—</div><div class="kpi-sub mono" id="ks-f"></div></div>
     <div class="kpi" id="kc-sh"><div class="kpi-lbl">Sharpe</div><div class="kpi-val mono" id="kv-sh">—</div><div class="kpi-sub mono" id="ks-sh"></div></div>
     <div class="kpi" id="kc-dd"><div class="kpi-lbl">Max Drawdown</div><div class="kpi-val mono" id="kv-dd">—</div><div class="kpi-sub mono" id="ks-dd"></div></div>
+  </div>
+
+  <!-- Copy decision indicator -->
+  <div class="panel decision-panel" id="decision-panel" style="display:none">
+    <div id="decision-widget"></div>
   </div>
 
   <!-- Content grid: chart + stats + positions + feed -->
