@@ -42,6 +42,8 @@ let symPnlChart        = null;
 let histChart          = null;
 let sharpeSeriesChart  = null;
 let fillCount    = 0;
+let _feedPage    = 0;         // 0-indexed page into the trade feed table
+const FEED_PAGE_SIZE = 20;
 const recentFillsBuffer = []; // ponytail: ring buffer — all wallet fills regardless of compareMode
 let _chartUpdatePending = false; // debounce flag — prevents chart.update() storm from HFT equity_ticks
 let _stateRenderPending = false; // debounce flag — coalesces per-wallet state_update renders into one frame
@@ -184,7 +186,12 @@ function initChart() {
         tooltip: {
           backgroundColor: c.s1, borderColor: c.hr, borderWidth: 1,
           titleColor: c.t1, bodyColor: c.t2, padding: 12,
-          callbacks: { label: ctx => ` ${ctx.dataset.label}: ${usePctView() ? fPct(ctx.parsed.y) : fUsd(ctx.parsed.y)}` }
+          filter: item => item.dataset.label !== 'Start Balance',
+          callbacks: { label: ctx => {
+            const base = ` ${ctx.dataset.label}: ${usePctView() ? fPct(ctx.parsed.y) : fUsd(ctx.parsed.y)}`;
+            const u = ctx.raw?.upnl;
+            return u != null ? [base, ` uPnL: ${fUsd(u)}`] : base;
+          } }
         },
         decimation: { enabled: true, algorithm: 'min-max' },
       },
@@ -373,9 +380,11 @@ function rebuildChart() {
     const s   = state[addr];
     const col = clr(addr);
     const sb  = s.start_balance || 1;
-    const data = filteredHistory(addr).map(p => ({
+    const hist = filteredHistory(addr);
+    const data = hist.map(p => ({
       x: new Date(p.t).getTime(),
-      y: usePctView() ? ((p.equity / sb) - 1) * 100 : p.equity
+      y: usePctView() ? ((p.equity / sb) - 1) * 100 : p.equity,
+      upnl: p.upnl,
     }));
     return {
       label: s.label || addr.slice(0,8), data, borderColor: col,
@@ -384,6 +393,21 @@ function rebuildChart() {
       pointHoverBackgroundColor:col, fill:!compareMode, tension:0.18,
     };
   });
+  // Dashed reference line at start balance ($ view) / 0% (% view) — single
+  // wallet only (compare mode already normalizes every line to 0% at start,
+  // so the reference would just duplicate the x-axis).
+  if (!compareMode && addrs.length === 1 && state[addrs[0]]) {
+    const primary = chart.data.datasets[0]?.data || [];
+    if (primary.length >= 2) {
+      const y0 = usePctView() ? 0 : (state[addrs[0]].start_balance || 0);
+      chart.data.datasets.push({
+        label: 'Start Balance', borderColor: 'rgba(255,255,255,0.35)', borderWidth: 1,
+        borderDash: [4, 4], backgroundColor: 'transparent', pointRadius: 0,
+        pointHoverRadius: 0, fill: false, tension: 0,
+        data: [{x: primary[0].x, y: y0}, {x: primary[primary.length-1].x, y: y0}],
+      });
+    }
+  }
   if (compareMode && showCombined && addrs.length > 1) {
     const combined = combinedHistory(addrs);
     const sb = combinedStartBal(addrs);
@@ -434,7 +458,7 @@ function addEquityPoint(addr, pt) {
   const sb = state[addr].start_balance || 1;
   const y  = usePctView() ? ((pt.equity / sb) - 1) * 100 : pt.equity;
   if (ds) {
-    ds.data.push({ x: new Date(pt.t).getTime(), y });
+    ds.data.push({ x: new Date(pt.t).getTime(), y, upnl: pt.upnl });
     if (ds.data.length > 5000) ds.data.shift();
     // Debounce to one redraw per animation frame (~16 ms).
     // Calling chart.update('none') on every HFT fill (hundreds/sec) locks up
@@ -524,6 +548,26 @@ function renderSidebar() {
     </div>
   </div>
 </div>`;
+  }).join('');
+  renderMobileBar(sorted, cur);
+}
+
+// Bottom wallet-switcher bar for narrow viewports — the sidebar becomes a
+// slide-in drawer under 768px (see .sb-open), so this gives one-tap wallet
+// switching without opening it. Hidden entirely on desktop via CSS.
+function renderMobileBar(sortedAddrs, cur) {
+  const el = document.getElementById('mobile-tabbar');
+  if (!el) return;
+  el.innerHTML = sortedAddrs.map(addr => {
+    const s = state[addr];
+    const initials = (s.label || addr).replace(/^0x/i,'').slice(0,2).toUpperCase();
+    const sel = !compareMode && cur === addr;
+    const ret = s.return_pct || 0;
+    return `<button class="mtab${sel?' on':''}" onclick="selectWallet('${addr}')" title="${s.label}">
+      <span class="mtab-dot" style="background:${s.is_paused?'var(--warn)':clr(addr)}"></span>
+      <span class="mtab-init">${initials}</span>
+      <span class="mtab-ret ${ret>0?'pos':ret<0?'neg':'z'}">${fPct(ret)}</span>
+    </button>`;
   }).join('');
 }
 
@@ -635,6 +679,16 @@ function renderKpis() {
   const wrColor = wr==null ? null : wr>=55 ? 1 : wr>=40 ? 0 : -1;
   setKpi('w', wr!=null ? wr.toFixed(1)+'%' : '—', `${wins}W / ${losses}L`, wrColor);
   setKpi('t', String(wins + losses), npos+' open position'+(npos!==1?'s':''), null);
+  setKpi('f', fUsd(fees), funding !== 0 ? `+ ${fUsd(Math.abs(funding))} funding` : '', null);
+
+  // Sharpe/drawdown come from /api/stats (statsCache), refreshed less often
+  // than the per-tick state — averaged across compared wallets same as win rate.
+  const sharpes = sess.map(s => statsCache[s.address]?.sharpe).filter(v => v != null);
+  const sharpe  = sharpes.length ? sharpes.reduce((a,v)=>a+v,0)/sharpes.length : null;
+  setKpi('sh', sharpe!=null ? sharpe.toFixed(2) : '—', '', sharpe!=null ? (sharpe-0.5) : null);
+  const dds = sess.map(s => statsCache[s.address]?.max_drawdown).filter(v => v != null);
+  const maxDd = dds.length ? Math.min(...dds) : null;
+  setKpi('dd', maxDd!=null ? maxDd.toFixed(1)+'%' : '—', '', maxDd!=null ? -Math.abs(maxDd) : null);
 
   // Header: in compare mode, individual wallet cards already show each wallet's
   // paused state via an orange dot — don't hoist that into the global banner,
@@ -737,6 +791,39 @@ function renderPositions() {
   _knownPositionKeys = _nextKeys;
 }
 
+// ── Trade feed pagination ────────────────────────────────────────────────
+// Rows are always fully rendered into the DOM (fed by live socket prepends,
+// capped at 200) — pagination here just hides/shows rows client-side rather
+// than re-fetching per page, since the feed is a live-updating list, not a
+// static paged resource.
+function _applyFeedPagination() {
+  const tbody = document.getElementById('feed-body');
+  if (!tbody) return;
+  const rows = [...tbody.children].filter(r => r.id !== 'feed-ph');
+  const pages = Math.max(1, Math.ceil(rows.length / FEED_PAGE_SIZE));
+  _feedPage = Math.min(_feedPage, pages - 1);
+  const start = _feedPage * FEED_PAGE_SIZE, end = start + FEED_PAGE_SIZE;
+  rows.forEach((r, i) => { r.style.display = (i >= start && i < end) ? '' : 'none'; });
+  document.getElementById('feed-page-lbl').textContent = `${_feedPage+1} / ${pages}`;
+  document.getElementById('feed-prev').disabled = _feedPage === 0;
+  document.getElementById('feed-next').disabled = _feedPage >= pages - 1;
+}
+
+function feedPage(delta) {
+  _feedPage = Math.max(0, _feedPage + delta);
+  _applyFeedPagination();
+}
+
+// Debounced to one recompute per animation frame — HFT wallets can fire
+// prependFill() hundreds of times/sec, and re-scanning up to 200 rows on
+// every single one of those would add real overhead for no visible benefit.
+let _feedPagerPending = false;
+function _scheduleFeedPagination() {
+  if (_feedPagerPending) return;
+  _feedPagerPending = true;
+  requestAnimationFrame(() => { _feedPagerPending = false; _applyFeedPagination(); });
+}
+
 // ── Trade feed ─────────────────────────────────────────────────────────────
 function dirCls(dir) {
   if (!dir) return 'd-xx';
@@ -782,6 +869,7 @@ function prependFill(f) {
   while (tbody.children.length > 200) tbody.removeChild(tbody.lastChild);
   fillCount++;
   document.getElementById('feed-cnt').textContent = fillCount+' fill'+(fillCount!==1?'s':'');
+  _scheduleFeedPagination();
 }
 
 function prependFundingRow(f) {
@@ -811,6 +899,7 @@ function prependFundingRow(f) {
     tbody.prepend(tr);
   });
   while (tbody.children.length > 200) tbody.removeChild(tbody.lastChild);
+  _scheduleFeedPagination();
 }
 
 // Debounced wrapper for loadStats()'s compare-panel refresh — the periodic 25s
@@ -1703,16 +1792,27 @@ function renderSharpSeriesChart(data) {
   if (!ctx) return;
   if (sharpeSeriesChart) { sharpeSeriesChart.destroy(); sharpeSeriesChart = null; }
   const c = chartColors();
+  const pts = data.filter(d=>d.sharpe!=null).map(d=>({ x:d.t, y:d.sharpe }));
+  const datasets = [{ data: pts,
+    borderColor:'var(--brand)', backgroundColor:'rgba(124,108,255,0.10)',
+    borderWidth:1.5, pointRadius:0, fill:true, tension:0.3,
+    segment:{ borderColor: ctx => ctx.p1.parsed.y > 0 ? '#16C784' : '#F0506A' } }];
+  // Dashed reference line at the 0.5 Sharpe "good copy candidate" threshold.
+  if (pts.length >= 2) {
+    datasets.push({
+      label: 'Threshold', data: [{x:pts[0].x, y:0.5}, {x:pts[pts.length-1].x, y:0.5}],
+      borderColor: 'rgba(255,255,255,0.35)', borderWidth: 1, borderDash: [4,4],
+      backgroundColor: 'transparent', pointRadius: 0, fill: false, tension: 0,
+    });
+  }
   sharpeSeriesChart = new Chart(ctx.getContext('2d'), {
     type: 'line',
-    data: { datasets: [{ data: data.filter(d=>d.sharpe!=null).map(d=>({ x:d.t, y:d.sharpe })),
-      borderColor:'var(--brand)', backgroundColor:'rgba(124,108,255,0.10)',
-      borderWidth:1.5, pointRadius:0, fill:true, tension:0.3,
-      segment:{ borderColor: ctx => ctx.p1.parsed.y > 0 ? '#16C784' : '#F0506A' } }] },
+    data: { datasets },
     options: {
       animation:false, responsive:true, maintainAspectRatio:false,
       plugins:{ legend:{display:false}, tooltip:{ backgroundColor:c.s1, borderColor:c.hr,
         borderWidth:1, titleColor:c.t1, bodyColor:c.t2,
+        filter: item => item.dataset.label !== 'Threshold',
         callbacks:{ label: ctx=>` Sharpe: ${ctx.parsed.y}` } }},
       scales:{
         x:{ type:'time', ticks:{color:c.t3,font:{size:9},maxTicksLimit:5}, grid:{display:false}, border:{color:c.hr} },
@@ -1807,8 +1907,8 @@ async function loadTrades(addr, from='', to='') {
     const r    = await fetchT(url);
     const rows = await r.json();
     if (addr !== curWallet()) return; // stale — wallet selection changed while this was in flight
-    document.getElementById('feed-body').innerHTML=''; fillCount=0;
-    if (!rows.length) return;
+    document.getElementById('feed-body').innerHTML=''; fillCount=0; _feedPage=0;
+    if (!rows.length) { _applyFeedPagination(); return; }
     rows.slice().reverse().forEach(t=>prependFill({...t,wallet_label:state[addr]?.label||''}));
   } catch(e) {
     console.warn('loadTrades', e);
@@ -1820,7 +1920,7 @@ let _cmpReloadGen = 0;
 function reloadFeedForCompare(from = '', to = '') {
   const gen = ++_cmpReloadGen;
   document.getElementById('feed-body').innerHTML = '';
-  fillCount = 0;
+  fillCount = 0; _feedPage = 0;
   document.getElementById('feed-cnt').textContent = '0 fills';
   const addrs = [...compareSelection];
   Promise.all(addrs.map(addr => {
@@ -1844,9 +1944,11 @@ function reloadFeedForCompare(from = '', to = '') {
     ];
     const all = merged.sort((a, b) => new Date(a.timestamp||0) - new Date(b.timestamp||0));
     all.slice(-200).reverse().forEach(t => prependFill(t));
-    if (!all.length)
+    if (!all.length) {
       document.getElementById('feed-body').innerHTML =
         '<tr id="feed-ph"><td colspan="9" class="no-feed">No fills yet…</td></tr>';
+      _applyFeedPagination();
+    }
   });
 }
 
@@ -2270,8 +2372,9 @@ socket.on('clear', async d => {
     if (cur === addr) {
       document.getElementById('feed-body').innerHTML =
         '<tr id="feed-ph"><td colspan="9" class="no-feed">Waiting for fills…</td></tr>';
-      fillCount = 0;
+      fillCount = 0; _feedPage = 0;
       document.getElementById('feed-cnt').textContent = '0 fills';
+      _applyFeedPagination();
       document.getElementById('stats-content').innerHTML =
         '<div class="no-stats">No trade history yet — stats appear after the first fill.</div>';
     }
@@ -2293,8 +2396,9 @@ socket.on('clear', async d => {
     _destroyCharts();
     document.getElementById('feed-body').innerHTML =
       '<tr id="feed-ph"><td colspan="9" class="no-feed">Waiting for fills…</td></tr>';
-    fillCount = 0;
+    fillCount = 0; _feedPage = 0;
     document.getElementById('feed-cnt').textContent = '0 fills';
+    _applyFeedPagination();
     document.getElementById('stats-content').innerHTML =
       '<div class="no-stats">Select a wallet to see advanced stats</div>';
     showToast('All wallets cleared', 'Sessions restarted from starting balance', '⟳');

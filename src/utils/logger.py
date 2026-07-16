@@ -12,7 +12,15 @@ def setup_logger(log_file: str = "./logs/trading.log", log_level: str = "INFO"):
     
     # Remove default handler
     logger.remove()
-    
+
+    # BUG FIX: Windows' console defaults to the cp1252 codepage, which can't
+    # encode characters like "→" — any log line containing one previously
+    # crashed loguru's stdout sink (UnicodeEncodeError) instead of just
+    # printing it. errors="replace" makes an unencodable character degrade to
+    # "?" instead of taking down logging entirely.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
+
     # Add console handler with colors
     logger.add(
         sys.stdout,

@@ -175,7 +175,7 @@ header{
 
 /* KPI strip */
 .kpi-bar{
-  display:grid;grid-template-columns:repeat(6,1fr);flex-shrink:0;
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(115px,1fr));flex-shrink:0;
   background:var(--s1);border-bottom:1px solid var(--hr)
 }
 .kpi{padding:11px 16px;border-right:1px solid var(--hr);position:relative;overflow:hidden}
@@ -311,6 +311,11 @@ header{
 .ftbl tr:hover td{background:var(--s2)}
 .fnew td{animation:fslide .2s ease}
 @keyframes fslide{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:translateY(0)}}
+.feed-pager{display:flex;align-items:center;justify-content:center;gap:12px;padding:8px;border-top:1px solid var(--hr);flex-shrink:0}
+.feed-pager button{background:var(--s2);border:1px solid var(--hr);color:var(--t2);border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;transition:background .2s var(--ease)}
+.feed-pager button:hover:not(:disabled){background:var(--s3)}
+.feed-pager button:disabled{opacity:.4;cursor:default}
+.feed-pager span{font-size:11px;color:var(--t3)}
 .dc{display:inline-block;padding:2px 7px;border-radius:4px;font-size:9px;font-weight:600;white-space:nowrap}
 .d-ol{background:var(--green-a);color:var(--green);border:1px solid var(--green-b)}
 .d-os{background:var(--red-a);color:var(--red);border:1px solid var(--red-b)}
@@ -513,6 +518,9 @@ header{
 .sb-overlay{display:none;position:fixed;top:52px;left:0;right:0;bottom:0;z-index:49;background:rgba(0,0,0,.5)}
 .sb-overlay.sb-open{display:block}
 
+/* Bottom wallet-switcher bar — mobile only, see the 768px block below */
+.mobile-tabbar{display:none}
+
 /* ── Mobile — 768px ── */
 @media(max-width:768px){
   /* Keep body fixed at 100vh — .main scrolls internally */
@@ -538,15 +546,30 @@ header{
   header{gap:8px;padding:0 12px}
   .h-right{gap:6px}
 
-  /* KPI bar: 3 columns */
-  .kpi-bar{grid-template-columns:repeat(3,1fr)}
   .kpi{padding:10px 12px}
   .kpi-val{font-size:15px}
   .kpi-lbl{font-size:8px}
   .kpi-sub{font-size:9px}
 
-  /* Main: scrollable column */
-  .main{overflow-y:auto;grid-row:2}
+  /* Main: scrollable column, leave room for the bottom tabbar */
+  .main{overflow-y:auto;grid-row:2;padding-bottom:56px}
+
+  /* Bottom wallet-switcher bar — one-tap switching without opening the drawer */
+  .mobile-tabbar{
+    display:flex;position:fixed;left:0;right:0;bottom:0;z-index:48;
+    background:var(--s1);border-top:1px solid var(--hr);
+    overflow-x:auto;padding:6px 8px;gap:6px
+  }
+  .mtab{
+    flex:0 0 auto;display:flex;flex-direction:column;align-items:center;gap:2px;
+    background:transparent;border:1px solid transparent;border-radius:8px;
+    padding:4px 10px;color:var(--t2);cursor:pointer;transition:background .2s var(--ease)
+  }
+  .mtab.on{background:var(--s3);border-color:var(--hr)}
+  .mtab-dot{width:6px;height:6px;border-radius:50%}
+  .mtab-init{font-size:11px;font-weight:700;font-family:var(--mono)}
+  .mtab-ret{font-size:8px;font-family:var(--mono)}
+  .mtab-ret.pos{color:var(--green)} .mtab-ret.neg{color:var(--red)} .mtab-ret.z{color:var(--t3)}
 
   /* Content grid: single column, fixed panel heights */
   .content-grid{
@@ -575,7 +598,6 @@ header{
 
 /* ── Mobile — 480px (small phones) ── */
 @media(max-width:480px){
-  /* KPI bar: 2 columns */
   .kpi-bar{grid-template-columns:repeat(2,1fr)}
   .kpi-val{font-size:13px}
 }
@@ -619,6 +641,7 @@ header{
   </div>
 </aside>
 <div class="sb-overlay" id="sb-overlay" onclick="closeSidebar()"></div>
+<nav class="mobile-tabbar" id="mobile-tabbar"></nav>
 
 <!-- ── Main ── -->
 <div class="main">
@@ -631,6 +654,9 @@ header{
     <div class="kpi" id="kc-p"><div class="kpi-lbl">Realized PnL</div><div class="kpi-val mono" id="kv-p">—</div><div class="kpi-sub mono" id="ks-p"></div></div>
     <div class="kpi" id="kc-w"><div class="kpi-lbl">Win Rate</div><div class="kpi-val mono" id="kv-w">—</div><div class="kpi-sub mono" id="ks-w"></div></div>
     <div class="kpi" id="kc-t"><div class="kpi-lbl">Trades</div><div class="kpi-val mono" id="kv-t">—</div><div class="kpi-sub mono" id="ks-t"></div></div>
+    <div class="kpi" id="kc-f"><div class="kpi-lbl">Fees Paid</div><div class="kpi-val mono" id="kv-f">—</div><div class="kpi-sub mono" id="ks-f"></div></div>
+    <div class="kpi" id="kc-sh"><div class="kpi-lbl">Sharpe</div><div class="kpi-val mono" id="kv-sh">—</div><div class="kpi-sub mono" id="ks-sh"></div></div>
+    <div class="kpi" id="kc-dd"><div class="kpi-lbl">Max Drawdown</div><div class="kpi-val mono" id="kv-dd">—</div><div class="kpi-sub mono" id="ks-dd"></div></div>
   </div>
 
   <!-- Content grid: chart + stats + positions + feed -->
@@ -643,8 +669,8 @@ header{
         <div style="display:flex;align-items:center;gap:6px">
           <div class="range-row">
             <span class="rp" data-h="1"   onclick="setRange(this)">1H</span>
-            <span class="rp" data-h="4"   onclick="setRange(this)">4H</span>
-            <span class="rp on" data-h="24" onclick="setRange(this)">1D</span>
+            <span class="rp" data-h="6"   onclick="setRange(this)">6H</span>
+            <span class="rp on" data-h="24" onclick="setRange(this)">24H</span>
             <span class="rp" data-h="168" onclick="setRange(this)">7D</span>
             <span class="rp" data-h="0"   onclick="setRange(this)">ALL</span>
           </div>
@@ -712,6 +738,11 @@ header{
             <tr id="feed-ph"><td colspan="9" class="no-feed">Waiting for fills…</td></tr>
           </tbody>
         </table>
+      </div>
+      <div class="feed-pager">
+        <button onclick="feedPage(-1)" id="feed-prev">‹ Prev</button>
+        <span id="feed-page-lbl" class="mono">1 / 1</span>
+        <button onclick="feedPage(1)" id="feed-next">Next ›</button>
       </div>
     </div>
 
