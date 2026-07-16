@@ -34,12 +34,6 @@ function curWallet() {
 }
 let compareMode  = false;
 let rangeHours   = 24;
-// Cap for the "ALL history" range (rangeHours===0). EquitySnapshot rows are
-// never pruned server-side (kept forever, ticking every 3s) — this is purely
-// an interactive-chart fetch/render safety net, not a retention limit, so
-// "ALL" here means "last 90 days", not literally every row ever recorded.
-// The full unbounded history is always available via /api/export/equity/<wallet>.
-const MAX_HISTORY_HOURS = 90 * 24;
 let chart        = null;
 let pnlChart     = null;
 let underwaterChart    = null;
@@ -841,7 +835,10 @@ async function loadStats(addr) {
     const isCur = !compareMode && (activeWallet||Object.keys(state)[0]) === addr;
     if (isCur) renderStats(st);
     if (compareMode) _scheduleComparePanelRender(); // refresh active tab, not just leaderboard
-  } catch(e) { console.warn('loadStats', e); }
+  } catch(e) {
+    console.warn('loadStats', e);
+    showToast('Failed to load stats', addr.slice(0,8), '⚠');
+  }
 }
 
 function renderStats(st) {
@@ -1416,7 +1413,6 @@ function renderLeaderboardInto(el) {
   </table>
   </div>`;
 }
-function renderLeaderboard() { renderLeaderboardInto(document.getElementById('stats-content')); }
 
 // -- Side-by-side stats table --
 const ALL_STATS_METRICS = [
@@ -1499,7 +1495,6 @@ function renderStatsTableInto(el) {
   </table>
   </div>`;
 }
-function renderStatsTable() { renderStatsTableInto(document.getElementById('stats-content')); }
 
 // -- Correlation heatmap --
 function renderCorrelationInto(el) {
@@ -1543,7 +1538,6 @@ function renderCorrelationInto(el) {
     <div style="margin-top:10px;font-size:10px;color:var(--t3)">Green = moves together · Red = moves opposite · Based on equity return series</div>
   </div>`;
 }
-function renderCorrelation() { renderCorrelationInto(document.getElementById('stats-content')); }
 
 // ── PnL Calendar Heatmap (pure SVG/DOM — no Chart.js) ─────────────────────
 function _renderPnlHeatmap(pnlByDay) {
@@ -1783,18 +1777,23 @@ function renderHistChart(data) {
 }
 
 // ── Data loading ───────────────────────────────────────────────────────────
-async function loadHistory(addr) {
+// hours=0 = full retained history, no time cutoff — the server downsamples to
+// a fixed point budget regardless of how long the wallet has been running, so
+// there's no client-side retention cap here and no need to couple this fetch
+// to whatever range happened to be selected at the moment this wallet was
+// first discovered. filteredHistory() slices this client-side per rangeHours.
+async function loadHistory(addr, _retried=false) {
   try {
-    // Always fetch the full window (server downsamples to a fixed point budget) —
-    // filteredHistory() already slices client-side per the active rangeHours, so
-    // there's no need to couple this fetch to whatever range happened to be
-    // selected at the moment this wallet was first discovered.
-    const r = await fetchT(`/api/history/${addr}?hours=${MAX_HISTORY_HOURS}`);
+    const r = await fetchT(`/api/history/${addr}?hours=0`);
     const d = await r.json();
     if (state[addr]) state[addr]._history = d;
   } catch(e) {
+    if (!_retried) return loadHistory(addr, true);
     console.warn('loadHistory', e);
     showToast('Failed to load chart history', addr.slice(0,8), '⚠');
+    // Deliberately leave any previously-loaded _history in place rather than
+    // clearing it — a transient fetch failure should never blank a chart
+    // that already has data on screen.
   }
 }
 
@@ -1877,14 +1876,6 @@ async function togglePause() {
   if (!addr) return;
   const action = state[addr]?.is_paused ? 'resume' : 'pause';
   await fetchT(`/api/${action}/${addr}`, {method:'POST'});
-}
-
-async function clearSelected() {
-  const addr = curWallet();
-  if (!addr) return;
-  const lbl = state[addr]?.label || addr;
-  if (!confirm(`Clear all data for "${lbl}"?\n\nThis permanently removes all trade history and equity snapshots from the database and resets the simulated balance to ${fUsd(state[addr]?.start_balance)}.`)) return;
-  await fetchT(`/api/reset/${addr}`, {method:'POST'});
 }
 
 async function resetWallet(addr) {
@@ -2090,14 +2081,43 @@ async function addTestWallets() {
 }
 
 // ── SocketIO events ────────────────────────────────────────────────────────
+// BUG FIX: the chart used to only rebuild from cached in-memory data across a
+// reconnect — fine for a brief blip, but any gap long enough to miss
+// equity_ticks (server restart, laptop sleep, flaky wifi) left the chart
+// silently stale with no way to notice. On every reconnect (never on the very
+// first connect — there's nothing to resync yet) we now re-fetch full history
+// from the DB for every known wallet and rebuild their charts from scratch,
+// per the "never rely on cached array" requirement.
+let _hasConnectedBefore = false;
 socket.on('connect', () => {
   const el=document.getElementById('conn-dot');
   el.textContent='● connected'; el.className='conn-dot ok';
+  if (_hasConnectedBefore) resyncAllHistory();
+  _hasConnectedBefore = true;
 });
 socket.on('disconnect', () => {
   const el=document.getElementById('conn-dot');
   el.textContent='○ disconnected'; el.className='conn-dot';
 });
+
+// Re-fetches full equity history for every known wallet and rebuilds whatever
+// chart is currently on screen. Used on reconnect and by the periodic resync
+// below — both exist to fix the same class of bug: a tab left open for a long
+// time (hours to months) must never show a truncated or stale timeline.
+async function resyncAllHistory() {
+  const addrs = Object.keys(state);
+  await Promise.all(addrs.map(a => loadHistory(a)));
+  rebuildChart();
+  addrs.forEach(loadStats);
+}
+
+// Independent of reconnects: the client-side history array is capped at 5000
+// points (addEquityPoint) purely as a memory guard against an open-for-months
+// tab accumulating unbounded live ticks. Left alone, that cap would silently
+// evict old history the same way a missed reconnect would. Periodically
+// replacing it with a fresh server-downsampled full-range fetch keeps the
+// full timeline intact indefinitely instead of eroding to a recent window.
+setInterval(resyncAllHistory, 30 * 60 * 1000);
 
 // Each wallet ticks independently every ~3s, so with N wallets a naive render
 // on every state_update is O(N) DOM work fired N times per tick window — O(N²).

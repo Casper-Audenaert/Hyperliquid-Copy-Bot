@@ -26,11 +26,10 @@ from config.settings import settings
 from hyperliquid.client import HyperliquidClient, get_startup_sem
 from hyperliquid.models import PositionSide
 from copy_engine.monitor import WalletMonitor
-from copy_engine.executor import TradeExecutor
 from copy_engine.position_sizer import PositionSizer
 from web.db import (
     db_record_fill, db_record_close, db_snapshot_equity, db_update_latest_funding,
-    db_get_trades, purge_wallet_data, purge_equity_snapshots,
+    purge_equity_snapshots,
     db_get_latest_equity_snapshot, db_restore_session_counters,
     db_get_known_fill_ids, db_update_trade_equity,
     db_upsert_position, db_delete_position, db_load_positions,
@@ -89,7 +88,6 @@ class WalletSession:
     address: str
     label: str
     monitor: WalletMonitor
-    executor: TradeExecutor
     position_sizer: PositionSizer
     client: HyperliquidClient
 
@@ -1533,11 +1531,10 @@ def _create_session(address: str, label: str, start_balance: float = None,
     balance = float(start_balance) if start_balance else settings.simulated_account_balance
     client  = HyperliquidClient(settings.hyperliquid.api_url)
     monitor = WalletMonitor(address, settings.hyperliquid.api_url, settings.hyperliquid.ws_url)
-    executor = TradeExecutor()
     sizer = PositionSizer()
     session = WalletSession(
         address=address, label=label,
-        monitor=monitor, executor=executor, position_sizer=sizer, client=client,
+        monitor=monitor, position_sizer=sizer, client=client,
         simulated_balance=balance, start_balance=balance,
         bot_start_time=datetime.now(),
         copy_mode=copy_mode, debounce_secs=debounce_secs, detected_style=detected_style,
