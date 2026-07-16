@@ -719,9 +719,10 @@ def _despike(rows: list) -> list:
 _EQUITY_HISTORY_MAX_POINTS = 2000
 
 
-def db_get_equity_history(wallet_addr: str, hours: int = 0) -> list:
-    """Returns the wallet's equity history, downsampled to at most
-    _EQUITY_HISTORY_MAX_POINTS points spanning the full requested time range.
+def db_get_equity_history(wallet_addr: str, hours: int = 0,
+                          max_points: int = _EQUITY_HISTORY_MAX_POINTS) -> list:
+    """Returns the wallet's equity history, downsampled to at most max_points
+    points spanning the full requested time range.
 
     hours=0 (default) means "no time cutoff" — the entire retained history,
     not just a recent window. Downsampling happens in SQL (bucket by rowid,
@@ -749,12 +750,12 @@ def db_get_equity_history(wallet_addr: str, hours: int = 0) -> list:
 
         q = db.query(EquitySnapshot.timestamp, EquitySnapshot.equity,
                       EquitySnapshot.balance, EquitySnapshot.upnl).filter(*filters)
-        if count > _EQUITY_HISTORY_MAX_POINTS:
+        if count > max_points:
             # One representative row per bucket, chosen via rowid modulo — id is
             # SQLite's implicit rowid, so this predicate is evaluated against the
             # index itself and only the ~max_points accepted rows need a table
             # lookup for equity/balance/upnl.
-            bucket_size = max(1, (max_id - min_id + 1) // _EQUITY_HISTORY_MAX_POINTS)
+            bucket_size = max(1, (max_id - min_id + 1) // max_points)
             q = q.filter((EquitySnapshot.id - min_id) % bucket_size == 0)
         rows = q.order_by(EquitySnapshot.timestamp).all()
 

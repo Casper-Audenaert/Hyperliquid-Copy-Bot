@@ -157,6 +157,19 @@ def api_state():
     return jsonify([_session_to_dict(s) for s in list(_sessions.values())])
 
 
+@app.route("/api/full-state")
+def api_full_state():
+    """All sessions plus each one's recent equity history in a single call —
+    used on initial page load so an N-wallet dashboard doesn't need N separate
+    /api/history round-trips just to draw the first frame."""
+    out = []
+    for s in list(_sessions.values()):
+        d = _session_to_dict(s)
+        d["history"] = db_get_equity_history(s.address, hours=0, max_points=500)
+        out.append(d)
+    return jsonify(out)
+
+
 @app.route("/api/history/<wallet>")
 def api_history(wallet):
     # hours=0 (default) = full retained history, not just a recent window —

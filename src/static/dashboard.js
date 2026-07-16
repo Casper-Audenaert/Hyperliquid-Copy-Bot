@@ -81,6 +81,15 @@ function showToast(msg, sub='', icon='✓', duration=4000) {
   _toastTimer = setTimeout(() => el.classList.remove('show'), duration);
 }
 
+// A malformed/partial API payload throwing inside one chart's render function
+// shouldn't take the rest of the tearsheet down with it (uncaught exceptions
+// abort the rest of whatever synchronous function called them). Wrap each
+// individual chart render call in this rather than hoping every field is
+// always present and well-typed.
+function safeRender(label, fn) {
+  try { fn(); } catch(e) { console.error(`Chart render failed: ${label}`, e); }
+}
+
 // ── Theme ──────────────────────────────────────────────────────────────────
 function getCssVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -225,7 +234,9 @@ function computeUnderwaterData(history) {
   });
 }
 
-function renderUnderwaterChart(addr) {
+function renderUnderwaterChart(addr) { safeRender('drawdown chart', () => _renderUnderwaterChartImpl(addr)); }
+
+function _renderUnderwaterChartImpl(addr) {
   const canvas = document.getElementById('dd-canvas');
   if (!canvas) return;
   if (underwaterChart) { underwaterChart.destroy(); underwaterChart = null; }
@@ -353,7 +364,12 @@ function corrColor(r) {
   return `rgba(${red},${g},100,0.55)`;
 }
 
-function rebuildChart() {
+// Thin wrapper so a malformed history point (bad timestamp, NaN equity, etc.)
+// can't throw uncaught and leave the equity chart — the single most
+// important piece of this dashboard — stuck mid-update.
+function rebuildChart() { safeRender('equity chart', _rebuildChartImpl); }
+
+function _rebuildChartImpl() {
   if (!chart) return;
   const cur   = curWallet();
   const addrs = compareMode ? [...compareSelection] : (cur ? [cur] : []);
@@ -936,7 +952,22 @@ async function loadStats(addr) {
   }
 }
 
+// Thin wrapper: the tearsheet template below reads dozens of fields off a
+// single API response in one big expression, so one unexpected shape (a
+// missing key, an array where a number was expected) would otherwise throw
+// uncaught and leave the tearsheet stuck on stale content with every chart
+// render call after it silently skipped.
 function renderStats(st) {
+  try {
+    _renderStatsImpl(st);
+  } catch(e) {
+    console.error('Tearsheet render failed', e);
+    const el = document.getElementById('stats-content');
+    if (el) el.innerHTML = '<div class="no-stats">Failed to render stats — check console for details.</div>';
+  }
+}
+
+function _renderStatsImpl(st) {
   if (!st) return;
   const el   = document.getElementById('stats-content');
   const addr = curWallet() || '';
@@ -1216,16 +1247,16 @@ function renderStats(st) {
     </div>` : ''}
   `;
 
-  if (pnlByDay.length)              renderPnlChart(pnlByDay);
-  if (weeklyPnl.length > 1)        renderWeeklyPnlChart(weeklyPnl);
-  if (monthlyPnl.length > 1)       renderMonthlyPnlChart(monthlyPnl);
-  if (dailyTradeCounts.length > 1)  renderDailyTradeCountChart(dailyTradeCounts);
-  if (rollingWinrate.length)        renderWinRateChart(rollingWinrate);
-  if (rollingSharp.length)          renderSharpSeriesChart(rollingSharp);
-  if (symbolPnl.length)             renderSymPnlChart(symbolPnl);
-  if (pnlHistogram.length)          renderHistChart(pnlHistogram);
+  if (pnlByDay.length)              safeRender('daily PnL', () => renderPnlChart(pnlByDay));
+  if (weeklyPnl.length > 1)        safeRender('weekly PnL', () => renderWeeklyPnlChart(weeklyPnl));
+  if (monthlyPnl.length > 1)       safeRender('monthly PnL', () => renderMonthlyPnlChart(monthlyPnl));
+  if (dailyTradeCounts.length > 1)  safeRender('daily trade count', () => renderDailyTradeCountChart(dailyTradeCounts));
+  if (rollingWinrate.length)        safeRender('rolling win rate', () => renderWinRateChart(rollingWinrate));
+  if (rollingSharp.length)          safeRender('rolling Sharpe', () => renderSharpSeriesChart(rollingSharp));
+  if (symbolPnl.length)             safeRender('symbol PnL', () => renderSymPnlChart(symbolPnl));
+  if (pnlHistogram.length)          safeRender('PnL histogram', () => renderHistChart(pnlHistogram));
 
-  renderDecisionWidget(st, addr);
+  safeRender('decision widget', () => renderDecisionWidget(st, addr));
 }
 
 // ── Copy decision indicator (gauge widget) ──────────────────────────────
@@ -1316,7 +1347,9 @@ setInterval(() => {
 }, 1000);
 
 // ── Compare panel — wallet stat cards ────────────────────────────────────
-function renderComparePanel() {
+function renderComparePanel() { safeRender('compare panel', _renderComparePanelImpl); }
+
+function _renderComparePanelImpl() {
   if (!compareMode) return;
   document.getElementById('stats-title').textContent = 'Compare';
   renderCmpTabs();
@@ -2072,13 +2105,25 @@ async function togglePause() {
   const addr = curWallet();
   if (!addr) return;
   const action = state[addr]?.is_paused ? 'resume' : 'pause';
-  await fetchT(`/api/${action}/${addr}`, {method:'POST'});
+  try {
+    const r = await fetchT(`/api/${action}/${addr}`, {method:'POST'});
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  } catch(e) {
+    console.warn('togglePause', e);
+    showToast(`Failed to ${action}`, state[addr]?.label || addr, '⚠');
+  }
 }
 
 async function resetWallet(addr) {
   const lbl = state[addr]?.label || addr;
   if (!confirm(`Clear all data for "${lbl}"?\n\nThis permanently removes all trade history and equity snapshots from the database and resets to ${fUsd(state[addr]?.start_balance)}.`)) return;
-  await fetchT(`/api/reset/${addr}`, {method:'POST'});
+  try {
+    const r = await fetchT(`/api/reset/${addr}`, {method:'POST'});
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  } catch(e) {
+    console.warn('resetWallet', e);
+    showToast('Failed to reset wallet', lbl, '⚠');
+  }
 }
 
 async function removeWallet(addr) {
@@ -2229,9 +2274,14 @@ async function addWallet() {
 
 // ── Test Wallets Modal ────────────────────────────────────────────────────
 async function openTestModal() {
-  const res = await fetchT('/api/test-wallets');
-  const { wallets } = await res.json();
-  document.getElementById('tw-addrs').value = wallets.join('\n');
+  try {
+    const res = await fetchT('/api/test-wallets');
+    const { wallets } = await res.json();
+    document.getElementById('tw-addrs').value = wallets.join('\n');
+  } catch(e) {
+    console.warn('openTestModal', e);
+    showToast('Failed to load test wallets', '', '⚠');
+  }
   document.getElementById('tw-bal').value = '';
   document.getElementById('tw-merr').classList.remove('show');
   document.getElementById('tw-mbg').classList.add('open');
@@ -2333,17 +2383,50 @@ function _scheduleStateRender() {
 
 socket.on('state_update', s => {
   const isNew = !state[s.address];
+  // History-loading is gated on "do we have chart data for this wallet yet",
+  // not strictly on isNew — loadFullState() (called once at page init) can
+  // win the race and populate _history before this socket event ever fires
+  // for a given wallet, and there's no way to guarantee which resolves
+  // first (both are independently-timed async round-trips). Gating on
+  // _history presence makes the redundant-fetch avoidance correct either
+  // way instead of depending on load order.
+  const hadHistory = !!state[s.address]?._history;
   state[s.address] = {...(state[s.address]||{}), ...s};
   if (isNew) {
     if (compareMode) compareSelection.add(s.address);
-    loadHistory(s.address).then(()=>{ if (s.address === curWallet()) rebuildChart(); });
     loadStats(s.address);
     // Only load trades for the wallet that will actually be displayed;
     // selectWallet() handles it for any wallet the user explicitly clicks.
     if (!activeWallet && Object.keys(state).length === 1) loadTrades(s.address);
   }
+  if (!hadHistory) {
+    loadHistory(s.address).then(()=>{ if (s.address === curWallet()) rebuildChart(); });
+  }
   _scheduleStateRender();
 });
+
+// Fetches all sessions + each one's recent equity history in a single call —
+// avoids N separate /api/history round-trips on initial page load. Runs once
+// at boot; live updates continue via the state_update/equity_tick sockets.
+async function loadFullState() {
+  try {
+    const r    = await fetchT('/api/full-state');
+    const rows = await r.json();
+    let touchedChart = false;
+    rows.forEach(d => {
+      const { history, ...s } = d;
+      const hadHistory = !!state[s.address]?._history;
+      state[s.address] = {...(state[s.address]||{}), ...s};
+      if (!hadHistory) { state[s.address]._history = history; touchedChart = true; }
+    });
+    if (touchedChart) rebuildChart();
+    _scheduleStateRender();
+  } catch(e) {
+    console.warn('loadFullState', e);
+    // Non-fatal: the socket-driven state_update/loadHistory path below still
+    // hydrates everything on its own, just via N calls instead of one.
+  }
+}
 
 socket.on('fill', f => {
   const fill = {...f, timestamp: f.timestamp || new Date().toISOString()};
@@ -2532,6 +2615,7 @@ setInterval(() => {
 
 // ── Init ───────────────────────────────────────────────────────────────────
 initChart();
+loadFullState();
 
 // One-time load-in animation for the main panels — runs once per page load
 // (this file's top-level code executes exactly once), never replays on
