@@ -83,6 +83,25 @@ class StartupSeedingPolicy(BaseModel):
     allow_seed_small: bool = True                 # use SEED_SMALL for borderline positions
     ghost_on_failed_seed: bool = True             # ghost instead of ignoring failed seed orders
 
+def _parse_csv_env(raw: str) -> list[str]:
+    """Parse a comma-separated env var into a stripped, non-empty item list.
+
+    BUG FIX: python-dotenv only strips a trailing `# comment` when the value
+    before it is non-empty (e.g. `KEY=x  # comment` -> "x"); for an EMPTY
+    value followed by a comment (`KEY=  # comment`), it returns the comment
+    text itself as the literal value instead of "". That silently turned
+    `BLOCKED_ASSETS=  # Comma-separated list of assets to NOT copy (e.g.,
+    BTC,ETH,SOL)` into blocked_assets=["...NOT COPY (E.G.", "BTC", "ETH",
+    "SOL)"] — every BTC and ETH fill for every wallet was silently treated
+    as a blocked asset and never copied. Stripping any `#...` suffix here
+    (in addition to fixing the .env file itself) makes every comma-list env
+    var immune to this whole class of misconfiguration, not just this one
+    instance of it.
+    """
+    value = raw.split("#", 1)[0]
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 def _validate_eth_address(v: Optional[str], field_name: str) -> Optional[str]:
     """Validate Ethereum address format."""
     if not v:
@@ -157,12 +176,10 @@ class Settings(BaseModel):
         settings.target_wallet = os.getenv('TARGET_WALLET_ADDRESS', settings.target_wallet)
 
         # Multi-wallet support (web dashboard)
-        wallets_env = os.getenv('TARGET_WALLETS', '')
-        settings.target_wallets = [w.strip() for w in wallets_env.split(',') if w.strip()]
+        settings.target_wallets = _parse_csv_env(os.getenv('TARGET_WALLETS', ''))
         if not settings.target_wallets and settings.target_wallet:
             settings.target_wallets = [settings.target_wallet]
-        labels_env = os.getenv('WALLET_LABELS', '')
-        settings.wallet_labels = [l.strip() for l in labels_env.split(',') if l.strip()]
+        settings.wallet_labels = _parse_csv_env(os.getenv('WALLET_LABELS', ''))
 
         # Wallets are managed via the GUI/DB — no wallet env var required at startup
         if not settings.target_wallet and settings.target_wallets:
@@ -204,9 +221,8 @@ class Settings(BaseModel):
         settings.copy_rules.max_account_equity = None if max_equity.lower() == 'x' else float(max_equity)
         
         # Blocked assets
-        blocked = os.getenv('BLOCKED_ASSETS', '')
         settings.copy_rules.blocked_assets = [
-            asset.strip().upper() for asset in blocked.split(',') if asset.strip()
+            asset.upper() for asset in _parse_csv_env(os.getenv('BLOCKED_ASSETS', ''))
         ]
         
         settings.telegram.bot_token = os.getenv('TELEGRAM_BOT_TOKEN')

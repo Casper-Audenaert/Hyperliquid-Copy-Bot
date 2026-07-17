@@ -449,18 +449,29 @@ async def _fetch_target_fills(session: WalletSession, limit: int = 50) -> list:
     fills = sorted(result, key=lambda f: f.get("timestamp", ""), reverse=True)
     fills = fills[:limit]
 
-    # Seed DB so /api/trades always has data from session start, not just after first live fill
-    for f in fills:
-        fid = f.get("fill_id", "")
-        if fid and fid not in session._processed_fill_ids:
-            db_record_fill(
-                session.address, session.label, fid,
-                f["symbol"], f["direction"], f["side"],
-                f["size"], f["price"], 1,
-                fee=0.0, is_seed=True,
-            )
+    # Seed DB so /api/trades always has data from session start, not just after
+    # first live fill. Batched into one to_thread call (not one per fill) —
+    # this can be dozens of rows at startup and each db_record_fill opens its
+    # own DB session; running the whole loop on a worker thread keeps a busy
+    # 14-wallet startup off the event loop without spawning dozens of threads.
+    to_seed = [f for f in fills if f.get("fill_id") and f["fill_id"] not in session._processed_fill_ids]
+    if to_seed:
+        await asyncio.to_thread(_seed_fill_records_sync, session, to_seed)
 
     return fills
+
+
+def _seed_fill_records_sync(session: "WalletSession", entries: list) -> None:
+    """Synchronous body for the startup fill-seeding loop above — run via
+    asyncio.to_thread so a wallet with a long fill history doesn't block the
+    event loop while it writes each row."""
+    for f in entries:
+        db_record_fill(
+            session.address, session.label, f["fill_id"],
+            f["symbol"], f["direction"], f["side"],
+            f["size"], f["price"], 1,
+            fee=0.0, is_seed=True,
+        )
 
 
 # ── Core fill processor ───────────────────────────────────────────────────────
@@ -775,6 +786,18 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
                 target_pos_size = _p.size
                 break
 
+    # Set inside the lock below (pure in-memory _equity_from_cache read) but the
+    # actual DB write is deferred until AFTER the lock is released — BUG FIX:
+    # this used to run `await asyncio.to_thread(db_snapshot_equity, ...)` while
+    # still holding _state_lock, so under DB contention (14 wallets writing
+    # concurrently, WAL busy_timeout=5s) a slow snapshot write could stall this
+    # wallet's entire fill pipeline for up to 5s — every subsequent fill for
+    # the SAME wallet blocks trying to acquire the lock this write is holding.
+    # The equity values themselves are unaffected by writing them slightly
+    # later: they're a point-in-time snapshot already fully computed while the
+    # lock was held, not re-read at write time.
+    _pending_snapshot: Optional[tuple] = None
+
     async with session._state_lock:
         # Re-check dedup INSIDE the lock: on_order_fill's pre-lock check (top of this
         # function's caller) only protects against a fill that arrived twice AFTER the
@@ -870,7 +893,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             if pnl < 0:
                 _record_loss(session, abs(pnl))  # track daily loss for stats only — no auto-pause
             _eq, _bal, _snap_upnl = _equity_from_cache(session)
-            await asyncio.to_thread(db_snapshot_equity, session.address, _eq, _bal, _snap_upnl, session.total_funding_paid)
+            _pending_snapshot = (_eq, _bal, _snap_upnl, session.total_funding_paid)
             session._last_fill_snap_ts = time.monotonic()
 
         elif is_closing and not is_flip:
@@ -903,7 +926,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
                     await asyncio.to_thread(db_record_close, session.address, symbol, opnl)
                     pnl_realized = opnl
                     _eq, _bal, _snap_upnl = _equity_from_cache(session)
-                    await asyncio.to_thread(db_snapshot_equity, session.address, _eq, _bal, _snap_upnl, session.total_funding_paid)
+                    _pending_snapshot = (_eq, _bal, _snap_upnl, session.total_funding_paid)
                     session._last_fill_snap_ts = time.monotonic()
 
             position_value = our_size * price
@@ -1010,6 +1033,11 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
         # matter, but correctness shouldn't depend on chasing every deduction site.
         session.simulated_balance = max(session.simulated_balance, 0.0)
 
+    # Lock released above — now safe to do the (possibly slow, DB-contended)
+    # equity snapshot write without blocking this wallet's next fill.
+    if _pending_snapshot is not None:
+        await asyncio.to_thread(db_snapshot_equity, session.address, *_pending_snapshot)
+
     # Emit outside lock
     # Force a fresh allMids fetch so _upnl() prices are accurate at fill time.
     # Without this, _mids_cache can be up to 3 s stale; on high-leverage positions
@@ -1088,7 +1116,7 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
         # Ghost guard: target closed a position we chose not to track — clean up ghost state.
         if symbol in session.ghost_positions:
             session.ghost_positions.pop(symbol)
-            db_delete_ghost(session.address, symbol)
+            await asyncio.to_thread(db_delete_ghost, session.address, symbol)
             logger.debug(f"[{session.label}] Ghost {symbol} closed (position_close event) — removed")
             return
 
@@ -1112,6 +1140,7 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
             logger.warning(f"[{session.label}] on_position_close: no price for {symbol}, skipping PnL")
             return
 
+        _pending_snapshot: Optional[tuple] = None
         async with session._state_lock:
             if symbol not in session.simulated_positions:
                 return
@@ -1141,12 +1170,18 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
             del session.simulated_positions[symbol]
             await asyncio.to_thread(db_delete_position, session.address, symbol)
             await asyncio.to_thread(db_record_close, session.address, symbol, pnl)
+            # Snapshot values computed here (in-memory, under the lock); the
+            # actual DB write is deferred until after the lock is released —
+            # see the matching note in _process_fill for why.
             _eq, _bal, _snap_upnl = _equity_from_cache(session)
-            await asyncio.to_thread(db_snapshot_equity, session.address, _eq, _bal, _snap_upnl, session.total_funding_paid)
+            _pending_snapshot = (_eq, _bal, _snap_upnl, session.total_funding_paid)
             session._last_fill_snap_ts = time.monotonic()
 
             if pnl < 0:
                 _record_loss(session, abs(pnl))  # track daily loss for stats only — no auto-pause
+
+        if _pending_snapshot is not None:
+            await asyncio.to_thread(db_snapshot_equity, session.address, *_pending_snapshot)
 
         emit_fn("position_close", {"wallet": session.address, "symbol": symbol, "pnl": round(pnl, 2)})
         emit_fn("state_update",   _session_to_dict(session))
@@ -1253,15 +1288,20 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
                     # no-ops and the open side is copied as a fresh entry with a
                     # freshly resolved ratio.
                     session.ghost_positions.pop(symbol)
-                    db_delete_ghost(session.address, symbol)
+                    await asyncio.to_thread(db_delete_ghost, session.address, symbol)
                     logger.info(f"[{session.label}] Ghost {symbol} flipped — copying new side as fresh entry")
                 else:
                     if _g_closing:
                         session.ghost_positions.pop(symbol)
-                        db_delete_ghost(session.address, symbol)
+                        await asyncio.to_thread(db_delete_ghost, session.address, symbol)
                         logger.debug(f"[{session.label}] Ghost {symbol} closed by target — removed")
                     else:
-                        db_upsert_ghost(session.address, symbol, ghost)
+                        # BUG FIX: this ran as a blocking synchronous DB call directly
+                        # on the event loop, on every single fill for an actively-traded
+                        # ghosted symbol (a target adding to a pre-existing position it
+                        # already held when we started tracking it) — a real hot path
+                        # for busy algorithmic wallets, not an edge case.
+                        await asyncio.to_thread(db_upsert_ghost, session.address, symbol, ghost)
                     session._processed_fill_ids[fill_id] = None
                     _evict_fill_ids(session)
                     return
@@ -1304,7 +1344,9 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
             pos["leverage"]    = our_new_lev
             pos["margin_used"] = new_margin
             session.simulated_balance -= margin_delta
-            db_upsert_position(session.address, symbol, pos)
+            # BUG FIX: this was a fully blocking synchronous DB call directly on
+            # the event loop (not even `await`ed) while holding _state_lock.
+            await asyncio.to_thread(db_upsert_position, session.address, symbol, pos)
             logger.info(
                 f"[{session.label}] {symbol} leverage {old_lev:.0f}→{new_lev:.0f}x "
                 f"(ours {our_new_lev}x), margin Δ${margin_delta:+.2f}"
@@ -1672,8 +1714,8 @@ async def _detect_trading_style(session: "WalletSession") -> None:
         f"({fills_per_hour:.1f} fills/hr, median_hold={session.median_hold_secs:.1f}s"
         f" → debounce={session.debounce_secs}s)"
     )
-    db_update_wallet_style(session.address, session.copy_mode,
-                           session.debounce_secs, session.detected_style)
+    await asyncio.to_thread(db_update_wallet_style, session.address, session.copy_mode,
+                            session.debounce_secs, session.detected_style)
 
 
 def _evict_fill_ids(session: "WalletSession") -> None:
@@ -1969,20 +2011,20 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
         # undead ghosts that silently absorbed the target's future re-opens.
         # (The enclosing `if state and state.balance > 0` already guarantees
         # the state fetch itself succeeded, so an empty list means truly flat.)
-        session.ghost_positions = db_load_ghosts(session.address)
+        session.ghost_positions = await asyncio.to_thread(db_load_ghosts, session.address)
         if session.ghost_positions:
             live_symbols = {p.symbol for p in state.positions}
             for sym in list(session.ghost_positions.keys()):
                 if sym not in live_symbols:
                     session.ghost_positions.pop(sym)
-                    db_delete_ghost(session.address, sym)
+                    await asyncio.to_thread(db_delete_ghost, session.address, sym)
                     logger.info(f"[{session.label}] Ghost {sym} no longer held by target — removed")
                 else:
                     for p in state.positions:
                         if p.symbol == sym:
                             session.ghost_positions[sym]["target_size"]   = abs(p.size)
                             session.ghost_positions[sym]["last_seen_at"]  = datetime.utcnow().isoformat(timespec='milliseconds')
-                            db_upsert_ghost(session.address, sym, session.ghost_positions[sym])
+                            await asyncio.to_thread(db_upsert_ghost, session.address, sym, session.ghost_positions[sym])
                             break
 
         # Only seed from target when there is no saved simulation state.
@@ -2034,7 +2076,7 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
                         "last_seen_at":       datetime.utcnow().isoformat(timespec='milliseconds'),
                     }
                     session.ghost_positions[pos.symbol] = ghost
-                    db_upsert_ghost(session.address, pos.symbol, ghost)
+                    await asyncio.to_thread(db_upsert_ghost, session.address, pos.symbol, ghost)
                     counts["GHOST_ONLY"] += 1
                     ghost_reasons["no_mark_price"] = ghost_reasons.get("no_mark_price", 0) + 1
                     continue
@@ -2063,7 +2105,7 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
                         "last_seen_at":       datetime.utcnow().isoformat(timespec='milliseconds'),
                     }
                     session.ghost_positions[pos.symbol] = ghost
-                    db_upsert_ghost(session.address, pos.symbol, ghost)
+                    await asyncio.to_thread(db_upsert_ghost, session.address, pos.symbol, ghost)
                     counts["GHOST_ONLY"] += 1
                     ghost_reasons[reason] = ghost_reasons.get(reason, 0) + 1
                     logger.debug(f"[{session.label}] Ghost {pos.symbol}: {reason}")
@@ -2100,10 +2142,11 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
                 session.total_fees_paid   += seed_fee
                 total_copied_notional     += pos_value
 
-                db_upsert_position(session.address, pos.symbol, seed_pos)
+                await asyncio.to_thread(db_upsert_position, session.address, pos.symbol, seed_pos)
                 ts_ms = int(datetime.now().timestamp() * 1000)
                 fill_id = f"seed_{pos.symbol}_{session.address[:8]}_{ts_ms}"
-                db_record_fill(
+                await asyncio.to_thread(
+                    db_record_fill,
                     session.address, session.label, fill_id,
                     pos.symbol,
                     "Open Long" if is_long else "Open Short",
@@ -2118,7 +2161,7 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
                     session.simulated_balance
                     + sum(p.get("margin_used", 0) for p in session.simulated_positions.values())
                 )
-                db_update_trade_equity(session.address, fill_id, round(_seed_running_equity, 2))
+                await asyncio.to_thread(db_update_trade_equity, session.address, fill_id, round(_seed_running_equity, 2))
                 # Emit fill event so the trade feed shows the seeded position —
                 # without this, positions appear in the panel but are invisible in the feed.
                 emit_fn("fill", {
@@ -2164,7 +2207,7 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
         "balance": round(session.simulated_balance, 2),
         "upnl": round(upnl, 2),
     })
-    db_snapshot_equity(session.address, eq, session.simulated_balance, upnl, session.total_funding_paid)
+    await asyncio.to_thread(db_snapshot_equity, session.address, eq, session.simulated_balance, upnl, session.total_funding_paid)
 
     cbs = make_callbacks(session, emit_fn)
     session.monitor.on_new_position    = cbs["on_new_position"]
@@ -2265,7 +2308,7 @@ async def _reinit_session_body(session: WalletSession, emit_fn: Callable):
                         "last_seen_at":       datetime.utcnow().isoformat(timespec='milliseconds'),
                     }
                     session.ghost_positions[pos.symbol] = ghost
-                    db_upsert_ghost(session.address, pos.symbol, ghost)
+                    await asyncio.to_thread(db_upsert_ghost, session.address, pos.symbol, ghost)
                     counts["GHOST_ONLY"] += 1
                     ghost_reasons["no_mark_price"] = ghost_reasons.get("no_mark_price", 0) + 1
                     continue
@@ -2291,7 +2334,7 @@ async def _reinit_session_body(session: WalletSession, emit_fn: Callable):
                         "last_seen_at":       datetime.utcnow().isoformat(timespec='milliseconds'),
                     }
                     session.ghost_positions[pos.symbol] = ghost
-                    db_upsert_ghost(session.address, pos.symbol, ghost)
+                    await asyncio.to_thread(db_upsert_ghost, session.address, pos.symbol, ghost)
                     counts["GHOST_ONLY"] += 1
                     ghost_reasons[reason] = ghost_reasons.get(reason, 0) + 1
                     continue
@@ -2321,10 +2364,11 @@ async def _reinit_session_body(session: WalletSession, emit_fn: Callable):
                 session.simulated_balance -= margin + seed_fee
                 session.total_fees_paid   += seed_fee
                 total_copied_notional     += pos_value
-                db_upsert_position(session.address, pos.symbol, reinit_pos)
+                await asyncio.to_thread(db_upsert_position, session.address, pos.symbol, reinit_pos)
                 ts_ms = int(datetime.now().timestamp() * 1000)
                 fill_id = f"seed_{pos.symbol}_{session.address[:8]}_{ts_ms}"
-                db_record_fill(
+                await asyncio.to_thread(
+                    db_record_fill,
                     session.address, session.label, fill_id,
                     pos.symbol,
                     "Open Long" if is_long else "Open Short",
@@ -2336,7 +2380,7 @@ async def _reinit_session_body(session: WalletSession, emit_fn: Callable):
                     session.simulated_balance
                     + sum(p.get("margin_used", 0) for p in session.simulated_positions.values())
                 )
-                db_update_trade_equity(session.address, fill_id, round(_seed_running_equity, 2))
+                await asyncio.to_thread(db_update_trade_equity, session.address, fill_id, round(_seed_running_equity, 2))
                 emit_fn("fill", {
                     "wallet":       session.address,
                     "label":        session.label,
@@ -2380,7 +2424,7 @@ async def _reinit_session_body(session: WalletSession, emit_fn: Callable):
         "balance": round(session.simulated_balance, 2),
         "upnl": round(upnl, 2),
     })
-    db_snapshot_equity(session.address, eq, session.simulated_balance, upnl, session.total_funding_paid)
+    await asyncio.to_thread(db_snapshot_equity, session.address, eq, session.simulated_balance, upnl, session.total_funding_paid)
 
     # Re-register all WS callbacks — reinit clears simulated_positions/ghosts but the
     # monitor's callbacks were set in the original start_session and point to closures
