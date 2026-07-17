@@ -26,7 +26,7 @@ from utils.logger import setup_logger
 from web.db import (
     add_wallet_to_db, remove_wallet_from_db,
     list_wallets_from_db, purge_wallet_data,
-    db_get_equity_history, db_get_trades, db_get_hft_calibration_stats,
+    db_get_equity_history, db_get_trades,
 )
 from web.sim import _sessions, _create_session, start_session, _reinit_session, _session_to_dict
 from copy_engine.monitor import MAX_WALLETS
@@ -229,13 +229,6 @@ def api_stats(wallet):
     open_pos   = s.simulated_positions if s else {}
     copy_ratio = s.copy_ratio if s else 1.0
     return jsonify(compute_stats(wallet.lower(), open_pos, copy_ratio=copy_ratio))
-
-
-@app.route("/api/calibration/<wallet>")
-def api_calibration(wallet):
-    """HFT accuracy calibration data — aggregates entry slippage and copy delay
-    across all debounced trades to measure the empirical simulation gap."""
-    return jsonify(db_get_hft_calibration_stats(wallet.lower()))
 
 
 @app.route("/api/add-wallet", methods=["POST"])

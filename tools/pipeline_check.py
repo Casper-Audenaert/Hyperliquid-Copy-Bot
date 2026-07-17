@@ -212,6 +212,84 @@ async def scenario_snapshot_lock_deferred():
     del sim._sessions[s.address]
 
 
+async def scenario_hft_round_trips():
+    print("\n== scenario: rapid open/close round-trips are ALL copied (no debounce drop) ==")
+    sim._mids_cache.clear()
+    sim._mids_cache.update({"SOL": 150.0})
+    s = make_session("0x_hft", "HFT", 10_000.0)
+    cbs = sim.make_callbacks(s, lambda *a, **k: None)
+    now = int(time.time() * 1000)
+    tid = 5000
+    n_round_trips = 20
+    for i in range(n_round_trips):
+        tid += 1
+        await cbs["on_order_fill"](make_fill("SOL", "Open Long", "B", 20.0, 150.0, tid, now + i * 10))
+        tid += 1
+        await cbs["on_order_fill"](make_fill("SOL", "Close Long", "A", 20.0, 150.5, tid, now + i * 10 + 5,
+                                              start_position=20.0))
+    check(f"all {n_round_trips} round-trips copied (no buffering/discard)",
+          s.trades_copied_count == n_round_trips * 2,
+          f"trades_copied_count={s.trades_copied_count} expected={n_round_trips * 2}")
+    check("no position left dangling after the last close", "SOL" not in s.simulated_positions)
+    del sim._sessions[s.address]
+
+
+async def scenario_dedup_timestamp_fallback():
+    print("\n== scenario: no-tid dedup key includes exchange timestamp (Rule 2) ==")
+    sim._mids_cache.clear()
+    sim._mids_cache.update({"ETH": 3_000.0})
+    s = make_session("0x_dedup_ts", "DedupTs", 10_000.0)
+    cbs = sim.make_callbacks(s, lambda *a, **k: None)
+    now = int(time.time() * 1000)
+
+    # Two genuinely distinct fills sharing coin/px/sz/dir but at different
+    # exchange timestamps, and neither carrying a tid (fill built without one
+    # by omitting "tid" via a raw dict, since make_fill always sets a tid).
+    def make_fill_no_tid(coin, direction, side, sz, px, time_ms):
+        return {"coin": coin, "dir": direction, "side": side, "sz": str(sz), "px": str(px), "time": time_ms}
+
+    await cbs["on_order_fill"](make_fill_no_tid("ETH", "Open Long", "B", 1.0, 3_000.0, now))
+    await cbs["on_order_fill"](make_fill_no_tid("ETH", "Open Long", "B", 1.0, 3_000.0, now + 1000))
+    check("two distinct same-shape fills at different timestamps both copied",
+          s.trades_copied_count == 2, f"trades_copied_count={s.trades_copied_count}")
+
+    # Replaying the exact same (coin, px, sz, dir, time) fill must dedupe.
+    await cbs["on_order_fill"](make_fill_no_tid("ETH", "Open Long", "B", 1.0, 3_000.0, now))
+    check("replaying an identical fill (same timestamp) dedupes",
+          s.trades_copied_count == 2, f"trades_copied_count={s.trades_copied_count}")
+    del sim._sessions[s.address]
+
+
+async def scenario_fifo_ordering():
+    print("\n== scenario: WalletMonitor processes fills in strict arrival order (Rule 1) ==")
+    from copy_engine.monitor import WalletMonitor
+
+    monitor = WalletMonitor("0xfifo")
+    processed: list = []
+
+    async def slow_first_fill(fill: dict):
+        # The first fill sleeps briefly — if dispatch were still
+        # concurrent (create_task-per-fill), fill #2/#3 would finish and
+        # record themselves BEFORE fill #1, exposing any ordering bug.
+        if fill["tid"] == 1:
+            await asyncio.sleep(0.05)
+        processed.append(fill["tid"])
+
+    monitor.on_order_fill = slow_first_fill
+    consumer = asyncio.create_task(monitor._consume_fills())
+    try:
+        await monitor._handle_fills([
+            make_fill("BTC", "Open Long", "B", 1.0, 50_000.0, 1, 1000),
+            make_fill("BTC", "Add Long", "B", 0.5, 50_100.0, 2, 1001),
+            make_fill("BTC", "Close Long", "A", 1.5, 50_200.0, 3, 1002, start_position=1.5),
+        ])
+        await asyncio.sleep(0.2)
+        check("fills processed in exact arrival order despite a slow first fill",
+              processed == [1, 2, 3], f"processed={processed}")
+    finally:
+        consumer.cancel()
+
+
 async def scenario_money_math_invariant(n_wallets: int):
     print(f"\n== scenario: {n_wallets}-wallet concurrent load + money-math invariant ==")
     sim._mids_cache.clear()
@@ -269,6 +347,9 @@ async def main():
     await scenario_partial_close_start_position()
     await scenario_dedup_idempotence()
     await scenario_snapshot_lock_deferred()
+    await scenario_hft_round_trips()
+    await scenario_dedup_timestamp_fallback()
+    await scenario_fifo_ordering()
     await scenario_money_math_invariant(args.wallets)
 
     print("\nALL PIPELINE CHECKS PASSED")

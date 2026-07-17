@@ -456,56 +456,6 @@ def db_record_fill(wallet_addr: str, wallet_label: str, fill_id, symbol: str,
         db.commit()
 
 
-def db_get_hft_calibration_stats(wallet_addr: str, days: int = 180) -> dict:
-    """Aggregate calibration data for measuring the HFT simulation accuracy gap.
-
-    Returns metrics that quantify how far debounced copy entries deviate from
-    the target's original fills. Use this data to tune debounce_secs and the
-    slippage model after accumulating real live-trading results.
-
-    Bounded to the last `days` days — this used to be an unfiltered .all() over
-    the wallet's entire trade history, getting slower every week regardless of
-    how much of that history was actually relevant to current calibration.
-    """
-    cutoff = datetime.utcnow() - timedelta(days=days)
-    with DbSession(_db_engine) as db:
-        rows = (db.query(TradeRecord)
-                .filter(TradeRecord.wallet_addr == wallet_addr,
-                        TradeRecord.timestamp >= cutoff,
-                        TradeRecord.is_debounced == True,   # noqa: E712
-                        TradeRecord.is_seed == False,       # noqa: E712
-                        TradeRecord.target_entry_px.isnot(None))
-                .all())
-    if not rows:
-        return {"debounced_trades": 0}
-
-    slippages, delays, pnls = [], [], []
-    for r in rows:
-        if r.target_entry_px and r.target_entry_px > 0 and r.price and r.price > 0:
-            is_long = (r.side or "").upper() == "LONG"
-            slip = ((r.price - r.target_entry_px) / r.target_entry_px * 100
-                    if is_long else
-                    (r.target_entry_px - r.price) / r.target_entry_px * 100)
-            slippages.append(slip)
-        if r.copy_delay_ms is not None:
-            delays.append(r.copy_delay_ms)
-        if r.realized_pnl is not None:
-            pnls.append(r.realized_pnl)
-
-    total_closed = len(pnls)
-    wins = sum(1 for p in pnls if p > 0)
-    return {
-        "debounced_trades":       len(rows),
-        "closed_trades":          total_closed,
-        "win_rate_pct":           round(wins / total_closed * 100, 1) if total_closed else None,
-        "avg_entry_slippage_pct": round(sum(slippages) / len(slippages), 4) if slippages else None,
-        "avg_copy_delay_ms":      round(sum(delays) / len(delays)) if delays else None,
-        "median_copy_delay_ms":   sorted(delays)[len(delays) // 2] if delays else None,
-        # positive = we entered worse than target (paid more for longs, sold lower for shorts)
-        # negative = we got a better price (position moved in our favour during debounce)
-    }
-
-
 def db_record_close(wallet_addr: str, symbol: str, realized_pnl: float):
     """Attach realized PnL to the most recent open TradeRecord for this symbol."""
     with DbSession(_db_engine) as db:

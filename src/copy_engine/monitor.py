@@ -130,13 +130,16 @@ class WalletMonitor:
         self.last_positions: List[Position] = []
         self.last_orders: List[Order] = []
         self._state_refresh_task: Optional[asyncio.Task] = None
-        # Bounds concurrent in-flight fill callbacks (each does a DB write + REST
-        # fetch and contends on the session's state lock). Without this, a burst
-        # of fills (an HFT target, or a post-reconnect replay of up to 2000 fills)
-        # spawns one task per fill with no concurrency limit — tasks still queue
-        # up instantly (create_task is never blocked), only their execution is
-        # throttled, so no fill is dropped, just serialized in slices of 25.
-        self._fill_sem = asyncio.Semaphore(25)
+        # Per-wallet FIFO fill queue + single consumer task (started in
+        # start_monitoring). Replaces a create_task-per-fill dispatch that gave
+        # no ordering guarantee — concurrent fills for the same wallet could
+        # race each other through on_order_fill. A single consumer processes
+        # fills strictly in arrival order within this wallet's stream (rule:
+        # never debounce execution, always preserve per-wallet/per-symbol
+        # order), while different wallets remain fully parallel since each
+        # has its own queue/task.
+        self._fill_queue: asyncio.Queue = asyncio.Queue()
+        self._fill_consumer_task: Optional[asyncio.Task] = None
 
         # Track the timestamp of the last processed fill for gap recovery.
         # BUG FIX: this used to always start at 0 and was never persisted, so a
@@ -206,6 +209,7 @@ class WalletMonitor:
         # Background state refresh — decoupled from fill events so high-frequency
         # fills don't trigger REST calls on every message.
         self._state_refresh_task = asyncio.create_task(self._periodic_state_refresh())
+        self._fill_consumer_task = asyncio.create_task(self._consume_fills())
 
         # Subscribe this wallet's address to the shared WS
         await shared_ws.subscribe_user_events(
@@ -240,6 +244,9 @@ class WalletMonitor:
         if self._state_refresh_task is not None:
             self._state_refresh_task.cancel()
             self._state_refresh_task = None
+        if self._fill_consumer_task is not None:
+            self._fill_consumer_task.cancel()
+            self._fill_consumer_task = None
 
     async def _periodic_state_refresh(self):
         """Refresh current_state every ~60s independent of fill events.
@@ -369,23 +376,12 @@ class WalletMonitor:
                 self._last_fill_time = fill_time
 
             logger.info(f"Fill: {fill.get('dir','')} {symbol} sz={fill.get('sz')} px={fill.get('px')}")
-            if self.on_order_fill:
-                if asyncio.iscoroutinefunction(self.on_order_fill):
-                    # Dispatch as a task so slow callbacks (DB write + REST fetch) don't
-                    # block subsequent fills.  session._state_lock inside _process_fill
-                    # serializes per-session mutations so concurrency is safe. The
-                    # semaphore bounds how many run AT ONCE (not how many get queued —
-                    # every fill still gets a task immediately, none are dropped).
-                    _t = asyncio.create_task(self._run_fill_callback(fill))
-                    _t.add_done_callback(
-                        lambda t: logger.error(f"Fill callback error: {t.exception()!r}")
-                        if not t.cancelled() and t.exception() else None
-                    )
-                else:
-                    try:
-                        self.on_order_fill(fill)
-                    except Exception as e:
-                        logger.error(f"Fill callback error: {e}")
+            # Enqueue in arrival order — the single consumer task (started in
+            # start_monitoring) processes fills for this wallet strictly FIFO.
+            # put_nowait never blocks/drops: the queue is unbounded, so a fast
+            # burst (HFT target, or a post-reconnect replay of up to 2000
+            # fills) still enqueues every fill instantly.
+            self._fill_queue.put_nowait(fill)
 
         if self._last_fill_time > _clock_before:
             self._maybe_persist_fill_clock()
@@ -410,9 +406,24 @@ class WalletMonitor:
         except Exception as e:
             logger.debug(f"Fill clock persist failed (non-fatal): {e}")
 
-    async def _run_fill_callback(self, fill: dict):
-        async with self._fill_sem:
-            await self.on_order_fill(fill)
+    async def _consume_fills(self):
+        """The single consumer of self._fill_queue for this wallet — awaits
+        on_order_fill sequentially so fills apply in exact arrival order
+        (and therefore per-symbol order) within this wallet's stream, while
+        other wallets' consumers run fully in parallel. One bad fill must
+        never kill the stream, so each iteration is wrapped individually."""
+        while True:
+            fill = await self._fill_queue.get()
+            try:
+                if self.on_order_fill:
+                    if asyncio.iscoroutinefunction(self.on_order_fill):
+                        await self.on_order_fill(fill)
+                    else:
+                        self.on_order_fill(fill)
+            except Exception as e:
+                logger.error(f"Fill callback error: {e}")
+            finally:
+                self._fill_queue.task_done()
 
     async def _replay_missed_fills(self):
         """Fetch fills newer than last_fill_time after a WS reconnect and replay them."""

@@ -529,7 +529,7 @@ function renderSidebar() {
     const npnlCls = npnl == null ? 'z' : npnl > 0 ? 'pos' : npnl < 0 ? 'neg' : 'z';
     const style  = s.detected_style || 'Swing';
     const styleBadge = style === 'HFT'
-      ? `<span class="style-pill hft" title="High-frequency target — copies use ${s.debounce_secs ?? 30}s debounce (median hold ${s.median_hold_secs ?? '?'}s)">HFT</span>`
+      ? `<span class="style-pill hft" title="High-frequency target (median hold ${s.median_hold_secs ?? '?'}s) — all fills copied live, no debounce">HFT</span>`
       : `<span class="style-pill swing" title="Swing/long-term target — all fills copied immediately">Swing</span>`;
     const ratioMode = s.ratio_mode || 'fixed';
     const ratioBadgeText = ratioMode === 'proportional' ? 'PROP' : ratioMode === 'fixed_amount' ? '$AMT' : 'FIXED';

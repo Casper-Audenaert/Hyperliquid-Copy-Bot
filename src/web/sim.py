@@ -130,14 +130,12 @@ class WalletSession:
     start_balance: float = 10_000.0
     simulated_positions: dict = field(default_factory=dict)
     ghost_positions: dict = field(default_factory=dict)    # symbol → ghost metadata; never generate orders for these
-    copy_mode: str      = "all_fills"       # "all_fills" | "debounced" — auto-detected from fill history
-    debounce_secs: int  = 30               # seconds to wait before confirming a debounced copy
+    copy_mode: str      = "all_fills"       # always "all_fills" now — every fill is copied live; field/DB column kept for legacy rows
+    debounce_secs: int  = 30               # unused (debounced copy mode was removed) — kept only so legacy DB rows still round-trip
     ratio_mode: str = "fixed"                    # "fixed" | "proportional" | "fixed_amount" — set once at add-time, never mutated
     fixed_amount_usd: Optional[float] = None      # only used when ratio_mode == "fixed_amount"
     detected_style: str = "Swing"          # "HFT" | "Swing" — surfaced to UI as a badge
-    _pending_debounce: dict = field(default_factory=dict)  # symbol → asyncio.Task
     _style_last_checked: float = 0.0                       # monotonic time of last _detect_trading_style call
-    _fill_timestamps: list = field(default_factory=list)   # monotonic times of recent live fills, for fast burst detection
     _last_equity_tick_ts: float = 0.0                      # monotonic time of last equity_tick emit from fills
     _last_fill_snap_ts: float = 0.0                        # monotonic time of last fill-triggered equity snapshot
     median_hold_secs: float = 60.0                         # median position hold time (seconds) for this target
@@ -559,12 +557,6 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     price       = float(fill_data.get("px", 0))
     direction   = fill_data.get("dir", "")
 
-    # Calibration metadata injected by _debounced_copy_task (absent on live fills)
-    _target_px      = fill_data.get("_target_px")      # target's original fill price
-    _fill_time_ms   = fill_data.get("_fill_time", 0)   # original fill timestamp (ms)
-    _is_debounced   = bool(fill_data.get("_debounced", False))
-    _copy_delay_ms  = (time.time() * 1000 - _fill_time_ms) if _fill_time_ms else None
-
     # Parse side
     if "Long" in direction:
         position_side = PositionSide.LONG
@@ -686,16 +678,10 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             price = price * (1 - slippage) if is_long_pos else price * (1 + slippage)
     # ponytail: constant slippage; per-asset liquidity bucket if accuracy gap is measured
 
-    # ── Latency model (all_fills mode only) ───────────────────────────────────
-    # Approximates the price drift during execution latency. A confirmed
-    # debounced fill (_is_debounced) is treated as all_fills-equivalent here —
-    # previously _debounced_copy_task flipped session.copy_mode to "all_fills"
-    # around its _process_fill call just to pass this gate, but that global
-    # save/restore raced when two debounce tasks interleaved (both awaiting
-    # inside _process_fill concurrently), which could permanently strand the
-    # session in all_fills mode and disable debouncing entirely.
+    # ── Latency model ─────────────────────────────────────────────────────────
+    # Approximates the price drift during execution latency.
     lat_ms = settings.sim_accuracy.sim_latency_ms
-    if lat_ms > 0 and is_opening and not is_flip and (session.copy_mode == "all_fills" or _is_debounced):
+    if lat_ms > 0 and is_opening and not is_flip:
         drift_pct = (lat_ms / 1000) * 0.0001 * random.uniform(0.5, 1.5)
         price = price * (1 + drift_pct) if position_side == PositionSide.LONG else price * (1 - drift_pct)
     # ponytail: fixed volatility proxy; per-asset vol model if needed
@@ -918,7 +904,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
                 await asyncio.to_thread(
                     db_record_fill, session.address, session.label, fill_id, symbol,
                     direction, position_side.value, close_size, price, our_leverage, fill_fee,
-                    False, _is_debounced, _target_px, _copy_delay_ms,
+                    False, False, None, None,
                 )
                 await asyncio.to_thread(db_record_close, session.address, symbol, pnl)
             except Exception as e:
@@ -1058,7 +1044,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
                 await asyncio.to_thread(
                     db_record_fill, session.address, session.label, fill_id, symbol,
                     direction, position_side.value, our_size, price, our_leverage, fill_fee,
-                    False, _is_debounced, _target_px, _copy_delay_ms,
+                    False, False, None, None,
                 )
             except Exception as e:
                 # Same reasoning as the close-fill path: in-memory position/balance is
@@ -1237,64 +1223,23 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
         if session.is_paused:
             return
 
-        # Dedup by tid (trade ID) or composite key
+        # Dedup by tid (trade ID — exchange sequence identity, long memory: the
+        # same fill legitimately arrives twice via userEvents+userFills, and
+        # replays can redeliver it minutes later). For the rare fill with no
+        # tid, fall back to a composite key that also includes the exchange
+        # timestamp — without it, two genuinely distinct trades that share
+        # coin/price/size/direction (common for a bot re-entering the same
+        # setup) would be wrongly merged into one.
         # Normalize px/sz to float so "50000" and "50000.0" produce the same dedup key.
         fill_id = fill_data.get("tid") or (
             fill_data.get("coin", ""),
             float(fill_data.get("px") or 0),
             float(fill_data.get("sz") or 0),
             fill_data.get("dir", ""),
+            fill_data.get("time", 0),
         )
         if fill_id in session._processed_fill_ids:
             return
-
-        # Fast burst detection: uses the fill's own exchange-reported timestamp, not
-        # when we process it — using processing time would misfire during a WS
-        # reconnect replay, when fills that actually happened hours apart get delivered
-        # in a tight loop. Two signals mirror how trade-surveillance systems distinguish
-        # churn from rebalancing: repeated closes on ONE symbol within the window is the
-        # costly round-trip flip pattern (the original incident: 88 fills on xyz:MU);
-        # a one-time basket rebalance shows many fills but few/no closes on any single
-        # symbol, and should NOT trip into debounced copying unnecessarily.
-        _fill_time_ms = fill_data.get("time", 0)
-        if _fill_time_ms > 0:
-            _b_sym   = fill_data.get("coin", "")
-            _b_dir   = fill_data.get("dir", "")
-            _b_close = "Close" in _b_dir or "Reduce" in _b_dir
-            session._fill_timestamps.append((_fill_time_ms, _b_sym, _b_close))
-            _window_ms = settings.copy_style.fast_burst_window_secs * 1000
-            session._fill_timestamps = [
-                f for f in session._fill_timestamps if _fill_time_ms - f[0] <= _window_ms
-            ]
-            if session.copy_mode == "all_fills":
-                _closes_by_sym: dict = {}
-                for _, _s, _c in session._fill_timestamps:
-                    if _c:
-                        _closes_by_sym[_s] = _closes_by_sym.get(_s, 0) + 1
-                _max_closes   = max(_closes_by_sym.values(), default=0)
-                _total_closes = sum(_closes_by_sym.values())
-                if _max_closes >= settings.copy_style.fast_burst_same_symbol_closes:
-                    _burst_reason = f"{_max_closes} closes on one symbol"
-                elif _total_closes >= settings.copy_style.fast_burst_total_closes:
-                    _burst_reason = f"{_total_closes} closes across symbols"
-                else:
-                    _burst_reason = None
-                if _burst_reason:
-                    session.copy_mode       = "debounced"
-                    session.detected_style  = "HFT"
-                    session.debounce_secs   = settings.copy_style.hft_debounce_secs
-                    session._style_last_checked = 0.0  # force a full _detect_trading_style pass soon
-                    logger.warning(
-                        f"[{session.label}] Fast burst detected ({_burst_reason}) in "
-                        f"{settings.copy_style.fast_burst_window_secs}s — switching to debounced "
-                        f"(debounce={session.debounce_secs}s)"
-                    )
-                    try:
-                        from web_app import _send_telegram
-                        _send_telegram(f"⚡ <b>{session.label}</b>: burst detected ({_burst_reason}) "
-                                       f"— switched to debounced copying")
-                    except Exception:
-                        pass
 
         try:
             symbol     = fill_data.get("coin", "")
@@ -1346,18 +1291,6 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
                     return
 
             assert symbol not in session.ghost_positions, f"BUG: {symbol} still in ghost_positions at order placement"
-
-            # Parse flags early so mode dispatch can inspect them
-            is_closing = "Close" in direction or "Reduce" in direction
-            is_flip    = ">" in direction
-            is_opening = "Open" in direction or "Add" in direction
-
-            # Debounced mode: buffer opening fills; closes pass through immediately
-            if session.copy_mode == "debounced" and is_opening and not is_flip:
-                _schedule_debounced_copy(session, fill_data, fill_id, emit_fn)
-                session._processed_fill_ids[fill_id] = None
-                _evict_fill_ids(session)
-                return
 
             await _process_fill(session, fill_data, fill_id, emit_fn)
 
@@ -1736,22 +1669,19 @@ async def _detect_trading_style(session: "WalletSession") -> None:
     else:
         session.median_hold_secs = 60.0
 
+    # detected_style is purely an informational badge — HFT/Swing wallets are
+    # copied identically now (every fill, live, in arrival order). copy_mode is
+    # always normalized to "all_fills" here, which also self-heals any legacy
+    # "debounced" value a wallet persisted before debounced copying was removed.
     policy = settings.copy_style
-    if fills_per_hour >= policy.hft_threshold_fills_per_hour:
-        session.copy_mode      = "debounced"
-        # Adaptive debounce: 25% of median hold, clamped to [10s, 300s].
-        # If target holds 2min on average → debounce 30s; 10min → 150s.
-        # ponytail: fixed 0.25 multiplier; tune per-strategy if data shows drift
-        session.debounce_secs  = max(10, min(300, int(session.median_hold_secs * 0.25)))
-        session.detected_style = "HFT"
-    else:
-        session.copy_mode      = "all_fills"
-        session.detected_style = "Swing"
+    session.copy_mode = "all_fills"
+    session.detected_style = (
+        "HFT" if fills_per_hour >= policy.hft_threshold_fills_per_hour else "Swing"
+    )
 
     logger.info(
         f"[{session.label}] Style detection: {session.detected_style} "
-        f"({fills_per_hour:.1f} fills/hr, median_hold={session.median_hold_secs:.1f}s"
-        f" → debounce={session.debounce_secs}s)"
+        f"({fills_per_hour:.1f} fills/hr, median_hold={session.median_hold_secs:.1f}s)"
     )
     await asyncio.to_thread(db_update_wallet_style, session.address, session.copy_mode,
                             session.debounce_secs, session.detected_style)
@@ -1763,114 +1693,6 @@ def _evict_fill_ids(session: "WalletSession") -> None:
         keys = list(session._processed_fill_ids)[:50_000]
         for k in keys:
             del session._processed_fill_ids[k]
-
-
-def _schedule_debounced_copy(session: "WalletSession", fill_data: dict,
-                              fill_id, emit_fn: Callable) -> None:
-    """Buffer an opening fill. Subsequent Add fills for the same symbol accumulate
-    into total_sz so the debounce task opens the full aggregated size."""
-    symbol      = fill_data.get("coin", "")
-    target_sz   = abs(float(fill_data.get("sz", 0)))
-    pending     = session._pending_debounce.get(symbol)
-
-    # Otherwise an unhandled exception in _debounced_copy_task (network blip, stale
-    # cache, DB error) only reaches asyncio's default handler on GC — logged via
-    # stdlib logging, never through loguru's sinks — so a dropped debounced copy
-    # (this is specifically the HFT-detected-wallet path) leaves no trace anywhere.
-    def _log_debounce_error(t: asyncio.Task) -> None:
-        if not t.cancelled() and t.exception():
-            logger.error(f"[{session.label}] Debounced copy task error: {t.exception()!r}")
-
-    if pending:
-        # Add fill arrives while debounce is running → cancel the timer, accumulate size,
-        # restart the timer so the window resets (keeps counting from the latest signal).
-        pending["task"].cancel()
-        pending["total_sz"] += target_sz
-        task = asyncio.create_task(
-            _debounced_copy_task(session, symbol, pending, fill_id, emit_fn, session.debounce_secs)
-        )
-        task.add_done_callback(_log_debounce_error)
-        pending["task"] = task
-    else:
-        entry = {
-            "total_sz":      target_sz,
-            "fill_template": fill_data,   # first fill: carries dir/side/coin metadata
-            "original_px":   float(fill_data.get("px", 0)),
-            "original_time": fill_data.get("time", 0),
-            "task":          None,
-        }
-        task = asyncio.create_task(
-            _debounced_copy_task(session, symbol, entry, fill_id, emit_fn, session.debounce_secs)
-        )
-        task.add_done_callback(_log_debounce_error)
-        entry["task"] = task
-        session._pending_debounce[symbol] = entry
-
-
-async def _debounced_copy_task(session: "WalletSession", symbol: str,
-                                pending: dict, fill_id,
-                                emit_fn: Callable, delay_secs: int) -> None:
-    await asyncio.sleep(delay_secs)
-    session._pending_debounce.pop(symbol, None)
-
-    if session.address not in _sessions or session.is_paused:
-        return
-
-    still_open = (
-        session.monitor.current_state is not None
-        and any(p.symbol == symbol for p in session.monitor.current_state.positions)
-    )
-    if not still_open:
-        logger.debug(f"[{session.label}] Debounce: {symbol} gone in {delay_secs}s — skipped")
-        return
-
-    mids = await _get_shared_mids(session.client)
-    current_px = mids.get(symbol, 0)
-    if current_px <= 0:
-        return
-
-    # Entry deviation guard (debounced path): compare against the target's
-    # ORIGINAL fill price, not just-fetched current price — this is the drift
-    # accrued during the debounce delay itself, which _target_px/_fill_time were
-    # already being recorded for (calibration stats) but never gated on.
-    original_px = pending["original_px"]
-    max_dev = settings.copy_rules.max_entry_deviation_pct
-    if max_dev > 0 and original_px > 0:
-        deviation_pct = abs(current_px - original_px) / original_px * 100
-        if deviation_pct > max_dev:
-            logger.warning(
-                f"[{session.label}] Debounce entry deviation guard: {symbol} price drifted "
-                f"{deviation_pct:.2f}% since target's original fill "
-                f"(${original_px:,.4f} → ${current_px:,.4f}, limit {max_dev:.2f}%) — skip"
-            )
-            session.skipped_fills_count += 1
-            return
-
-    total_sz = pending["total_sz"]
-    template = pending["fill_template"]
-
-    # Patch: current mark price + accumulated size + calibration metadata for stats
-    patched = {
-        **template,
-        "px":            str(current_px),
-        "sz":            str(total_sz),
-        "_target_px":    pending["original_px"],    # target's original entry for calibration
-        "_fill_time":    pending["original_time"],   # original fill timestamp (ms)
-        "_debounced":    True,
-    }
-    logger.info(
-        f"[{session.label}] Debounce confirmed {symbol} "
-        f"sz={total_sz:.4f} (debounce={delay_secs}s) @ ${current_px:,.4f} "
-        f"(target was ${pending['original_px']:,.4f})"
-    )
-
-    # _process_fill is called directly (bypassing on_order_fill's debounce-
-    # scheduling gate, so this can't re-trigger scheduling), and the only place
-    # inside it that reads session.copy_mode (the latency-model gate) already
-    # treats _is_debounced fills as all_fills-equivalent — no mode mutation
-    # needed here anymore. Removed a global copy_mode save/restore that raced
-    # when two debounce tasks interleaved (see the latency-gate comment above).
-    await _process_fill(session, patched, fill_id, emit_fn)
 
 
 def evaluate_startup_position(
@@ -2284,15 +2106,6 @@ async def _reinit_session(session: WalletSession, emit_fn: Callable):
 
 async def _reinit_session_body(session: WalletSession, emit_fn: Callable):
     """Reinit body — caller MUST hold session._state_lock for the duration."""
-    # Cancel pending debounce tasks BEFORE clearing the dict — clearing alone
-    # does not cancel the live asyncio tasks, and a task waking after this
-    # reset would apply a stale pre-reset fill to the fresh account (its
-    # wake-up guard only checks _sessions membership, which a reinit keeps).
-    for _entry in session._pending_debounce.values():
-        _task = _entry.get("task")
-        if _task is not None:
-            _task.cancel()
-
     session.simulated_balance    = session.start_balance
     session.simulated_positions  = {}
     session.ghost_positions      = {}
@@ -2310,7 +2123,6 @@ async def _reinit_session_body(session: WalletSession, emit_fn: Callable):
     session.recent_fills         = []
     session._last_equity_tick_ts = 0.0   # reset rate-limit so first tick fires immediately
     session._style_last_checked  = 0.0   # force style re-detection after reinit
-    session._pending_debounce    = {}
 
     state = await session.monitor.get_current_state()
     if state and state.balance > 0:

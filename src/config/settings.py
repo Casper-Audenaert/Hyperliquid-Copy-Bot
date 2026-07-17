@@ -55,11 +55,7 @@ class RiskManagementConfig(BaseModel):
     max_net_exposure_pct: float = 0.80    # |long_notional - short_notional| / equity cap
 
 class CopyStyleConfig(BaseModel):
-    hft_threshold_fills_per_hour: int = 60   # fills/hr above this → debounced copy mode
-    hft_debounce_secs: int = 30              # seconds to wait before confirming a debounced copy
-    fast_burst_window_secs: int = 90          # rolling window (seconds) for the fast in-memory burst check
-    fast_burst_same_symbol_closes: int = 3    # closes on ONE symbol within window → targeted churn signal
-    fast_burst_total_closes: int = 6          # total closes (any symbol combined) → broad-activity fallback
+    hft_threshold_fills_per_hour: int = 60   # fills/hr above this → "HFT" badge (informational only; all styles copy every fill live)
 
 class SimAccuracyConfig(BaseModel):
     slippage_bps: float = 3.0          # basis points of slippage per side on every fill
