@@ -66,11 +66,49 @@ def _safe_emit(event: str, data: dict):
     _emit_q.put_nowait((event, data))
 
 
+# Event types that are cheap to coalesce: each new one fully supersedes the
+# previous one for the same wallet (a fresh state snapshot / equity point),
+# so under a burst only the latest per wallet needs to reach the browser.
+# Everything else (fills, funding, closes, wallet add/remove) must be
+# delivered individually and in order — coalescing a "fill" would drop a
+# real trade from the feed.
+_COALESCABLE_EVENTS = {"state_update": "address", "equity_tick": "wallet"}
+
+
 def _emit_worker():
     while True:
         try:
-            event, data = _emit_q.get()
-            socketio.emit(event, data)
+            # Block for the first item, then drain whatever else is already
+            # queued without blocking further. This bounds work to one drain
+            # per burst (14 wallets ticking near-simultaneously coalesces to
+            # O(wallets) emits, not O(events)) while adding zero latency when
+            # the queue is quiet — a fixed-interval timer would add up to its
+            # full interval of delay even for a single isolated event, which
+            # is the common case outside a burst.
+            batch = [_emit_q.get()]
+            while True:
+                try:
+                    batch.append(_emit_q.get_nowait())
+                except queue.Empty:
+                    break
+
+            coalesced: dict = {}   # (event, wallet_key) -> data, latest wins
+            ordered: list = []     # everything else, original order preserved
+            for event, data in batch:
+                wallet_key_field = _COALESCABLE_EVENTS.get(event)
+                if wallet_key_field is not None:
+                    coalesced[(event, data.get(wallet_key_field))] = data
+                else:
+                    ordered.append((event, data))
+
+            for event, data in ordered:
+                socketio.emit(event, data)
+            # Coalesced updates go out after this batch's ordered events —
+            # each one already reflects any fills from the same batch (sim.py
+            # emits state_update right after mutating state), so this is the
+            # semantically correct order, not just a coalescing side effect.
+            for (event, _wallet), data in coalesced.items():
+                socketio.emit(event, data)
         except Exception as e:
             logger.error(f"Emit worker error: {e}")
 

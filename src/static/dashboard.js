@@ -49,6 +49,7 @@ let _chartUpdatePending = false; // debounce flag — prevents chart.update() st
 let _stateRenderPending = false; // debounce flag — coalesces per-wallet state_update renders into one frame
 let _cmpPanelRenderPending = false; // debounce flag — coalesces per-wallet loadStats() resolutions in compare mode
 let statsCache   = {};      // addr → stats dict (cached from /api/stats)
+const _statsRefreshTimers = {}; // addr -> timeout id, for scheduleStatsRefresh()
 let compareSelection = new Set(); // addrs visible in compare mode
 let showCombined     = false;     // overlay combined portfolio curve
 let showUnderwater   = false;     // toggle underwater sub-chart
@@ -934,6 +935,23 @@ function _scheduleComparePanelRender() {
     _cmpPanelRenderPending = false;
     renderComparePanel();
   });
+}
+
+// Trailing-edge debounce for loadStats(), keyed per wallet. BUG FIX: the
+// 'fill' and 'position_close' socket handlers used to call
+// `setTimeout(()=>loadStats(addr), 1000)` on EVERY single event — for a
+// busy algorithmic wallet firing hundreds of fills/sec, that queued
+// hundreds of independent /api/stats requests (each running compute_stats'
+// windowed DB queries) exactly when the server is already busiest. This
+// collapses any burst within the window into one refresh, 1.5s after the
+// burst quiets down, no matter how many fills arrived.
+function scheduleStatsRefresh(addr) {
+  if (!addr) return;
+  clearTimeout(_statsRefreshTimers[addr]);
+  _statsRefreshTimers[addr] = setTimeout(() => {
+    delete _statsRefreshTimers[addr];
+    loadStats(addr);
+  }, 1500);
 }
 
 // ── Stats tearsheet ────────────────────────────────────────────────────────
@@ -2425,10 +2443,11 @@ socket.on('fill', f => {
   if (compareMode || !cur || cur === f.wallet) {
     prependFill(fill);
   }
-  // Refresh stats after a fill (PnL may have changed)
+  // Refresh stats after a fill (PnL may have changed) — debounced per wallet
+  // so an HFT burst collapses to one refresh instead of one per fill.
   const addr = f.wallet;
   if (addr && (compareMode || addr === (activeWallet||Object.keys(state)[0]))) {
-    setTimeout(()=>loadStats(addr), 1000); // slight delay so DB write completes
+    scheduleStatsRefresh(addr);
   }
 });
 
@@ -2485,7 +2504,7 @@ socket.on('equity_tick', tick => {
 
 socket.on('position_close', d => {
   const addr = d.wallet;
-  if (addr) setTimeout(()=>loadStats(addr), 1000);
+  if (addr) scheduleStatsRefresh(addr);
 });
 
 socket.on('wallet_removed', d => {
