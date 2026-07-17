@@ -44,6 +44,7 @@ class Wallet(Base):
     ratio_mode        = Column(String, default="fixed")    # "fixed" | "proportional" | "fixed_amount"
     fixed_amount_usd  = Column(Float, nullable=True)        # only meaningful when ratio_mode == "fixed_amount"
     last_fill_time_ms = Column(Integer, default=0)          # exchange ms of the last fill we processed — restart gap-replay watermark
+    skip_counters     = Column(String, nullable=True)       # JSON blob of {reason: count} — see sim.py's _SKIP_CATEGORIES
 
 
 class TradeRecord(Base):
@@ -162,6 +163,7 @@ for _col, _ddl in [
     ("ratio_mode",       "ALTER TABLE wallets ADD COLUMN ratio_mode TEXT DEFAULT 'fixed'"),
     ("fixed_amount_usd", "ALTER TABLE wallets ADD COLUMN fixed_amount_usd REAL"),
     ("last_fill_time_ms", "ALTER TABLE wallets ADD COLUMN last_fill_time_ms INTEGER DEFAULT 0"),
+    ("skip_counters",    "ALTER TABLE wallets ADD COLUMN skip_counters TEXT"),
 ]:
     try:
         with _db_engine.connect() as conn:
@@ -365,9 +367,31 @@ def db_update_last_fill_time(address: str, ts_ms: int):
     """Persist the fill-clock watermark so a restart can replay exactly the
     fills that happened during downtime instead of silently dropping them
     (see WalletMonitor._last_fill_time). Cheap single-column UPDATE — caller
-    throttles how often this is invoked."""
+    throttles how often this is invoked.
+
+    BUG FIX: this was missing db.commit() — Session.close() (called by this
+    context manager's __exit__) rolls back an uncommitted transaction rather
+    than persisting it, so the fill-clock watermark was computed correctly
+    in memory but never actually reached disk. Every restart silently fell
+    back to last_fill_time_ms=0, defeating the entire point of C2 (replaying
+    exactly the downtime gap instead of dropping it) without ever raising an
+    error — the in-memory clock still advanced and looked correct all
+    session long, only to reset silently on the next restart.
+    """
     with DbSession(_db_engine) as db:
         db.query(Wallet).filter(Wallet.address == address).update({"last_fill_time_ms": ts_ms})
+        db.commit()
+
+
+def db_update_skip_counters(address: str, skip_counts: dict):
+    """Persist the per-reason skip breakdown so a restart doesn't reset the
+    dashboard's visibility back to all-zero. Caller only invokes this when
+    skip_counts actually changed since the last write (see WalletSession's
+    _skip_counts_dirty flag)."""
+    with DbSession(_db_engine) as db:
+        db.query(Wallet).filter(Wallet.address == address).update(
+            {"skip_counters": json.dumps(skip_counts)}
+        )
         db.commit()
 
 
@@ -399,6 +423,7 @@ def purge_wallet_data(address: str):
         w = db.get(Wallet, address)
         if w:
             w.stats_counters = None
+            w.skip_counters  = None
         db.commit()
 
 

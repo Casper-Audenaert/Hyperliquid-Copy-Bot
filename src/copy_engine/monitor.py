@@ -129,6 +129,11 @@ class WalletMonitor:
         self.current_state: Optional[UserState] = None
         self.last_positions: List[Position] = []
         self.last_orders: List[Order] = []
+        # Wall-clock time of the last WS message (any channel) for this wallet —
+        # distinguishes "target is just idle" from "the feed died" (a connection
+        # can report is_running=True while silently receiving nothing, e.g. a
+        # half-open TCP connection). Surfaced as feed_age_secs on the dashboard.
+        self.last_ws_event_ts: float = 0.0
         self._state_refresh_task: Optional[asyncio.Task] = None
         # Per-wallet FIFO fill queue + single consumer task (started in
         # start_monitoring). Replaces a create_task-per-fill dispatch that gave
@@ -261,10 +266,37 @@ class WalletMonitor:
         purpose independent of WS delivery.
         """
         import random
+        _FEED_STALE_SECS = 300  # 5 minutes with a connection that claims open but sent nothing
+        _stale_alerted = False
         await asyncio.sleep(random.uniform(0, 30))  # initial stagger
         while True:
             await asyncio.sleep(50 + random.uniform(0, 20))  # 50–70s jitter
             try:
+                # Feed-health: distinguishes "target is just idle" from "the
+                # feed died" (a connection can report is_running=True while
+                # silently receiving nothing, e.g. a half-open TCP connection).
+                # last_ws_event_ts == 0 means no event has arrived since this
+                # monitor started, which the subscribe-time userFills snapshot
+                # (see _handle_user_fills_event) makes normal at startup — only
+                # alert once an established feed has actually gone quiet, and
+                # only once per stale episode (a live event resets the flag).
+                if self.last_ws_event_ts > 0:
+                    age = time.time() - self.last_ws_event_ts
+                    if age > _FEED_STALE_SECS and self.ws and self.ws.is_running:
+                        if not _stale_alerted:
+                            _stale_alerted = True
+                            logger.warning(
+                                f"Feed stale for {self.target_address[:10]}…: no WS event in "
+                                f"{age:.0f}s despite an open connection"
+                            )
+                            if self.on_alert:
+                                self.on_alert(
+                                    f"Feed stale: no WS event in {age/60:.1f}min despite an "
+                                    f"open connection — the socket may be half-open"
+                                )
+                    else:
+                        _stale_alerted = False
+
                 prev_positions = {p.symbol: p for p in self.last_positions}
                 await self.get_current_state()
                 logger.debug(f"State refreshed for {self.target_address[:10]}…")
@@ -304,6 +336,12 @@ class WalletMonitor:
                 )
                 return
 
+            # Stamp AFTER the address check, not on every message this shared
+            # connection sees — feed_age_secs must reflect events actually
+            # about THIS wallet, so a connection shared with a busier wallet
+            # doesn't mask this one's feed having gone silent.
+            self.last_ws_event_ts = time.time()
+
             if "fills" in data:
                 await self._handle_fills(data["fills"])
             if "positions" in data:
@@ -320,6 +358,7 @@ class WalletMonitor:
         """Handle a userFills WS message (fills-only feed, separate from userEvents).
         Reuses _handle_fills so address filtering and the on_order_fill dispatch
         (and its downstream tid dedup) stay in one place."""
+        self.last_ws_event_ts = time.time()
         try:
             inner = update.data.get("data", {})
             fills = inner.get("fills", [])

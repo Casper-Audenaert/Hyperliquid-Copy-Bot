@@ -363,14 +363,21 @@ _server_start = time.time()
 def api_health():
     wallets = {}
     for addr, s in list(_sessions.items()):
-        ws_ok = getattr(s.monitor, "is_connected", None)
+        # BUG FIX: WalletMonitor has no `is_connected` attribute (only its
+        # `.ws.is_running`) — this always returned None, silently, for every
+        # wallet. Matches the same check _session_to_dict already uses.
+        ws_ok = bool(s.monitor and s.monitor.ws and getattr(s.monitor.ws, "is_running", False))
         uptime = (datetime.now() - s.bot_start_time).total_seconds() / 3600 if s.bot_start_time else 0
+        last_evt = getattr(s.monitor, "last_ws_event_ts", 0) if s.monitor else 0
+        fq = getattr(s.monitor, "_fill_queue", None) if s.monitor else None
         wallets[addr] = {
-            "label":          s.label,
-            "is_paused":      s.is_paused,
-            "uptime_h":       round(uptime, 2),
-            "trades_copied":  s.trades_copied_count,
-            "ws_connected":   ws_ok,
+            "label":            s.label,
+            "is_paused":        s.is_paused,
+            "uptime_h":         round(uptime, 2),
+            "trades_copied":    s.trades_copied_count,
+            "ws_connected":     ws_ok,
+            "feed_age_secs":    round(time.time() - last_evt, 1) if last_evt else None,
+            "fill_queue_depth": fq.qsize() if fq is not None else None,
         }
     return jsonify({
         "status":          "ok",
@@ -454,6 +461,7 @@ if __name__ == "__main__":
             ratio_mode=getattr(w, "ratio_mode", "fixed") or "fixed",
             fixed_amount_usd=getattr(w, "fixed_amount_usd", None),
             last_fill_time_ms=getattr(w, "last_fill_time_ms", 0) or 0,
+            skip_counters_json=getattr(w, "skip_counters", None),
         )
         # Stagger starts by 5s each — 2s was too tight for 20+ wallets each making
         # 9+ REST calls during startup (fill history + style detection)

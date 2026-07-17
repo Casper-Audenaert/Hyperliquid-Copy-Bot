@@ -212,6 +212,84 @@ async def scenario_snapshot_lock_deferred():
     del sim._sessions[s.address]
 
 
+async def scenario_skip_counts():
+    print("\n== scenario: skip_counts breakdown (ghosted, blocked, deviation) ==")
+    from hyperliquid.models import Position, PositionSide
+    sim._mids_cache.clear()
+    sim._mids_cache.update({"BTC": 50_000.0, "ETH": 3_000.0})
+    s = make_session("0x_skips", "Skips", 10_000.0)
+    cbs = sim.make_callbacks(s, lambda *a, **k: None)
+    now = int(time.time() * 1000)
+
+    # Ghosted: target adds to a position we deliberately never opened.
+    s.ghost_positions["SOL"] = {
+        "side": "LONG", "target_size": 10.0, "target_entry_price": 150.0,
+        "target_leverage": 1, "reason_skipped": "test",
+        "detected_at": "now", "last_seen_at": "now",
+    }
+    before_skipped = s.skipped_fills_count
+    await cbs["on_order_fill"](make_fill("SOL", "Add Long", "B", 1.0, 150.0, 601, now))
+    check("ghosted add increments skip_counts.ghosted", s.skip_counts["ghosted"] == 1,
+          f"{s.skip_counts}")
+    check("ghosted skip does NOT inflate skipped_fills_count (not a permanent miss)",
+          s.skipped_fills_count == before_skipped)
+
+    # Blocked asset.
+    settings.copy_rules.blocked_assets = ["ETH"]
+    try:
+        await cbs["on_order_fill"](make_fill("ETH", "Open Long", "B", 1.0, 3_000.0, 602, now + 100))
+    finally:
+        settings.copy_rules.blocked_assets = []
+    check("blocked asset increments skip_counts.blocked", s.skip_counts["blocked"] == 1)
+    check("blocked asset fill is marked processed (BUG FIX — used to loop forever unmarked)",
+          602 in s._processed_fill_ids)
+
+    # Entry deviation: fill price far from the cached mid.
+    await cbs["on_order_fill"](make_fill("BTC", "Open Long", "B", 1.0, 100_000.0, 603, now + 200))
+    check("large price deviation increments skip_counts.deviation", s.skip_counts["deviation"] == 1,
+          f"{s.skip_counts}")
+
+    del sim._sessions[s.address]
+
+
+async def scenario_position_drift():
+    print("\n== scenario: position drift — sync_pct/desynced reflect our size vs. target's ==")
+    from hyperliquid.models import Position, PositionSide
+    sim._mids_cache.clear()
+    sim._mids_cache.update({"BTC": 50_000.0})
+    s = make_session("0x_drift", "Drift", 10_000.0)
+    cbs = sim.make_callbacks(s, lambda *a, **k: None)
+    now = int(time.time() * 1000)
+
+    await cbs["on_order_fill"](make_fill("BTC", "Open Long", "B", 1.0, 50_000.0, 701, now))
+    our_size = abs(s.simulated_positions["BTC"]["size"])  # == 1.0 * copy_ratio(0.01) == 0.01
+
+    # Target's real size still matches what we opened against (1.0) — in sync.
+    s.monitor.current_state = SimpleNamespace(positions=[
+        Position(symbol="BTC", side=PositionSide.LONG, size=1.0, entry_price=50_000.0,
+                 current_price=50_000.0, leverage=1, unrealized_pnl=0.0)
+    ])
+    d = sim._session_to_dict(s)
+    pos = next(p for p in d["positions"] if p["symbol"] == "BTC")
+    check("in-sync position reports ~100% sync_pct", pos["sync_pct"] is not None and pos["sync_pct"] > 99.0,
+          f"sync_pct={pos['sync_pct']}")
+    check("in-sync position is not flagged desynced", pos["desynced"] is False)
+
+    # Target has since added heavily (10x) but we never got the add (e.g. it
+    # was skipped by a guard) — our size is now way behind expected.
+    s.monitor.current_state = SimpleNamespace(positions=[
+        Position(symbol="BTC", side=PositionSide.LONG, size=10.0, entry_price=50_000.0,
+                 current_price=50_000.0, leverage=1, unrealized_pnl=0.0)
+    ])
+    d = sim._session_to_dict(s)
+    pos = next(p for p in d["positions"] if p["symbol"] == "BTC")
+    check("drifted position reports low sync_pct", pos["sync_pct"] is not None and pos["sync_pct"] < 20.0,
+          f"sync_pct={pos['sync_pct']}")
+    check("drifted position is flagged desynced", pos["desynced"] is True)
+
+    del sim._sessions[s.address]
+
+
 async def scenario_dust_accumulator():
     print("\n== scenario: sub-floor opens accumulate at VWAP until the dust floor is crossed ==")
     sim._mids_cache.clear()
@@ -382,6 +460,8 @@ async def main():
     await scenario_partial_close_start_position()
     await scenario_dedup_idempotence()
     await scenario_snapshot_lock_deferred()
+    await scenario_skip_counts()
+    await scenario_position_drift()
     await scenario_dust_accumulator()
     await scenario_hft_round_trips()
     await scenario_dedup_timestamp_fallback()

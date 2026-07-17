@@ -14,6 +14,7 @@ Design decisions baked in:
 """
 import asyncio
 import aiohttp
+import json
 import random
 import time
 from dataclasses import dataclass, field
@@ -34,11 +35,22 @@ from web.db import (
     db_get_known_fill_ids, db_update_trade_equity,
     db_upsert_position, db_delete_position, db_load_positions,
     db_upsert_ghost, db_delete_ghost, db_load_ghosts,
-    db_update_wallet_style,
+    db_update_wallet_style, db_update_skip_counters,
 )
 
 # Shared session registry (keyed by lowercase address)
 _sessions: dict = {}
+
+# Every reason a fill can fail to produce a copy, for skip_counts (per-wallet,
+# surfaced on the dashboard so "nothing silent" also covers WHY, not just a
+# single aggregate number). "ghosted"/"dust_buffered" are high-frequency and
+# transient (a ghost may later flip into a copy; a dust buffer may later
+# flush) so they don't add to skipped_fills_count/copy_efficiency_pct below —
+# every other category does, same as it always has.
+_SKIP_CATEGORIES = (
+    "ghosted", "dust_buffered", "dust_skipped", "deviation", "exposure",
+    "affordability", "position_cap", "blocked", "external_market", "other",
+)
 
 DUST_GUARD = settings.copy_rules.min_position_size_usd  # HL's real minimum order notional (configurable via MIN_POSITION_SIZE_USD) — fills below this are skipped (same as live trading)
 
@@ -149,6 +161,8 @@ class WalletSession:
     total_fees_paid: float = 0.0      # cumulative taker fees deducted from balance
     total_funding_paid: float = 0.0   # cumulative funding charges (positive = paid, negative = earned)
     skipped_fills_count: int = 0      # fills skipped by dust guard (for copy efficiency)
+    skip_counts: dict = field(default_factory=lambda: {k: 0 for k in _SKIP_CATEGORIES})  # per-reason breakdown — see _SKIP_CATEGORIES
+    _skip_counts_dirty: bool = False  # set by _mark_skip; cleared once the periodic snapshot loop persists it
     wins: int = 0
     losses: int = 0
     equity_history: list = field(default_factory=list)
@@ -283,9 +297,14 @@ def _session_to_dict(s: WalletSession, price_override: dict | None = None) -> di
     # discrepancy — use allMids instead to prevent the inflation.
     _ws_prices  = {}
     _mid_prices = {}
+    _target_sizes = {}
     if s.monitor and s.monitor.current_state:
         _ws_prices = {p.symbol: p.current_price
                       for p in s.monitor.current_state.positions if p.current_price > 0}
+        # For position-drift detection below — the target's actual size per
+        # symbol, refreshed on the same ~50-70s cadence as current_state
+        # itself (_periodic_state_refresh in monitor.py).
+        _target_sizes = {p.symbol: abs(p.size) for p in s.monitor.current_state.positions}
     if _mids_cache:
         _mid_prices = {sym: float(px) for sym, px in _mids_cache.items() if float(px) > 0}
 
@@ -334,12 +353,27 @@ def _session_to_dict(s: WalletSession, price_override: dict | None = None) -> di
         else:
             dist_to_liq_pct = None
 
+        # Position drift: expected_size = target's actual size × the ratio this
+        # position was opened/last-added at, vs. what we're actually holding.
+        # Surfaces residual desync (e.g. from a guard skip that blocked an add)
+        # instead of assuming the mirror is always exact — decision data for a
+        # paper-trading evaluation tool, not something to silently auto-correct.
+        target_size = _target_sizes.get(sym)
+        if target_size and target_size > 0 and size > 0:
+            expected_size = target_size * pos.get("copy_ratio", s.copy_ratio)
+            sync_pct = round(min(size, expected_size) / max(size, expected_size) * 100, 1) \
+                if expected_size > 0 else None
+        else:
+            sync_pct = None
+        desynced = sync_pct is not None and sync_pct < 90.0
+
         positions.append({
             "symbol": sym, "side": pos.get("side", "LONG"),
             "size": size, "entry_price": entry, "current_price": current_price,
             "leverage": pos.get("leverage", 1), "value": val,
             "margin_used": margin, "upnl": round(upnl, 4), "pnl_pct": round(pnl_pct, 2),
             "liq_price": liq_price, "dist_to_liq_pct": dist_to_liq_pct,
+            "sync_pct": sync_pct, "desynced": desynced,
         })
 
     # equity = free_cash + locked_margin + unrealized_pnl
@@ -361,6 +395,28 @@ def _session_to_dict(s: WalletSession, price_override: dict | None = None) -> di
         annualized_return = None
     total_attempted   = s.trades_copied_count + s.skipped_fills_count
     copy_efficiency   = round(s.trades_copied_count / total_attempted * 100, 1) if total_attempted else 100.0
+
+    ghosted = [{"symbol": sym, **g} for sym, g in s.ghost_positions.items()]
+    pending_dust = [
+        {
+            "symbol": sym,
+            "side": buf["side"],
+            "size": round(buf["size"], 8),
+            "notional": round(buf["px_volume"], 2),
+            "vwap": round(buf["px_volume"] / buf["size"], 6) if buf["size"] > 0 else 0,
+            "fill_count": buf["fill_count"],
+        }
+        for sym, buf in s.pending_dust.items()
+    ]
+    feed_age_secs = None
+    fill_queue_depth = None
+    if s.monitor:
+        last_evt = getattr(s.monitor, "last_ws_event_ts", 0)
+        if last_evt:
+            feed_age_secs = round(time.time() - last_evt, 1)
+        fq = getattr(s.monitor, "_fill_queue", None)
+        if fq is not None:
+            fill_queue_depth = fq.qsize()
 
     return {
         "address": s.address, "label": s.label,
@@ -391,6 +447,11 @@ def _session_to_dict(s: WalletSession, price_override: dict | None = None) -> di
         "median_hold_secs": round(s.median_hold_secs, 1),
         "debounce_secs": s.debounce_secs,
         "ratio_mode": s.ratio_mode,
+        "skip_counts": dict(s.skip_counts),
+        "ghosted": ghosted,
+        "pending_dust": pending_dust,
+        "feed_age_secs": feed_age_secs,
+        "fill_queue_depth": fill_queue_depth,
     }
 
 
@@ -548,6 +609,21 @@ def _ratio_for_new_position(session: WalletSession, target_size: float, price: f
     return session.copy_ratio  # "fixed" (default) — unchanged behavior
 
 
+def _mark_skip(session: "WalletSession", fill_id, category: str, count: bool = True) -> None:
+    """Record a skip at one of the guard sites below: bump the per-reason
+    breakdown (skip_counts, dashboard-visible) and, for "true" skips, the
+    aggregate skipped_fills_count that copy_efficiency_pct is derived from —
+    then mark the fill processed so a WS-reconnect replay of the same fill
+    doesn't recount it. `count=False` for reasons that aren't a permanent
+    miss (ghosted may later flip into a copy; dust_buffered may later flush)."""
+    session.skip_counts[category] = session.skip_counts.get(category, 0) + 1
+    session._skip_counts_dirty = True
+    if count:
+        session.skipped_fills_count += 1
+    session._processed_fill_ids[fill_id] = None
+    _evict_fill_ids(session)
+
+
 async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_fn: Callable) -> None:
     """Process a confirmed fill: size, fee, slippage, guards, position update, DB, emit."""
     symbol      = fill_data.get("coin", "")
@@ -555,8 +631,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
         # Skip external-builder markets (pre-IPO stocks, tokenised assets, etc.)
         # Coin names like "XYZ:SNDK" are routed via HL external builders, not perp fills.
         logger.debug(f"[{session.label}] External-market fill skipped ({symbol})")
-        session._processed_fill_ids[fill_id] = None
-        _evict_fill_ids(session)
+        _mark_skip(session, fill_id, "external_market")
         return
     side_str    = fill_data.get("side", "")
     target_size = abs(float(fill_data.get("sz", 0)))
@@ -635,12 +710,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     # (a reversal invalidates whatever thesis the buffer was accumulating
     # toward) — mixing it into a VWAP with the new side makes no sense.
     if is_flip and our_notional < DUST_GUARD:
-        session.skipped_fills_count += 1
-        # Mark processed even though skipped — otherwise a WS-reconnect replay of this
-        # same fill re-triggers this branch every time, inflating skipped_fills_count
-        # (and the displayed copy_efficiency_pct) without bound on every reconnect.
-        session._processed_fill_ids[fill_id] = None
-        _evict_fill_ids(session)
+        _mark_skip(session, fill_id, "dust_skipped")
         return
 
     # Dust accumulator (faithful mirror): a plain open/add below HL's real $10
@@ -664,9 +734,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
         buf_notional = buf["px_volume"]
         if buf_notional < DUST_GUARD:
             session.pending_dust[symbol] = buf
-            session.skipped_fills_count += 1
-            session._processed_fill_ids[fill_id] = None
-            _evict_fill_ids(session)
+            _mark_skip(session, fill_id, "dust_buffered", count=False)
             return
         # Cumulative notional crossed the floor — flush as one aggregated open
         # at VWAP, falling through to the normal path below (deviation guard,
@@ -696,9 +764,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             if cur_mid and cur_mid > 0:
                 deviation_pct = abs(cur_mid - price) / price * 100
                 if deviation_pct > max_dev:
-                    session.skipped_fills_count += 1
-                    session._processed_fill_ids[fill_id] = None
-                    _evict_fill_ids(session)
+                    _mark_skip(session, fill_id, "deviation")
                     logger.warning(
                         f"[{session.label}] Entry deviation guard: {symbol} target fill "
                         f"${price:,.4f} vs current ${cur_mid:,.4f} "
@@ -730,9 +796,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
         max_trades = settings.copy_rules.max_open_trades
         if max_trades and len(session.simulated_positions) >= max_trades:
             logger.warning(f"[{session.label}] Position cap ({max_trades}) hit — skip {symbol}")
-            session.skipped_fills_count += 1
-            session._processed_fill_ids[fill_id] = None
-            _evict_fill_ids(session)
+            _mark_skip(session, fill_id, "position_cap")
             return
 
     # ── Net exposure guard ────────────────────────────────────────────────────
@@ -758,9 +822,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
         cap = settings.risk_management.max_net_exposure_pct
         if eq > 0 and cap > 0 and abs(new_long - new_short) / eq > cap:
             logger.warning(f"[{session.label}] Net exposure guard: skip {symbol}")
-            session.skipped_fills_count += 1
-            session._processed_fill_ids[fill_id] = None
-            _evict_fill_ids(session)
+            _mark_skip(session, fill_id, "exposure")
             return
 
     # ── Fee ───────────────────────────────────────────────────────────────────
@@ -807,9 +869,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     if is_opening and not is_flip:
         _margin_est = our_size * price / max(our_leverage, 1)
         if _margin_est > session.simulated_balance:
-            session.skipped_fills_count += 1
-            session._processed_fill_ids[fill_id] = None
-            _evict_fill_ids(session)
+            _mark_skip(session, fill_id, "affordability")
             logger.warning(
                 f"[{session.label}] Affordability guard: {symbol} needs "
                 f"~${_margin_est:,.0f} margin but free balance is "
@@ -821,11 +881,13 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     # Also covers a symbol that was only ever a dust buffer (never flushed to a
     # real position) and the target now closes it — nothing to close on our
     # side, so discard the buffer rather than leaving it to accumulate toward
-    # a position the target no longer even holds.
+    # a position the target no longer even holds. Not counted toward
+    # skipped_fills_count: there's nothing WE could have copied here (no
+    # symbol tracking existed on our side at all), unlike the guards above
+    # which reject a copy attempt we actually could have made.
     if is_closing and not is_flip and symbol not in session.simulated_positions:
         session.pending_dust.pop(symbol, None)
-        session._processed_fill_ids[fill_id] = None
-        _evict_fill_ids(session)
+        _mark_skip(session, fill_id, "other", count=False)
         return
 
     # Snapshot target's pre-close position size for close-fraction calculation.
@@ -1012,20 +1074,19 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             position_value = our_size * price
             margin_req     = position_value / max(our_leverage, 1)
 
-            # Re-validate the position-count and net-exposure guards atomically too —
-            # same race as the affordability re-check just below: the pre-lock checks
-            # (Position count guard / Net exposure guard, above) read session state
-            # before any concurrent fill for this session has mutated it, so several
-            # opens can each pass against the same stale snapshot and all get admitted.
+            # Re-validate the position-count and net-exposure guards here too.
+            # C8's per-wallet FIFO queue means fills for one session no longer
+            # run _process_fill concurrently, so these can no longer actually
+            # lose a race against a sibling fill the way the pre-lock checks
+            # above could when dispatch was still create_task-per-fill —
+            # they're now redundant-but-harmless defense in depth against any
+            # future change to that guarantee, not a live correctness need.
             if is_opening and not is_flip:
                 max_trades = settings.copy_rules.max_open_trades
                 if max_trades and len(session.simulated_positions) >= max_trades:
-                    session.skipped_fills_count += 1
-                    session._processed_fill_ids[fill_id] = None
-                    _evict_fill_ids(session)
+                    _mark_skip(session, fill_id, "position_cap")
                     logger.warning(
-                        f"[{session.label}] Position cap re-check failed (lost race to a "
-                        f"concurrent fill): {symbol} — skip"
+                        f"[{session.label}] Position cap re-check failed: {symbol} — skip"
                     )
                     return
                 cap = settings.risk_management.max_net_exposure_pct
@@ -1047,32 +1108,23 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
                     new_long  = long_n  + (our_notional if position_side == PositionSide.LONG  else 0)
                     new_short = short_n + (our_notional if position_side == PositionSide.SHORT else 0)
                     if eq > 0 and abs(new_long - new_short) / eq > cap:
-                        session.skipped_fills_count += 1
-                        session._processed_fill_ids[fill_id] = None
-                        _evict_fill_ids(session)
+                        _mark_skip(session, fill_id, "exposure")
                         logger.warning(
-                            f"[{session.label}] Net exposure re-check failed (lost race to a "
-                            f"concurrent fill): {symbol} — skip"
+                            f"[{session.label}] Net exposure re-check failed: {symbol} — skip"
                         )
                         return
 
-            # Re-validate affordability atomically, inside the lock, using the live
-            # balance. monitor.py dispatches each fill via asyncio.create_task, so
-            # several fills for this session can run _process_fill concurrently; the
-            # pre-lock affordability guard above reads session.simulated_balance
-            # before any of them have deducted, so concurrent fills can all pass that
-            # check against the same stale balance and then all deduct sequentially
-            # once they reach this lock — over-committing margin beyond real capital.
-            # This is the point that actually spends the balance, so — together with
-            # the position-count/net-exposure re-checks just above — it's race-safe.
+            # Re-validate affordability here too, using the live balance —
+            # this is the point that actually spends it, so together with the
+            # position-count/net-exposure re-checks just above it's the real
+            # backstop if a future change reintroduces concurrent processing
+            # for one session (see the comment on those re-checks).
             if margin_req > session.simulated_balance:
-                session.skipped_fills_count += 1
-                session._processed_fill_ids[fill_id] = None
-                _evict_fill_ids(session)
+                _mark_skip(session, fill_id, "affordability")
                 logger.warning(
-                    f"[{session.label}] Affordability re-check failed (lost race to a "
-                    f"concurrent fill): {symbol} needs ${margin_req:,.2f} margin but free "
-                    f"balance is ${session.simulated_balance:,.2f} — skip"
+                    f"[{session.label}] Affordability re-check failed: {symbol} needs "
+                    f"${margin_req:,.2f} margin but free balance is "
+                    f"${session.simulated_balance:,.2f} — skip"
                 )
                 return
 
@@ -1305,6 +1357,7 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
 
             # Blocked assets
             if symbol.upper() in settings.copy_rules.blocked_assets:
+                _mark_skip(session, fill_id, "blocked")
                 return
 
             # Ghost guard — positions we chose not to open at startup.
@@ -1334,6 +1387,8 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
                         session.ghost_positions.pop(symbol)
                         await asyncio.to_thread(db_delete_ghost, session.address, symbol)
                         logger.debug(f"[{session.label}] Ghost {symbol} closed by target — removed")
+                        session._processed_fill_ids[fill_id] = None
+                        _evict_fill_ids(session)
                     else:
                         # BUG FIX: this ran as a blocking synchronous DB call directly
                         # on the event loop, on every single fill for an actively-traded
@@ -1341,8 +1396,7 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
                         # already held when we started tracking it) — a real hot path
                         # for busy algorithmic wallets, not an edge case.
                         await asyncio.to_thread(db_upsert_ghost, session.address, symbol, ghost)
-                    session._processed_fill_ids[fill_id] = None
-                    _evict_fill_ids(session)
+                        _mark_skip(session, fill_id, "ghosted", count=False)
                     return
 
             assert symbol not in session.ghost_positions, f"BUG: {symbol} still in ghost_positions at order placement"
@@ -1604,6 +1658,14 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
             if time.monotonic() - session._style_last_checked > _STYLE_RECHECK_SECS:
                 asyncio.create_task(_detect_trading_style(session))
 
+            # Only-when-changed: skip_counts can update on every single fill for
+            # a busy wallet, but the dashboard already gets it via state_update
+            # below — this DB write is purely for restart-survival, so persist
+            # at this same ~30s cadence instead of on every skip.
+            if session._skip_counts_dirty:
+                session._skip_counts_dirty = False
+                await asyncio.to_thread(db_update_skip_counters, session.address, session.skip_counts)
+
             emit_fn("state_update", _session_to_dict(session))
 
         except Exception as e:
@@ -1632,13 +1694,20 @@ def _create_session(address: str, label: str, start_balance: float = None,
                     copy_mode: str = "all_fills", debounce_secs: int = 30,
                     detected_style: str = "Swing", ratio_mode: str = "fixed",
                     fixed_amount_usd: float | None = None,
-                    last_fill_time_ms: int = 0) -> "WalletSession":
+                    last_fill_time_ms: int = 0,
+                    skip_counters_json: str | None = None) -> "WalletSession":
     address = address.lower()
     balance = float(start_balance) if start_balance else settings.simulated_account_balance
     client  = HyperliquidClient(settings.hyperliquid.api_url)
     monitor = WalletMonitor(address, settings.hyperliquid.api_url, settings.hyperliquid.ws_url,
                              last_fill_time_ms=last_fill_time_ms)
     sizer = PositionSizer()
+    skip_counts = {k: 0 for k in _SKIP_CATEGORIES}
+    if skip_counters_json:
+        try:
+            skip_counts.update(json.loads(skip_counters_json))
+        except (TypeError, ValueError):
+            pass
     session = WalletSession(
         address=address, label=label,
         monitor=monitor, position_sizer=sizer, client=client,
@@ -1646,6 +1715,7 @@ def _create_session(address: str, label: str, start_balance: float = None,
         bot_start_time=datetime.now(),
         copy_mode=copy_mode, debounce_secs=debounce_secs, detected_style=detected_style,
         ratio_mode=ratio_mode, fixed_amount_usd=fixed_amount_usd,
+        skip_counts=skip_counts,
     )
     _sessions[address] = session
     return session
@@ -2169,6 +2239,15 @@ async def _reinit_session_body(session: WalletSession, emit_fn: Callable):
     session.total_fees_paid      = 0.0
     session.total_funding_paid   = 0.0
     session.trades_copied_count  = 0
+    # BUG FIX: reinit reset trades_copied_count but not skipped_fills_count,
+    # so copy_efficiency_pct (= trades_copied / (trades_copied + skipped))
+    # computed 0% immediately after every reinit until enough new trades
+    # diluted the pre-reinit skip count back down — a permanently wrong
+    # baseline the dashboard would show right after the exact action meant
+    # to reset the account's stats.
+    session.skipped_fills_count  = 0
+    session.skip_counts          = {k: 0 for k in _SKIP_CATEGORIES}
+    session._skip_counts_dirty   = False
     session.wins                 = 0
     session.losses               = 0
     session._processed_fill_ids  = {}
@@ -2313,6 +2392,10 @@ async def _reinit_session_body(session: WalletSession, emit_fn: Callable):
 
     session.recent_fills = await _fetch_target_fills(session)
     await _detect_trading_style(session)
+    # Persist the reset skip_counts immediately rather than waiting for the next
+    # skip to mark it dirty — otherwise a restart shortly after a reinit (but
+    # before any new skip) would restore the stale pre-reinit counters from DB.
+    await asyncio.to_thread(db_update_skip_counters, session.address, session.skip_counts)
 
     # Final sweep: a snapshot-loop tick already past its lock acquisitions when
     # this reinit grabbed the state lock can still write ONE pre-reset equity
