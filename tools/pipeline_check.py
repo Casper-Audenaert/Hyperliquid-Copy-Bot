@@ -266,10 +266,7 @@ async def main():
     args = parser.parse_args()
 
     await scenario_basic_open_close()
-    # scenario_partial_close_start_position() targets the C7 fix (exact close
-    # fractions via the fill's startPosition field) — enabled once C7 lands.
-    if os.environ.get("PIPELINE_CHECK_INCLUDE_C7"):
-        await scenario_partial_close_start_position()
+    await scenario_partial_close_start_position()
     await scenario_dedup_idempotence()
     await scenario_snapshot_lock_deferred()
     await scenario_money_math_invariant(args.wallets)

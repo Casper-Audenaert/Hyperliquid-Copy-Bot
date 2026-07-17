@@ -623,7 +623,27 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     our_notional = our_size * price
     emit_size    = our_size
 
-    if our_notional < DUST_GUARD:
+    # BUG FIX: the dust guard used to apply unconditionally, including to
+    # Close/Reduce fills. But `our_size` (target_size * ratio) is a phantom
+    # "what would a fresh open of this size look like" value for a close —
+    # the close path below derives its REAL size from the sim's own existing
+    # position (`close_size = pos_size * fraction`), never from `our_size`,
+    # exactly as the comment on the exposure-cap guard above already notes
+    # ("closes derive their size from the existing position, not from this
+    # value"). Gating a close on this unrelated phantom notional meant a
+    # perfectly real, correctly-sized reduction of an actual held position
+    # could be silently skipped whenever target_size * ratio happened to be
+    # small — permanently leaving our sim position desynced from the
+    # target's (never reduced/closed to match) until some later fill
+    # happened to clear the threshold, if ever. A close should never be
+    # blocked by a same-notional-as-an-open-order minimum: reducing risk to
+    # match the target is not "placing a new order," and skipping it only
+    # makes the desync worse, not better.
+    # Flips ARE still dust-gated: unlike a plain close, `our_size` for a flip
+    # is the genuinely new position's size on the opposite side (resolved via
+    # _ratio_for_new_position above), not a phantom value — the same "can we
+    # actually place this order" question applies as for a fresh open.
+    if not (is_closing and not is_flip) and our_notional < DUST_GUARD:
         session.skipped_fills_count += 1
         # Mark processed even though skipped — otherwise a WS-reconnect replay of this
         # same fill re-triggers this branch every time, inflating skipped_fills_count
@@ -778,13 +798,32 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
         _evict_fill_ids(session)
         return
 
-    # Snapshot target's pre-close position size for close-fraction calculation
+    # Snapshot target's pre-close position size for close-fraction calculation.
+    # 3-tier resolution, most exact first:
+    #   1. The fill's own `startPosition` field — Hyperliquid includes this on
+    #      every userFills entry (verified live against the real API: keys
+    #      include 'startPosition', a signed pre-fill position size). This is
+    #      the target's EXACT position at the moment of this exact fill, with
+    #      no staleness — using it eliminates the old bug where a partial
+    #      close's fraction was computed from monitor.current_state, which is
+    #      only refreshed every 50-70s and can be badly stale mid-burst.
+    #   2. monitor.current_state (existing fallback, up to 50-70s stale).
+    #   3. Ratio inference from our own position size (existing fallback,
+    #      applied later at the `else` branch below) — used only when neither
+    #      of the above is available.
     target_pos_size = 0.0
-    if is_closing and not is_flip and session.monitor.current_state:
-        for _p in session.monitor.current_state.positions:
-            if _p.symbol == symbol:
-                target_pos_size = _p.size
-                break
+    if is_closing and not is_flip:
+        _start_pos_raw = fill_data.get("startPosition")
+        if _start_pos_raw is not None:
+            try:
+                target_pos_size = abs(float(_start_pos_raw))
+            except (TypeError, ValueError):
+                target_pos_size = 0.0
+        if target_pos_size <= 0 and session.monitor.current_state:
+            for _p in session.monitor.current_state.positions:
+                if _p.symbol == symbol:
+                    target_pos_size = _p.size
+                    break
 
     # Set inside the lock below (pure in-memory _equity_from_cache read) but the
     # actual DB write is deferred until AFTER the lock is released — BUG FIX:
