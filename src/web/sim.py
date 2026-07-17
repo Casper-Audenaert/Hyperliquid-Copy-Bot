@@ -33,7 +33,7 @@ from web.db import (
     purge_equity_snapshots,
     db_get_latest_equity_snapshot, db_restore_session_counters,
     db_get_known_fill_ids, db_update_trade_equity,
-    db_upsert_position, db_delete_position, db_load_positions,
+    db_upsert_position, db_delete_position, db_load_positions, db_update_positions_funding,
     db_upsert_ghost, db_delete_ghost, db_load_ghosts,
     db_update_wallet_style, db_update_skip_counters,
 )
@@ -156,6 +156,7 @@ class WalletSession:
     _style_last_checked: float = 0.0                       # monotonic time of last _detect_trading_style call
     _last_equity_tick_ts: float = 0.0                      # monotonic time of last equity_tick emit from fills
     _last_fill_snap_ts: float = 0.0                        # monotonic time of last fill-triggered equity snapshot
+    _last_funding_persist_ts: float = 0.0                  # monotonic time of last per-position funding_paid persist (throttled, see the funding loop)
     median_hold_secs: float = 60.0                         # median position hold time (seconds) for this target
     simulated_pnl: float = 0.0        # cumulative realized PnL (gross, pre-fee)
     total_fees_paid: float = 0.0      # cumulative taker fees deducted from balance
@@ -374,6 +375,7 @@ def _session_to_dict(s: WalletSession, price_override: dict | None = None) -> di
             "margin_used": margin, "upnl": round(upnl, 4), "pnl_pct": round(pnl_pct, 2),
             "liq_price": liq_price, "dist_to_liq_pct": dist_to_liq_pct,
             "sync_pct": sync_pct, "desynced": desynced,
+            "funding_paid": round(pos.get("funding_paid", 0.0), 4),
         })
 
     # equity = free_cash + locked_margin + unrealized_pnl
@@ -1535,14 +1537,16 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
                         pos_value = abs(pos["size"]) * px
                         charge    = pos_value * rate / 1200  # 1h rate ÷ 1200 three-second ticks
                         is_long   = pos.get("side", "").upper() == "LONG"
+                        # Sign convention matches total_funding_paid: positive = paid, negative = earned.
+                        signed_charge = charge if is_long else -charge
                         if is_long:
                             session.simulated_balance   -= charge
                             session.total_funding_paid  += charge
                         else:
                             session.simulated_balance   += charge
                             session.total_funding_paid  -= charge
-                        # Sign convention matches total_funding_paid: positive = paid, negative = earned.
-                        _funding_breakdown.append({"symbol": sym, "charge": round(charge if is_long else -charge, 4)})
+                        pos["funding_paid"] = pos.get("funding_paid", 0.0) + signed_charge
+                        _funding_breakdown.append({"symbol": sym, "charge": round(signed_charge, 4)})
                     session.simulated_balance = max(session.simulated_balance, 0.0)
             except Exception as e:
                 logger.warning(f"[{session.label}] funding rate fetch failed, skipping: {e}")
@@ -1554,6 +1558,19 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
                 # Always persist the running total even when the full equity snapshot
                 # is rate-limited — UPDATE (not INSERT) so no chart rows are added.
                 await asyncio.to_thread(db_update_latest_funding, session.address, session.total_funding_paid)
+                # Per-position funding_paid (pos["funding_paid"], above) is throttled to
+                # once/60s and batched into one DB session — persisting it every 3s tick,
+                # per position, would multiply write load by open-position count on top
+                # of the wallet-level update just above.
+                _now_mono = time.monotonic()
+                if _now_mono - session._last_funding_persist_ts >= 60:
+                    session._last_funding_persist_ts = _now_mono
+                    _funding_by_symbol = {
+                        sym: pos["funding_paid"]
+                        for sym, pos in session.simulated_positions.items()
+                        if "funding_paid" in pos
+                    }
+                    await asyncio.to_thread(db_update_positions_funding, session.address, _funding_by_symbol)
 
             _funding_total = round(sum(f["charge"] for f in _funding_breakdown), 4)
             if _funding_total != 0:

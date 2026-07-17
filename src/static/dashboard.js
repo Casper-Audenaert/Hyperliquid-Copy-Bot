@@ -521,6 +521,23 @@ function _walletStatusBadgesHtml(addr, s) {
 // status badges) for the currently-selected single wallet. Empty in
 // compare mode — there's no one wallet to headline — which also collapses
 // the bar via .wallet-header:empty.
+// Feed-health dot: distinguishes "target is just idle" from "the feed died"
+// (a WS connection can report is_running=true while silently receiving
+// nothing — see monitor.py's last_ws_event_ts). null means no event has
+// arrived since this monitor started, which is normal right after a wallet
+// is added — shown neutral rather than alarming.
+function _feedHealthDotHtml(feedAgeSecs) {
+  if (feedAgeSecs == null) {
+    return `<span class="wh-feed" title="No feed event yet"><span class="wh-feed-dot z"></span>—</span>`;
+  }
+  const cls = feedAgeSecs < 60 ? 'pos' : feedAgeSecs < 300 ? 'warn' : 'neg';
+  const label = feedAgeSecs < 90 ? `${Math.round(feedAgeSecs)}s ago`
+    : feedAgeSecs < 5400 ? `${Math.round(feedAgeSecs/60)}m ago`
+    : `${Math.round(feedAgeSecs/3600)}h ago`;
+  return `<span class="wh-feed" title="Time since the last WS event for this wallet — red past 5 minutes means the connection may be half-open, not just quiet">
+    <span class="wh-feed-dot ${cls}"></span>feed ${label}</span>`;
+}
+
 function renderWalletHeader() {
   const el = document.getElementById('wallet-header');
   if (!el) return;
@@ -530,7 +547,7 @@ function renderWalletHeader() {
   el.innerHTML = `
     <span class="wh-name">${s.label}</span>
     <span class="wh-addr" onclick="copyAddr('${addr}')" title="${addr} — click to copy">${addr.slice(0,6)}…${addr.slice(-4)}<span class="copy-icon">⎘</span></span>
-    <div class="wh-badges">${_walletStatusBadgesHtml(addr, s)}</div>`;
+    <div class="wh-badges">${_walletStatusBadgesHtml(addr, s)}${_feedHealthDotHtml(s.feed_age_secs)}</div>`;
 }
 
 // Shows/hides the tab whose content only makes sense for one wallet
@@ -750,6 +767,26 @@ function renderKpis() {
   setKpi('t', String(wins + losses), npos+' open position'+(npos!==1?'s':''), null);
   setKpi('f', fUsd(fees), funding !== 0 ? `+ ${fUsd(Math.abs(funding))} funding` : '', null);
 
+  // Direction Bias: split of open notional between long and short, as a
+  // micro bar — a quick read on whether this target is net-long or net-short
+  // right now, not just what any single position's side is.
+  const posAll   = sess.flatMap(s => s.positions || []);
+  const longVal  = posAll.filter(p => (p.side||'').toUpperCase()==='LONG').reduce((a,p)=>a+(p.value||0),0);
+  const shortVal = posAll.filter(p => (p.side||'').toUpperCase()==='SHORT').reduce((a,p)=>a+(p.value||0),0);
+  const totalExp = longVal + shortVal;
+  const longPct  = totalExp>0 ? longVal/totalExp*100 : 50;
+  setKpi('db', totalExp>0 ? (longPct>=50 ? `${longPct.toFixed(0)}% Long` : `${(100-longPct).toFixed(0)}% Short`) : '—', '', null);
+  const dbSubEl = document.getElementById('ks-db');
+  if (dbSubEl) {
+    dbSubEl.innerHTML = totalExp>0
+      ? `<div class="db-bar"><div class="db-bar-long" style="width:${longPct}%"></div><div class="db-bar-short" style="width:${100-longPct}%"></div></div>`
+      : '';
+  }
+
+  // Volume: from /api/stats (statsCache), same refresh cadence as Sharpe/drawdown below.
+  const vol = sess.reduce((a,s)=>a+(statsCache[s.address]?.total_volume||0), 0);
+  setKpi('vol', vol>0 ? fUsd(vol) : '—', '', null);
+
   // Sharpe/drawdown come from /api/stats (statsCache), refreshed less often
   // than the per-tick state — averaged across compared wallets same as win rate.
   const sharpes = sess.map(s => statsCache[s.address]?.sharpe).filter(v => v != null);
@@ -783,6 +820,10 @@ function renderKpis() {
       ? `${selN}/${total} wallets`
       : uptime > 0 ? `up ${uptime.toFixed(1)}h` : '';
 }
+// Hyperdash calls this row "stat chips" — alias kept so both names resolve;
+// renderKpis is the one actually wired to every call site, left unrenamed
+// throughout the file to avoid a purely-cosmetic mass rename.
+const renderStatChips = renderKpis;
 
 function setKpi(id, val, sub, num) {
   const vEl=document.getElementById('kv-'+id), sEl=document.getElementById('ks-'+id), cEl=document.getElementById('kc-'+id);
@@ -811,6 +852,11 @@ function softSwap(el, renderFn) {
 }
 
 // ── Positions ──────────────────────────────────────────────────────────────
+// Dense table (Hyperdash-style) — one row per position, sorted by notional
+// value descending (biggest exposure first). Sync column is the direct
+// answer to "positions desynced": our size vs. target_size × the ratio this
+// position was opened/last-added at (sync_pct/desynced come from sim.py's
+// _session_to_dict, refreshed on the same ~50-70s cadence as current_state).
 let _knownPositionKeys = new Set(); // symbol+side(+wallet) keys seen last render — new ones get a slide-in
 
 function renderPositions() {
@@ -821,41 +867,49 @@ function renderPositions() {
   const wrap = document.getElementById('pos-list');
   if (!all.length) { wrap.innerHTML='<div class="no-pos">No open positions</div>'; _knownPositionKeys = new Set(); return; }
 
+  all.sort((a,b) => (b.value||0) - (a.value||0));
+
   const _nextKeys = new Set();
-  wrap.innerHTML = all.map(p => {
-    const side   = (p.side||'LONG').toLowerCase();
-    const key    = `${p._lbl}:${p.symbol}:${side}`;
+  const rows = all.map(p => {
+    const side    = (p.side||'LONG').toLowerCase();
+    const key     = `${p._lbl}:${p.symbol}:${side}`;
     _nextKeys.add(key);
-    const isNew  = !_knownPositionKeys.has(key);
-    const upnl   = p.upnl ?? 0;
-    const pct    = p.pnl_pct ?? 0;
-    const pnlCls = upnl>0?'pnl-g':upnl<0?'pnl-r':'pnl-n';
-    const mark   = p.current_price || p.entry_price;
-    const wlbl   = compareMode ? `<div class="wallet-badge">${p._lbl}</div>` : '';
-    return `<div class="pc ${side}${isNew?' fnew':''}">
-  ${wlbl}
-  <div class="pc-top">
-    <span class="pc-sym">${p.symbol}</span>
-    <div class="pc-tags">
-      <span class="side-tag ${side}">${side.toUpperCase()}</span>
-      <span class="lev-tag">${p.leverage}×</span>
-    </div>
-  </div>
-  <div class="pc-grid">
-    <div class="pc-s"><span class="pc-sl">Entry</span><span class="pc-sv mono">$${fPx(p.entry_price)}</span></div>
-    <div class="pc-s"><span class="pc-sl">Mark</span><span class="pc-sv mono">$${fPx(mark)}</span></div>
-    <div class="pc-s"><span class="pc-sl">Size</span><span class="pc-sv mono">${fNum(p.size)}</span></div>
-    <div class="pc-s"><span class="pc-sl">Margin</span><span class="pc-sv mono">$${fPx(p.margin_used)}</span></div>
-    ${p.liq_price!=null?`<div class="pc-s"><span class="pc-sl">Liq</span><span class="pc-sv mono" style="color:var(--red)">$${fPx(p.liq_price)}</span></div>`:''}
-    ${p.dist_to_liq_pct!=null?`<div class="pc-s"><span class="pc-sl">Dist to Liq</span><span class="pc-sv mono" style="color:${p.dist_to_liq_pct<10?'var(--red)':p.dist_to_liq_pct<25?'var(--warn)':'var(--t2)'}">${p.dist_to_liq_pct}%</span></div>`:''}
-  </div>
-  <div class="pc-pnl ${pnlCls}">
-    <span class="pc-pnl-l">UPNL</span>
-    <span class="pc-pnl-v">${upnl>=0?'+':''}${fUsd(upnl)}</span>
-    <span class="pc-pnl-p">${fPct(pct)}</span>
-  </div>
-</div>`;
+    const isNew   = !_knownPositionKeys.has(key);
+    const upnl    = p.upnl ?? 0;
+    const pct     = p.pnl_pct ?? 0;
+    const pnlCls  = upnl>0?'pos':upnl<0?'neg':'z';
+    const mark    = p.current_price || p.entry_price;
+    const funding = p.funding_paid ?? 0;
+    // Sign convention matches total_funding_paid: positive = paid (a cost, red),
+    // negative = earned (a credit, green) — inverse of a typical PnL color.
+    const fundCls = funding>0?'neg':funding<0?'pos':'z';
+    const liqCls  = p.dist_to_liq_pct!=null && p.dist_to_liq_pct<10 ? 'neg' : p.dist_to_liq_pct!=null && p.dist_to_liq_pct<25 ? 'warn' : '';
+    const sync    = p.sync_pct;
+    const syncHtml = sync == null
+      ? `<span style="color:var(--t3)" title="No recent target position size to compare against yet">—</span>`
+      : p.desynced
+      ? `<span style="color:var(--warn)" title="Our size is only ${sync}% of what the target's current position × this position's copy ratio implies — a guard likely blocked a copy along the way">⚠ ${sync}%</span>`
+      : `<span style="color:var(--green)" title="Within tolerance of the target's current position × this position's copy ratio (${sync}% match)">✓ ${sync}%</span>`;
+    const wlbl = compareMode ? `<span class="wallet-badge-inline">${p._lbl}</span> ` : '';
+    return `<tr class="${side}${isNew?' fnew':''}">
+      <td>${wlbl}<span class="pc-sym">${p.symbol}</span></td>
+      <td><span class="side-tag ${side}">${side.toUpperCase()}</span> <span class="lev-tag">${p.leverage}×</span></td>
+      <td class="mono">${fNum(p.size)}</td>
+      <td class="mono">${fUsd(p.value)}</td>
+      <td class="mono">$${fPx(p.entry_price)}</td>
+      <td class="mono">$${fPx(mark)}</td>
+      <td class="mono ${liqCls}">${p.liq_price!=null?'$'+fPx(p.liq_price):'—'}</td>
+      <td class="mono ${pnlCls}">${upnl>=0?'+':''}${fPnl(upnl)} <span style="opacity:.7">(${fPct(pct)})</span></td>
+      <td class="mono ${fundCls}">${funding===0?'—':(funding<0?'+':'')+fPnl(-funding)}</td>
+      <td class="mono">${fUsd(p.margin_used)}</td>
+      <td>${syncHtml}</td>
+    </tr>`;
   }).join('');
+
+  wrap.innerHTML = `<table class="ftbl postbl"><thead><tr>
+    <th>Coin</th><th>Side</th><th>Size</th><th>Value</th><th>Entry</th><th>Mark</th>
+    <th>Liq</th><th>uPnL / ROE%</th><th>Funding</th><th>Margin</th><th>Sync</th>
+  </tr></thead><tbody>${rows}</tbody></table>`;
   _knownPositionKeys = _nextKeys;
 }
 

@@ -243,6 +243,12 @@ header{
 }
 .wh-addr:hover{color:var(--brand)}
 .wh-badges{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-left:auto}
+.wh-feed{display:inline-flex;align-items:center;gap:5px;font-size:10px;font-family:var(--mono);color:var(--t2)}
+.wh-feed-dot{width:6px;height:6px;border-radius:50%;background:var(--t3)}
+.wh-feed-dot.pos{background:var(--green)}
+.wh-feed-dot.warn{background:var(--warn)}
+.wh-feed-dot.neg{background:var(--red)}
+.wh-feed-dot.z{background:var(--t3)}
 
 /* KPI strip — two tiers. Hero: the numbers worth a glance from across the
    room (Display scale). Secondary: supporting detail, denser and quieter.
@@ -267,6 +273,12 @@ header{
 .kpi-tier-sub .kpi-lbl{margin-bottom:3px}
 .kpi-tier-sub .kpi-val{font-size:15px;letter-spacing:-.3px}
 .kpi-tier-sub .kpi-sub{margin-top:2px}
+
+/* Direction Bias chip: a micro split-bar, long share vs short share of open
+   notional. Rendered in the .kpi-sub slot below the numeric bias %. */
+.db-bar{display:flex;width:100%;height:4px;border-radius:2px;overflow:hidden;margin-top:4px;background:var(--s3)}
+.db-bar-long{background:var(--green)}
+.db-bar-short{background:var(--red)}
 
 /* ── Content stack — full-width sections, Hyperdash-style ─────────────────
    wallet header → stat chips (.kpi-bar, above) → big chart → tab bar →
@@ -358,38 +370,20 @@ header{
 .ta-cnt{color:var(--t2);font-size:11px;flex:1;white-space:nowrap}
 .ta-notional{font-family:var(--mono);font-size:11px;color:var(--t2);white-space:nowrap}
 
-/* ── Positions ── */
-.pos-scroll{flex:1;overflow-y:auto;padding:8px;min-height:0}
+/* ── Positions — dense table (Hyperdash-style), reuses .ftbl's table chrome ── */
+.pos-scroll{flex:1;overflow-y:auto;min-height:0}
 .no-pos{padding:24px 0;text-align:center;color:var(--t3);font-size:12px}
-.pc{
-  border:1px solid var(--hr);
-  border-radius:var(--r);padding:9px 11px;margin-bottom:6px;background:var(--s2)
-}
-.pc:last-child{margin-bottom:0}
-/* Long/short reads from the side-tag badge below, not a border stripe — a
-   faint full-card tint reinforces it without adding a decorative accent. */
-.pc.long{background:color-mix(in srgb, var(--s2) 94%, var(--green) 6%)}
-.pc.short{background:color-mix(in srgb, var(--s2) 94%, var(--red) 6%)}
-.pc.fnew{animation:fslide var(--dur-med) var(--ease)}
-.pc-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px}
-.pc-sym{font-size:14px;font-weight:700;letter-spacing:-.3px}
-.pc-tags{display:flex;gap:5px;align-items:center}
+.postbl tr.fnew{animation:fslide var(--dur-med) var(--ease)}
+.postbl .pc-sym{font-weight:700;letter-spacing:-.2px}
+.postbl td.pos{color:var(--green)}
+.postbl td.neg{color:var(--red)}
+.postbl td.warn{color:var(--warn)}
+.postbl td.z{color:var(--t2)}
 .side-tag{padding:2px 7px;border-radius:4px;font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase}
 .side-tag.long{background:var(--green-a);color:var(--green);border:1px solid var(--green-b)}
 .side-tag.short{background:var(--red-a);color:var(--red);border:1px solid var(--red-b)}
 .lev-tag{font-size:11px;font-family:var(--mono);color:var(--t2)}
-.pc-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px 10px;margin-bottom:8px}
-.pc-s{display:flex;flex-direction:column;gap:1px}
-.pc-sl{font-size:9px;text-transform:uppercase;letter-spacing:.5px;color:var(--t3)}
-.pc-sv{font-size:11px;font-family:var(--mono)}
-.pc-pnl{display:flex;align-items:center;justify-content:space-between;padding-top:7px;border-top:1px solid var(--hr)}
-.pc-pnl-l{font-size:9px;text-transform:uppercase;letter-spacing:.5px;color:var(--t3)}
-.pc-pnl-v{font-size:13px;font-weight:700;font-family:var(--mono)}
-.pc-pnl-p{font-size:11px;font-family:var(--mono)}
-.pnl-g .pc-pnl-v,.pnl-g .pc-pnl-p{color:var(--green)}
-.pnl-r .pc-pnl-v,.pnl-r .pc-pnl-p{color:var(--red)}
-.pnl-n .pc-pnl-v,.pnl-n .pc-pnl-p{color:var(--t2)}
-.wallet-badge{font-size:9px;color:var(--t3);text-transform:uppercase;letter-spacing:.4px;margin-bottom:5px}
+.wallet-badge-inline{font-size:9px;color:var(--t3);text-transform:uppercase;letter-spacing:.4px;margin-right:4px}
 
 /* ── Trade feed ── */
 .feed-scroll{flex:1;overflow-y:auto;min-height:0}
@@ -677,9 +671,10 @@ header{
   .wallet-header{padding:var(--sp-sm) var(--sp-md)}
   .wh-name{font-size:15px}
 
-  /* Trade feed: horizontal scroll for wide table */
-  .feed-scroll{overflow-x:auto}
+  /* Trade feed / positions: horizontal scroll for wide tables */
+  .feed-scroll,.pos-scroll{overflow-x:auto}
   .ftbl{min-width:520px}
+  .postbl{min-width:760px}
 
   /* Feed header date filter: wrap to avoid overflow */
   .phdr{flex-wrap:wrap;gap:6px}
@@ -756,6 +751,8 @@ header{
       <div class="kpi" id="kc-p"><div class="kpi-lbl">Realized PnL</div><div class="kpi-val mono" id="kv-p">—</div><div class="kpi-sub mono" id="ks-p"></div></div>
       <div class="kpi" id="kc-u"><div class="kpi-lbl">Unrealized PnL</div><div class="kpi-val mono" id="kv-u">—</div><div class="kpi-sub mono" id="ks-u"></div></div>
       <div class="kpi" id="kc-w"><div class="kpi-lbl">Win Rate</div><div class="kpi-val mono" id="kv-w">—</div><div class="kpi-sub mono" id="ks-w"></div></div>
+      <div class="kpi" id="kc-db"><div class="kpi-lbl">Direction Bias</div><div class="kpi-val mono" id="kv-db">—</div><div class="kpi-sub" id="ks-db"></div></div>
+      <div class="kpi" id="kc-vol"><div class="kpi-lbl">Volume</div><div class="kpi-val mono" id="kv-vol">—</div><div class="kpi-sub mono" id="ks-vol"></div></div>
       <div class="kpi" id="kc-f"><div class="kpi-lbl">Fees Paid</div><div class="kpi-val mono" id="kv-f">—</div><div class="kpi-sub mono" id="ks-f"></div></div>
     </div>
   </div>

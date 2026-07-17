@@ -100,6 +100,7 @@ class SimulatedPosition(Base):
     leverage    = Column(Integer)
     margin_used = Column(Float)
     copy_ratio  = Column(Float)         # ratio locked at open time
+    funding_paid = Column(Float, default=0.0)  # cumulative funding for THIS position (positive = paid); throttled write, see sim.py
     updated_at  = Column(DateTime, default=datetime.utcnow)
 
 
@@ -164,6 +165,7 @@ for _col, _ddl in [
     ("fixed_amount_usd", "ALTER TABLE wallets ADD COLUMN fixed_amount_usd REAL"),
     ("last_fill_time_ms", "ALTER TABLE wallets ADD COLUMN last_fill_time_ms INTEGER DEFAULT 0"),
     ("skip_counters",    "ALTER TABLE wallets ADD COLUMN skip_counters TEXT"),
+    ("position_funding_paid", "ALTER TABLE simulated_positions ADD COLUMN funding_paid REAL DEFAULT 0"),
 ]:
     try:
         with _db_engine.connect() as conn:
@@ -565,6 +567,7 @@ def db_upsert_position(wallet_addr: str, symbol: str, pos: dict):
             row.leverage    = int(pos.get("leverage", 1))
             row.margin_used = pos.get("margin_used", 0)
             row.copy_ratio  = pos.get("copy_ratio", 1.0)
+            row.funding_paid = pos.get("funding_paid", row.funding_paid or 0.0)
             row.updated_at  = datetime.utcnow()
         else:
             db.add(SimulatedPosition(
@@ -575,7 +578,23 @@ def db_upsert_position(wallet_addr: str, symbol: str, pos: dict):
                 leverage=int(pos.get("leverage", 1)),
                 margin_used=pos.get("margin_used", 0),
                 copy_ratio=pos.get("copy_ratio", 1.0),
+                funding_paid=pos.get("funding_paid", 0.0),
             ))
+        db.commit()
+
+
+def db_update_positions_funding(wallet_addr: str, funding_by_symbol: dict):
+    """Throttled batch persist of per-position funding_paid (see sim.py's
+    _periodic_equity_snapshot) — one DB session for the whole wallet instead
+    of one db_upsert_position round-trip per open position on every funding
+    tick, which would multiply write load by position count every 3s."""
+    if not funding_by_symbol:
+        return
+    with DbSession(_db_engine) as db:
+        for symbol, funding_paid in funding_by_symbol.items():
+            db.query(SimulatedPosition).filter_by(wallet_addr=wallet_addr, symbol=symbol).update(
+                {"funding_paid": funding_paid}
+            )
         db.commit()
 
 
@@ -647,6 +666,7 @@ def db_load_positions(wallet_addr: str) -> dict:
             "value":       r.size * r.entry_price,
             "margin_used": r.margin_used,
             "copy_ratio":  r.copy_ratio,
+            "funding_paid": r.funding_paid or 0.0,
         }
     return result
 
