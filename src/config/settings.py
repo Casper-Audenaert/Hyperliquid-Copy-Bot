@@ -19,10 +19,6 @@ class TelegramConfig(BaseModel):
     report_interval_hours: int = 1
     api_base_url: str = "https://api.telegram.org"
 
-class SizingConfig(BaseModel):
-    max_position_size: float = 1000.0
-    max_total_exposure: float = 5000.0
-
 class LeverageConfig(BaseModel):
     # 1.0 = mirror the target's leverage exactly (still clamped to the real
     # per-asset Hyperliquid cap below, same as it would be on a live exchange).
@@ -35,20 +31,12 @@ class LeverageConfig(BaseModel):
     min_leverage: float = 1.0
 
 class CopyRulesConfig(BaseModel):
-    copy_existing_positions: bool = True
-    copy_existing_orders: bool = True
-    copy_open_positions: bool = True
-    auto_adjust_size: bool = True
-    use_limit_orders: bool = False  # Convert market orders to limit orders at fill price
     max_open_trades: Optional[int] = None  # None = unlimited
-    max_open_orders: Optional[int] = None  # None = unlimited
-    max_account_equity: Optional[float] = None  # None = unlimited
     max_entry_deviation_pct: float = 5.0  # skip a copy if price has already moved this far from the target's fill
-    min_position_size_usd: float = 10.0
+    min_position_size_usd: float = 10.0   # dust floor — HL's real minimum order notional; fills below this are skipped
     blocked_assets: list[str] = []  # Assets to NOT copy (e.g., ["BTC", "ETH"])
 
 class RiskManagementConfig(BaseModel):
-    max_concurrent_positions: int = 10
     max_daily_loss_usd: float = 500.0
     fast_loss_pct: float = 0.05           # pause if equity drops this fraction within the window
     fast_loss_window_secs: int = 300      # rolling window for the circuit breaker (5 minutes)
@@ -122,7 +110,6 @@ class Settings(BaseModel):
     # Configuration sections
     hyperliquid: HyperliquidConfig = Field(default_factory=HyperliquidConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
-    sizing: SizingConfig = Field(default_factory=SizingConfig)
     leverage: LeverageConfig = Field(default_factory=LeverageConfig)
     copy_rules: CopyRulesConfig = Field(default_factory=CopyRulesConfig)
     risk_management: RiskManagementConfig = Field(default_factory=RiskManagementConfig)
@@ -188,19 +175,6 @@ class Settings(BaseModel):
         sim_balance = os.getenv('SIMULATED_ACCOUNT_BALANCE', '1000.0')
         settings.simulated_account_balance = float(sim_balance)
         
-        # Copy trading settings
-        copy_open_pos = os.getenv('COPY_OPEN_POSITIONS', 'true').lower()
-        settings.copy_rules.copy_open_positions = copy_open_pos in ('true', '1', 'yes')
-        
-        copy_orders = os.getenv('COPY_EXISTING_ORDERS', 'true').lower()
-        settings.copy_rules.copy_existing_orders = copy_orders in ('true', '1', 'yes')
-        
-        auto_adjust = os.getenv('AUTO_ADJUST_SIZE', 'true').lower()
-        settings.copy_rules.auto_adjust_size = auto_adjust in ('true', '1', 'yes')
-        
-        use_limit = os.getenv('USE_LIMIT_ORDERS', 'false').lower()
-        settings.copy_rules.use_limit_orders = use_limit in ('true', '1', 'yes')
-        
         # Leverage adjustment (default 1.0 = mirror target's leverage exactly;
         # this fallback must match LeverageConfig.adjustment_ratio's default
         # above, since this line unconditionally overwrites it either way)
@@ -209,13 +183,11 @@ class Settings(BaseModel):
         
         max_trades = os.getenv('MAX_OPEN_TRADES', 'x')
         settings.copy_rules.max_open_trades = None if max_trades.lower() == 'x' else int(max_trades)
-        
-        max_orders = os.getenv('MAX_OPEN_ORDERS', 'x')
-        settings.copy_rules.max_open_orders = None if max_orders.lower() == 'x' else int(max_orders)
-        
-        max_equity = os.getenv('MAX_ACCOUNT_EQUITY', 'x')
-        settings.copy_rules.max_account_equity = None if max_equity.lower() == 'x' else float(max_equity)
-        
+
+        settings.copy_rules.min_position_size_usd = float(
+            os.getenv('MIN_POSITION_SIZE_USD', str(settings.copy_rules.min_position_size_usd))
+        )
+
         # Blocked assets
         settings.copy_rules.blocked_assets = [
             asset.upper() for asset in _parse_csv_env(os.getenv('BLOCKED_ASSETS', ''))

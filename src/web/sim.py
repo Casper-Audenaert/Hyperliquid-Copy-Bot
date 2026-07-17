@@ -40,7 +40,7 @@ from web.db import (
 # Shared session registry (keyed by lowercase address)
 _sessions: dict = {}
 
-DUST_GUARD = 10.0  # HL's real minimum order notional — fills below this are skipped (same as live trading)
+DUST_GUARD = settings.copy_rules.min_position_size_usd  # HL's real minimum order notional (configurable via MIN_POSITION_SIZE_USD) — fills below this are skipped (same as live trading)
 
 # Shared caches — all market-wide data is identical across wallets.
 # Without caching: 15 wallets × 9 DEX calls each = 135 calls/30s per metric.
@@ -601,17 +601,10 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
         ratio = _ratio_for_new_position(session, target_size, price)
     our_size = target_size * ratio
 
-    # Per-position and portfolio exposure caps (settings.sizing) — opens/adds only;
-    # closes derive their size from the existing position, not from this value.
-    if is_opening and not is_flip and price > 0:
-        sz_cfg = settings.sizing
-        if sz_cfg.max_position_size > 0 and our_size * price > sz_cfg.max_position_size:
-            our_size = sz_cfg.max_position_size / price
-        if sz_cfg.max_total_exposure > 0:
-            current_exposure = sum(p.get("value", 0) for p in session.simulated_positions.values())
-            room = max(0.0, sz_cfg.max_total_exposure - current_exposure)
-            our_size = min(our_size, room / price)
-
+    # Faithful mirror: no hardcoded position/exposure caps — our_size scales
+    # purely off the target's fill via `ratio`. The affordability guard below
+    # (free balance vs. required margin) is the only remaining brake on size,
+    # same as it would be on a live exchange.
     our_notional = our_size * price
     emit_size    = our_size
 
@@ -619,10 +612,8 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     # Close/Reduce fills. But `our_size` (target_size * ratio) is a phantom
     # "what would a fresh open of this size look like" value for a close —
     # the close path below derives its REAL size from the sim's own existing
-    # position (`close_size = pos_size * fraction`), never from `our_size`,
-    # exactly as the comment on the exposure-cap guard above already notes
-    # ("closes derive their size from the existing position, not from this
-    # value"). Gating a close on this unrelated phantom notional meant a
+    # position (`close_size = pos_size * fraction`), never from `our_size`.
+    # Gating a close on this unrelated phantom notional meant a
     # perfectly real, correctly-sized reduction of an actual held position
     # could be silently skipped whenever target_size * ratio happened to be
     # small — permanently leaving our sim position desynced from the
