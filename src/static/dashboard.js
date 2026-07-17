@@ -1220,6 +1220,7 @@ function _renderStatsImpl(st) {
   if (monthlyPnlChart)  { monthlyPnlChart.destroy();  monthlyPnlChart  = null; }
 
   el.innerHTML = `
+  <div class="tearsheet-grid">
     <div class="stat-section">
       <div class="stat-section-title">Performance</div>
       <div class="stat-grid">
@@ -1321,11 +1322,11 @@ function _renderStatsImpl(st) {
       }
 
       return `
-    <div class="stat-section">
+    <div class="stat-section full">
       <div class="stat-section-title">Copy Capital Guide</div>
       <div style="font-size:11px;color:var(--t2);margin-bottom:8px;line-height:1.5">${status}</div>
       <div style="font-size:10px;color:var(--t3);margin-bottom:6px">Each level shows the capital where your smallest copied trade hits that dollar threshold. Bigger capital = larger positions = more meaningful dollar P&amp;L per trade (percentage returns stay the same).</div>
-      <div class="stat-grid">
+      <div class="stat-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:9px 20px">
         ${rowC('Min (floor)',  cb.min,        cb.ratio_min,        userBal >= cb.min        ? 'var(--green)' : 'var(--warn)',  'Smallest trade = $10 exactly. Below this level some of the trader\'s orders get skipped (below HL\'s minimum notional).')}
         ${rowC('Suggested',   cb.suggested,  cb.ratio_suggested,  userBal >= cb.suggested  ? 'var(--green)' : 'var(--t2)',   'Smallest trade = $50 — 5× headroom above the HL floor. Comfortable for most strategies.')}
         ${rowC('Optimal',     cb.optimal,    cb.ratio_optimal,    userBal >= cb.optimal    ? 'var(--green)' : 'var(--t2)',   'Smallest trade = $100 — good resolution. Each individual trade produces meaningful P&L.')}
@@ -1334,9 +1335,10 @@ function _renderStatsImpl(st) {
     </div>`;
     })()}
 
-    <div class="stat-section">
+    <div class="stat-section full">
       <div class="stat-section-title">Accounting</div>
 
+      <div class="stat-subgroups">
       <div class="stat-subgroup">
         <div class="stat-subgroup-hdr">Equity Breakdown</div>
         <div class="stat-grid">
@@ -1377,19 +1379,20 @@ function _renderStatsImpl(st) {
           <div class="stat-row"><span class="stat-lbl has-tip" title="The smallest trade size where the expected price move covers the taker fee. Trades below this notional are more likely to be fee-negative even when the trader's direction is right.">Break-even Size</span>${sv(st.breakeven_notional!=null?fUsd(st.breakeven_notional)+' notional':'—','var(--t2)')}</div>
         </div>
       </div>
+      </div>
 
-      <div style="font-size:10px;color:var(--t3);margin-top:4px">* Funding pro-rated every 3s from live HL rates. Slippage model: 3 bps/side on every fill. Execution latency: 150 ms drift on opens (all-fills mode).</div>
+      <div style="font-size:10px;color:var(--t3);margin-top:12px">* Funding pro-rated every 3s from live HL rates. Slippage model: 3 bps/side on every fill. Execution latency: 150 ms drift on opens (all-fills mode).</div>
     </div>
 
     ${symbolStats.length ? `
-    <div class="stat-section">
+    <div class="stat-section full">
       <div class="stat-section-title">Per-Symbol Win Rate</div>
-      <table style="width:100%;border-collapse:collapse;font-size:11px">
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
         <thead><tr style="color:var(--t3);text-align:left">
-          <th style="padding:2px 4px">Symbol</th><th>Trades</th><th>W/L</th><th>Win%</th><th style="text-align:right">PnL</th>
+          <th style="padding:4px 6px">Symbol</th><th>Trades</th><th>W/L</th><th>Win%</th><th style="text-align:right">PnL</th>
         </tr></thead>
-        <tbody>${symbolStats.map(s=>`<tr style="border-top:1px solid var(--border)">
-          <td style="padding:3px 4px;font-weight:600">${s.symbol}</td>
+        <tbody>${symbolStats.map(s=>`<tr style="border-top:1px solid var(--hr)">
+          <td style="padding:5px 6px;font-weight:600">${s.symbol}</td>
           <td class="mono">${s.count}</td>
           <td class="mono" style="color:var(--t3)">${s.wins}/${s.losses}</td>
           <td class="mono" style="color:${s.win_rate>=50?'var(--green)':'var(--red)'}">${s.win_rate!=null?s.win_rate+'%':'—'}</td>
@@ -1463,7 +1466,7 @@ function _renderStatsImpl(st) {
       <div class="stat-section-title">Trade PnL Distribution</div>
       <div class="pnl-chart-wrap"><canvas id="hist-chart"></canvas></div>
     </div>` : ''}
-  `;
+  </div>`;
 
   if (pnlByDay.length)              safeRender('daily PnL', () => renderPnlChart(pnlByDay));
   if (weeklyPnl.length > 1)        safeRender('weekly PnL', () => renderWeeklyPnlChart(weeklyPnl));

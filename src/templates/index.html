@@ -334,35 +334,55 @@ header{
 .rp{padding:3px 9px;border-radius:5px;font-size:10px;font-weight:700;cursor:pointer;color:var(--t3);transition:all var(--dur-fast) var(--ease);font-family:var(--mono)}
 .rp:hover{color:var(--t2)}.rp.on{background:var(--s3);color:var(--t1)}
 
-/* ── Stats panel (right column, scrollable) ── */
+/* ── Stats panel (now full tab width, not the old 360px sidebar) ──────────
+   #stats-content also hosts compare mode's own .cmp-sort-bar/.cmp-cards
+   (already correctly grid-laid-out on their own), so the multi-column
+   treatment below is scoped to a .tearsheet-grid wrapper the single-wallet
+   renderer wraps its sections in — compare mode's markup is untouched. ── */
 .stats-scroll{flex:1;overflow-y:auto;min-height:0;display:flex;flex-direction:column}
 .no-stats{padding:24px 16px;text-align:center;color:var(--t3);font-size:12px;line-height:1.5}
 
-.stat-section{padding:12px 14px;border-bottom:1px solid var(--hr);flex-shrink:0}
-.stat-section:last-child{border-bottom:none}
-.stat-section-title{
-  font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:1.1px;
-  color:var(--brand);margin-bottom:10px
+.tearsheet-grid{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));
+  gap:var(--sp-md);align-content:start;padding:var(--sp-md)
 }
-.stat-grid{display:flex;flex-direction:column;gap:8px}
-.stat-row{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.tearsheet-grid .full{grid-column:1/-1}
+
+.stat-section{
+  background:var(--s2);border:1px solid var(--hr);border-radius:var(--r2);
+  padding:var(--sp-md) var(--sp-lg)
+}
+.stat-section-title{
+  font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1.1px;
+  color:var(--brand);margin-bottom:12px
+}
+.stat-grid{display:flex;flex-direction:column;gap:9px}
+.stat-row{display:flex;justify-content:space-between;align-items:center;gap:10px}
 .stat-lbl{font-size:12px;color:var(--t2);flex-shrink:0}
-.stat-val{font-size:13px;font-weight:600;font-family:var(--mono);text-align:right}
+.stat-val{font-size:14px;font-weight:600;font-family:var(--mono);text-align:right}
 .stat-val.g{color:var(--green)}.stat-val.r{color:var(--red)}.stat-val.dim{color:var(--t2)}
 
-.stat-subgroup{margin-bottom:12px}
-.stat-subgroup:last-child{margin-bottom:0}
-.stat-subgroup + .stat-subgroup{border-top:1px solid var(--hr);padding-top:10px}
+/* Accounting's 3 subgroups (Equity/PnL Breakdown, Fee Analytics) sit side by
+   side in their own row now that there's room, instead of stacking with
+   divider rules — same "one glance, no scrolling past it" goal as the
+   outer grid. */
+.stat-subgroups{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:var(--sp-lg)}
 .stat-subgroup-hdr{
-  font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.9px;
-  color:var(--t3);margin-bottom:6px
+  font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.9px;
+  color:var(--t3);margin-bottom:8px
 }
 .stat-lbl.has-tip{border-bottom:1px dotted var(--t3);cursor:help}
 
-.pnl-chart-section{padding:12px 14px;flex-shrink:0;border-top:1px solid var(--hr)}
+.pnl-chart-section{
+  background:var(--s2);border:1px solid var(--hr);border-radius:var(--r2);
+  padding:var(--sp-md) var(--sp-lg);grid-column:1/-1
+}
 .pnl-chart-wrap{height:120px;position:relative;margin-top:8px}
 
-.top-assets-section{padding:12px 14px;flex-shrink:0}
+.top-assets-section{
+  background:var(--s2);border:1px solid var(--hr);border-radius:var(--r2);
+  padding:var(--sp-md) var(--sp-lg)
+}
 .top-assets-list{display:flex;flex-direction:column;margin-top:8px}
 .ta-row{display:flex;align-items:center;gap:10px;padding:5px 0;border-bottom:1px solid var(--hr)}
 .ta-row:last-child{border-bottom:none}
