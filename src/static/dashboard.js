@@ -493,6 +493,65 @@ function addEquityPoint(addr, pt) {
 }
 
 // ── Sidebar ────────────────────────────────────────────────────────────────
+// Shared by the sidebar wcard header and the wallet-header bar above the
+// tabs — same style/ratio/score-or-liq badges, just two different places
+// that need to show "what kind of target is this, and how is it doing".
+function _walletStatusBadgesHtml(addr, s) {
+  const style  = s.detected_style || 'Swing';
+  const styleBadge = style === 'HFT'
+    ? `<span class="style-pill hft" title="High-frequency target (median hold ${s.median_hold_secs ?? '?'}s) — all fills copied live, no debounce">HFT</span>`
+    : `<span class="style-pill swing" title="Swing/long-term target — all fills copied immediately">Swing</span>`;
+  const ratioMode = s.ratio_mode || 'fixed';
+  const ratioBadgeText = ratioMode === 'proportional' ? 'PROP' : ratioMode === 'fixed_amount' ? '$AMT' : 'FIXED';
+  const ratioBadgeTitle = ratioMode === 'proportional'
+    ? 'Proportional ratio — recalculated from live equity on every new position'
+    : ratioMode === 'fixed_amount'
+    ? 'Fixed Amount — flat $ per trade regardless of ratio'
+    : 'Fixed Ratio — locked at add-time';
+  const ratioBadge = `<span class="style-pill ratio-${ratioMode.replace('_','-')}" title="${ratioBadgeTitle}">${ratioBadgeText}</span>`;
+  const score    = statsCache[addr]?.score;
+  const scoreCls = score == null ? '' : score >= 70 ? 'good' : score >= 50 ? 'ok' : 'bad';
+  const scoreOrLiqBadge = s.liquidation_risk
+    ? `<span class="score-pill bad" title="A position is within 5% of its liquidation price">⚠ LIQ</span>`
+    : (score != null ? `<span class="score-pill ${scoreCls}">${score}</span>` : '');
+  return `${styleBadge}${ratioBadge}${scoreOrLiqBadge}`;
+}
+
+// Populates the wallet-header bar above the tabs (label, address+copy,
+// status badges) for the currently-selected single wallet. Empty in
+// compare mode — there's no one wallet to headline — which also collapses
+// the bar via .wallet-header:empty.
+function renderWalletHeader() {
+  const el = document.getElementById('wallet-header');
+  if (!el) return;
+  const addr = curWallet();
+  const s = !compareMode && addr ? state[addr] : null;
+  if (!s) { el.innerHTML = ''; return; }
+  el.innerHTML = `
+    <span class="wh-name">${s.label}</span>
+    <span class="wh-addr" onclick="copyAddr('${addr}')" title="${addr} — click to copy">${addr.slice(0,6)}…${addr.slice(-4)}<span class="copy-icon">⎘</span></span>
+    <div class="wh-badges">${_walletStatusBadgesHtml(addr, s)}</div>`;
+}
+
+// Shows/hides the tab whose content only makes sense for one wallet
+// (Positions/Ghosted/Decision) and auto-activates Tearsheet, where
+// renderComparePanel() already renders the side-by-side view.
+function _applyCompareTabVisibility() {
+  ['positions', 'ghosted', 'decision'].forEach(t => {
+    const btn = document.querySelector(`.tab-btn[data-tab="${t}"]`);
+    if (btn) btn.style.display = compareMode ? 'none' : '';
+  });
+  if (compareMode) setTab('tearsheet');
+  else if (activeTab === 'tearsheet') setTab('positions');
+}
+
+let activeTab = 'positions';
+function setTab(tab) {
+  activeTab = tab;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('on', c.dataset.tabContent === tab));
+}
+
 function renderSidebar() {
   const el    = document.getElementById('wlist');
   const addrs = Object.keys(state);
@@ -522,32 +581,16 @@ function renderSidebar() {
     const clickFn = compareMode ? `toggleCompareWallet('${addr}')` : `selectWallet('${addr}')` ;
     // sel kept as alias for backward compat with unchanged code below
     const sel = inCmp || (!compareMode && cur===addr);
-    const score    = statsCache[addr]?.score;
-    const scoreCls = score == null ? '' : score >= 70 ? 'good' : score >= 50 ? 'ok' : 'bad';
     const shortAddr = addr.slice(0,6) + '…' + addr.slice(-4);
     const npnl = s.net_pnl ?? null;
     const npnlCls = npnl == null ? 'z' : npnl > 0 ? 'pos' : npnl < 0 ? 'neg' : 'z';
-    const style  = s.detected_style || 'Swing';
-    const styleBadge = style === 'HFT'
-      ? `<span class="style-pill hft" title="High-frequency target (median hold ${s.median_hold_secs ?? '?'}s) — all fills copied live, no debounce">HFT</span>`
-      : `<span class="style-pill swing" title="Swing/long-term target — all fills copied immediately">Swing</span>`;
-    const ratioMode = s.ratio_mode || 'fixed';
-    const ratioBadgeText = ratioMode === 'proportional' ? 'PROP' : ratioMode === 'fixed_amount' ? '$AMT' : 'FIXED';
-    const ratioBadgeTitle = ratioMode === 'proportional'
-      ? 'Proportional ratio — recalculated from live equity on every new position'
-      : ratioMode === 'fixed_amount'
-      ? 'Fixed Amount — flat $ per trade regardless of ratio'
-      : 'Fixed Ratio — locked at add-time';
-    const ratioBadge = `<span class="style-pill ratio-${ratioMode.replace('_','-')}" title="${ratioBadgeTitle}">${ratioBadgeText}</span>`;
     return `<div class="wcard${cardCls}" data-addr="${addr}" onclick="${clickFn}">
   <div class="wcard-inner">
     <div class="wc-header">
       <span class="wc-rank">#${rank+1}</span>
       <div class="wc-dot${s.is_paused?' paused':''}" style="background:${s.is_paused?'var(--warn)':clr(addr)}"></div>
       <span class="wc-name" title="${addr}">${s.label}</span>
-      ${styleBadge}
-      ${ratioBadge}
-      ${s.liquidation_risk ? `<span class="score-pill bad" title="A position is within 5% of its liquidation price">⚠ LIQ</span>` : (score != null ? `<span class="score-pill ${scoreCls}">${score}</span>` : '')}
+      ${_walletStatusBadgesHtml(addr, s)}
       <div class="wc-actions">
         <button class="wc-act-btn rst" onclick="event.stopPropagation();resetWallet('${addr}')" title="Reset">⟳</button>
         <button class="wc-act-btn del" onclick="event.stopPropagation();removeWallet('${addr}')" title="Remove">✕</button>
@@ -605,6 +648,7 @@ function selectWallet(addr) {
   document.getElementById('analysis-btns').style.display = '';
   showCombined = false;
   renderSidebar();
+  renderWalletHeader();
   renderKpis();
   renderPositions();
   rebuildChart();
@@ -645,6 +689,8 @@ function toggleCompare() {
   document.getElementById('analysis-btns').style.display = compareMode ? 'none' : '';
   if (!compareMode) { showCombined = false; document.getElementById('combined-btn').classList.remove('on'); }
   renderSidebar();
+  renderWalletHeader();
+  _applyCompareTabVisibility();
   renderKpis();
   renderPositions();
   rebuildChart();
@@ -2382,6 +2428,7 @@ function _scheduleStateRender() {
   requestAnimationFrame(() => {
     _stateRenderPending = false;
     renderSidebar();
+    renderWalletHeader();
     renderKpis();
     renderPositions();
     if (compareMode) renderComparePanel();
@@ -2515,6 +2562,7 @@ socket.on('wallet_removed', d => {
   compareSelection.delete(addr);
   if (activeWallet === addr) activeWallet = null;
   renderSidebar();
+  renderWalletHeader();
   renderKpis();
   renderPositions();
   rebuildChart();
@@ -2599,6 +2647,7 @@ socket.on('clear', async d => {
     showToast('All wallets cleared', 'Sessions restarted from starting balance', '⟳');
   }
 
+  renderWalletHeader();
   renderKpis();
   renderPositions();
 });

@@ -227,6 +227,23 @@ header{
   .dg-score-num{font-size:20px}
 }
 
+/* ── Wallet header — label, address, style/ratio/liq badges, decision score.
+   Reuses the same badge markup renderSidebar() already builds for wcards.
+   Hidden entirely in compare mode (no single wallet to headline). ── */
+.wallet-header{
+  display:flex;align-items:center;gap:var(--sp-md);flex-wrap:wrap;
+  padding:var(--sp-md) var(--sp-lg);flex-shrink:0;
+  background:var(--s1);border-bottom:1px solid var(--hr)
+}
+.wallet-header:empty{display:none}
+.wh-name{font-size:18px;font-weight:700;letter-spacing:-.3px}
+.wh-addr{
+  font-size:12px;font-family:var(--mono);color:var(--t3);cursor:pointer;
+  display:flex;align-items:center;gap:4px;transition:color var(--dur-fast) var(--ease)
+}
+.wh-addr:hover{color:var(--brand)}
+.wh-badges{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-left:auto}
+
 /* KPI strip — two tiers. Hero: the numbers worth a glance from across the
    room (Display scale). Secondary: supporting detail, denser and quieter.
    Hierarchy comes from type scale alone, per the "instrument panel, not
@@ -251,21 +268,32 @@ header{
 .kpi-tier-sub .kpi-val{font-size:15px;letter-spacing:-.3px}
 .kpi-tier-sub .kpi-sub{margin-top:2px}
 
-/* ── Content grid — 3 columns, 2 rows ─────────────────────────────────────
-   Col 1+2: chart (row 1) | positions (row 2) | feed (row 2)
-   Col 3:   stats tearsheet (spans both rows, scrollable)
+/* ── Content stack — full-width sections, Hyperdash-style ─────────────────
+   wallet header → stat chips (.kpi-bar, above) → big chart → tab bar →
+   one tab's panel at a time. Replaces the old 3-col/2-row content-grid;
+   every panel below keeps its original id, so the render functions that
+   populate them (renderPositions, loadStats, etc.) are unchanged.
    ───────────────────────────────────────────────────────── */
-.content-grid{
-  flex:1;min-height:0;
-  display:grid;
-  grid-template-columns:1fr 1fr 360px;
-  grid-template-rows:1.1fr 1fr;    /* chart still biggest, but positions/feed noticeably taller */
-  gap:var(--sp-md);padding:var(--sp-md);
+.content-stack{
+  flex:1;min-height:0;overflow-y:auto;
+  display:flex;flex-direction:column;gap:var(--sp-md);padding:var(--sp-md);
 }
-.chart-panel{grid-column:1/3;grid-row:1;min-height:0}
-.stats-panel{grid-column:3;grid-row:1/3;min-height:0;overflow:hidden}
-.pos-panel  {grid-column:1;grid-row:2;min-height:0}
-.feed-panel {grid-column:2;grid-row:2;min-height:0}
+.chart-panel{flex-shrink:0;height:420px}
+.tab-bar{
+  display:flex;gap:2px;flex-shrink:0;
+  background:var(--s2);border:1px solid var(--hr);border-radius:var(--r2);
+  padding:4px;overflow-x:auto
+}
+.tab-btn{
+  flex:1;padding:8px 14px;border-radius:var(--r);border:none;background:transparent;
+  color:var(--t2);font-family:var(--font);font-size:12px;font-weight:600;
+  cursor:pointer;white-space:nowrap;transition:all var(--dur-fast) var(--ease)
+}
+.tab-btn:hover{color:var(--t1)}
+.tab-btn.on{background:var(--s3);color:var(--t1)}
+.tab-content{display:none;flex-direction:column;min-height:0}
+.tab-content.on{display:flex}
+.tab-content .panel{flex:1;min-height:420px}
 
 /* ── Panel ── */
 .panel{
@@ -641,16 +669,13 @@ header{
   .mtab-ret{font-size:8px;font-family:var(--mono)}
   .mtab-ret.pos{color:var(--green)} .mtab-ret.neg{color:var(--red)} .mtab-ret.z{color:var(--t3)}
 
-  /* Content grid: single column, fixed panel heights */
-  .content-grid{
-    grid-template-columns:1fr;
-    grid-template-rows:340px 400px 280px 340px;
-    gap:var(--sp-sm);padding:var(--sp-sm)
-  }
-  .chart-panel{grid-column:1;grid-row:1}
-  .stats-panel{grid-column:1;grid-row:2}
-  .pos-panel  {grid-column:1;grid-row:3}
-  .feed-panel {grid-column:1;grid-row:4}
+  /* Content stack: tighter padding, shorter fixed-height chart+tab panels */
+  .content-stack{gap:var(--sp-sm);padding:var(--sp-sm)}
+  .chart-panel{height:280px}
+  .tab-content .panel{min-height:340px}
+  .tab-btn{padding:8px 10px;font-size:11px}
+  .wallet-header{padding:var(--sp-sm) var(--sp-md)}
+  .wh-name{font-size:15px}
 
   /* Trade feed: horizontal scroll for wide table */
   .feed-scroll{overflow-x:auto}
@@ -717,34 +742,27 @@ header{
 <!-- ── Main ── -->
 <div class="main">
 
-  <!-- KPI strip — two tiers: the numbers you actually glance at (hero),
-       then supporting detail (secondary). Same element ids either way, so
-       dashboard.js's setKpi()/renderKpis() needed zero changes for this. -->
+  <!-- Wallet header: label, address+copy, style/ratio badges — populated by
+       renderWalletHeader(). Empty (and hidden via :empty) in compare mode. -->
+  <div class="wallet-header" id="wallet-header"></div>
+
+  <!-- Stat chips — the numbers you actually glance at. Same element ids as
+       before, so dashboard.js's setKpi()/renderKpis() needed zero changes.
+       Free Cash/Trades/Sharpe/Max Drawdown moved into the Tearsheet tab
+       below — they're detail, not a first-glance number. -->
   <div class="kpi-bar">
     <div class="kpi-tier kpi-tier-hero">
       <div class="kpi" id="kc-e"><div class="kpi-lbl">Equity</div><div class="kpi-val mono" id="kv-e">—</div><div class="kpi-sub mono" id="ks-e"></div></div>
       <div class="kpi" id="kc-p"><div class="kpi-lbl">Realized PnL</div><div class="kpi-val mono" id="kv-p">—</div><div class="kpi-sub mono" id="ks-p"></div></div>
       <div class="kpi" id="kc-u"><div class="kpi-lbl">Unrealized PnL</div><div class="kpi-val mono" id="kv-u">—</div><div class="kpi-sub mono" id="ks-u"></div></div>
       <div class="kpi" id="kc-w"><div class="kpi-lbl">Win Rate</div><div class="kpi-val mono" id="kv-w">—</div><div class="kpi-sub mono" id="ks-w"></div></div>
-    </div>
-    <div class="kpi-tier kpi-tier-sub">
-      <div class="kpi" id="kc-b"><div class="kpi-lbl" title="Free cash = equity − locked margin − unrealized PnL. Can be negative when positions lock more collateral than starting capital.">Free Cash</div><div class="kpi-val mono" id="kv-b">—</div><div class="kpi-sub mono" id="ks-b"></div></div>
-      <div class="kpi" id="kc-t"><div class="kpi-lbl">Trades</div><div class="kpi-val mono" id="kv-t">—</div><div class="kpi-sub mono" id="ks-t"></div></div>
       <div class="kpi" id="kc-f"><div class="kpi-lbl">Fees Paid</div><div class="kpi-val mono" id="kv-f">—</div><div class="kpi-sub mono" id="ks-f"></div></div>
-      <div class="kpi" id="kc-sh"><div class="kpi-lbl">Sharpe</div><div class="kpi-val mono" id="kv-sh">—</div><div class="kpi-sub mono" id="ks-sh"></div></div>
-      <div class="kpi" id="kc-dd"><div class="kpi-lbl">Max Drawdown</div><div class="kpi-val mono" id="kv-dd">—</div><div class="kpi-sub mono" id="ks-dd"></div></div>
     </div>
   </div>
 
-  <!-- Copy decision indicator -->
-  <div class="panel decision-panel" id="decision-panel" style="display:none">
-    <div id="decision-widget"></div>
-  </div>
+  <div class="content-stack">
 
-  <!-- Content grid: chart + stats + positions + feed -->
-  <div class="content-grid">
-
-    <!-- Top-left span 2 cols: Equity chart -->
+    <!-- Big chart panel — always visible above the tabs -->
     <div class="panel chart-panel">
       <div class="phdr">
         <span class="ptitle" id="chart-ttl">Equity Curve</span>
@@ -772,63 +790,102 @@ header{
       </div>
     </div>
 
-    <!-- Right col, both rows: Stats tearsheet / Compare panel -->
-    <div class="panel stats-panel" id="stats-panel">
-      <div class="phdr">
-        <span class="ptitle" id="stats-title">Tearsheet</span>
-        <span class="badge" id="stats-badge">All time</span>
-      </div>
-      <div id="cmp-tabs">
-        <button class="cmp-tab" data-tab="leaderboard" onclick="setCmpTab('leaderboard')">Leaderboard</button>
-        <button class="cmp-tab"    data-tab="stats"        onclick="setCmpTab('stats')">Stats</button>
-        <button class="cmp-tab"    data-tab="correlation"  onclick="setCmpTab('correlation')">Correlation</button>
-        <button class="cmp-tab"    data-tab="decision"     onclick="setCmpTab('decision')">🎯 Decision</button>
-      </div>
-      <div class="stats-scroll" id="stats-content">
-        <div class="no-stats">Select a wallet to see<br>performance stats</div>
+    <!-- Tab bar -->
+    <div class="tab-bar" id="tab-bar">
+      <button class="tab-btn on" data-tab="positions"  onclick="setTab('positions')">Positions</button>
+      <button class="tab-btn"    data-tab="history"    onclick="setTab('history')">Trade History</button>
+      <button class="tab-btn"    data-tab="ghosted"    onclick="setTab('ghosted')">Ghosted / Skipped</button>
+      <button class="tab-btn"    data-tab="tearsheet"  onclick="setTab('tearsheet')">Tearsheet</button>
+      <button class="tab-btn"    data-tab="decision"   onclick="setTab('decision')">Decision</button>
+    </div>
+
+    <!-- Positions tab -->
+    <div class="tab-content on" id="tab-positions" data-tab-content="positions">
+      <div class="panel pos-panel">
+        <div class="phdr">
+          <span class="ptitle">Open Positions</span>
+          <span class="badge" id="pos-cnt">0</span>
+        </div>
+        <div class="pos-scroll" id="pos-list"><div class="no-pos">No open positions</div></div>
       </div>
     </div>
 
-    <!-- Bottom-left: Open positions -->
-    <div class="panel pos-panel">
-      <div class="phdr">
-        <span class="ptitle">Open Positions</span>
-        <span class="badge" id="pos-cnt">0</span>
-      </div>
-      <div class="pos-scroll" id="pos-list"><div class="no-pos">No open positions</div></div>
-    </div>
-
-    <!-- Bottom-right: Trade feed -->
-    <div class="panel feed-panel">
-      <div class="phdr">
-        <span class="ptitle">Trade Feed</span>
-        <span class="badge" id="feed-cnt">0 fills</span>
-        <span style="display:flex;gap:4px;align-items:center;margin-left:auto">
-          <input type="date" id="feed-from" style="font-size:10px;padding:2px 4px;border:1px solid var(--hr);border-radius:4px;background:var(--s2);color:var(--t1)" oninput="filterFeed()">
-          <span style="font-size:10px;color:var(--t3)">to</span>
-          <input type="date" id="feed-to" style="font-size:10px;padding:2px 4px;border:1px solid var(--hr);border-radius:4px;background:var(--s2);color:var(--t1)" oninput="filterFeed()">
-        </span>
-      </div>
-      <div class="feed-scroll">
-        <table class="ftbl">
-          <thead><tr>
-            <th>Time</th><th>Symbol</th><th>Direction</th>
-            <th>Size</th><th>Price</th><th title="Taker fee charged (or funding paid/earned) on this event">Fee</th>
-            <th>PnL</th><th title="Account equity right after this event">Equity</th><th>Wallet</th>
-          </tr></thead>
-          <tbody id="feed-body">
-            <tr id="feed-ph"><td colspan="9" class="no-feed">Waiting for fills…</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <div class="feed-pager">
-        <button onclick="feedPage(-1)" id="feed-prev">‹ Prev</button>
-        <span id="feed-page-lbl" class="mono">1 / 1</span>
-        <button onclick="feedPage(1)" id="feed-next">Next ›</button>
+    <!-- Trade History tab -->
+    <div class="tab-content" id="tab-history" data-tab-content="history">
+      <div class="panel feed-panel">
+        <div class="phdr">
+          <span class="ptitle">Trade Feed</span>
+          <span class="badge" id="feed-cnt">0 fills</span>
+          <span style="display:flex;gap:4px;align-items:center;margin-left:auto">
+            <input type="date" id="feed-from" style="font-size:10px;padding:2px 4px;border:1px solid var(--hr);border-radius:4px;background:var(--s2);color:var(--t1)" oninput="filterFeed()">
+            <span style="font-size:10px;color:var(--t3)">to</span>
+            <input type="date" id="feed-to" style="font-size:10px;padding:2px 4px;border:1px solid var(--hr);border-radius:4px;background:var(--s2);color:var(--t1)" oninput="filterFeed()">
+          </span>
+        </div>
+        <div class="feed-scroll">
+          <table class="ftbl">
+            <thead><tr>
+              <th>Time</th><th>Symbol</th><th>Direction</th>
+              <th>Size</th><th>Price</th><th title="Taker fee charged (or funding paid/earned) on this event">Fee</th>
+              <th>PnL</th><th title="Account equity right after this event">Equity</th><th>Wallet</th>
+            </tr></thead>
+            <tbody id="feed-body">
+              <tr id="feed-ph"><td colspan="9" class="no-feed">Waiting for fills…</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="feed-pager">
+          <button onclick="feedPage(-1)" id="feed-prev">‹ Prev</button>
+          <span id="feed-page-lbl" class="mono">1 / 1</span>
+          <button onclick="feedPage(1)" id="feed-next">Next ›</button>
+        </div>
       </div>
     </div>
 
-  </div><!-- .content-grid -->
+    <!-- Ghosted/Skipped tab — full content lands with the C14 dashboard commit -->
+    <div class="tab-content" id="tab-ghosted" data-tab-content="ghosted">
+      <div class="panel ghost-panel">
+        <div class="phdr">
+          <span class="ptitle">Ghosted / Skipped</span>
+          <span class="badge" id="ghost-cnt">0</span>
+        </div>
+        <div class="pos-scroll" id="ghost-list"><div class="no-pos">No ghosted positions or skipped fills</div></div>
+      </div>
+    </div>
+
+    <!-- Tearsheet tab — stats / compare panel, plus the detail KPIs -->
+    <div class="tab-content" id="tab-tearsheet" data-tab-content="tearsheet">
+      <div class="panel stats-panel" id="stats-panel">
+        <div class="kpi-tier kpi-tier-sub">
+          <div class="kpi" id="kc-b"><div class="kpi-lbl" title="Free cash = equity − locked margin − unrealized PnL. Can be negative when positions lock more collateral than starting capital.">Free Cash</div><div class="kpi-val mono" id="kv-b">—</div><div class="kpi-sub mono" id="ks-b"></div></div>
+          <div class="kpi" id="kc-t"><div class="kpi-lbl">Trades</div><div class="kpi-val mono" id="kv-t">—</div><div class="kpi-sub mono" id="ks-t"></div></div>
+          <div class="kpi" id="kc-sh"><div class="kpi-lbl">Sharpe</div><div class="kpi-val mono" id="kv-sh">—</div><div class="kpi-sub mono" id="ks-sh"></div></div>
+          <div class="kpi" id="kc-dd"><div class="kpi-lbl">Max Drawdown</div><div class="kpi-val mono" id="kv-dd">—</div><div class="kpi-sub mono" id="ks-dd"></div></div>
+        </div>
+        <div class="phdr">
+          <span class="ptitle" id="stats-title">Tearsheet</span>
+          <span class="badge" id="stats-badge">All time</span>
+        </div>
+        <div id="cmp-tabs">
+          <button class="cmp-tab" data-tab="leaderboard" onclick="setCmpTab('leaderboard')">Leaderboard</button>
+          <button class="cmp-tab"    data-tab="stats"        onclick="setCmpTab('stats')">Stats</button>
+          <button class="cmp-tab"    data-tab="correlation"  onclick="setCmpTab('correlation')">Correlation</button>
+          <button class="cmp-tab"    data-tab="decision"     onclick="setCmpTab('decision')">🎯 Decision</button>
+        </div>
+        <div class="stats-scroll" id="stats-content">
+          <div class="no-stats">Select a wallet to see<br>performance stats</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Decision tab -->
+    <div class="tab-content" id="tab-decision" data-tab-content="decision">
+      <div class="panel decision-panel" id="decision-panel" style="display:none">
+        <div id="decision-widget"></div>
+      </div>
+    </div>
+
+  </div><!-- .content-stack -->
 </div><!-- .main -->
 
 <!-- ── Add Wallet Modal ── -->
