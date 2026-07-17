@@ -303,7 +303,7 @@ def _session_to_dict(s: WalletSession, price_override: dict | None = None) -> di
         _ws_prices = {p.symbol: p.current_price
                       for p in s.monitor.current_state.positions if p.current_price > 0}
         # For position-drift detection below — the target's actual size per
-        # symbol, refreshed on the same ~50-70s cadence as current_state
+        # symbol, refreshed on the same ~100-140s cadence as current_state
         # itself (_periodic_state_refresh in monitor.py).
         _target_sizes = {p.symbol: abs(p.size) for p in s.monitor.current_state.positions}
     if _mids_cache:
@@ -917,8 +917,8 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     #      the target's EXACT position at the moment of this exact fill, with
     #      no staleness — using it eliminates the old bug where a partial
     #      close's fraction was computed from monitor.current_state, which is
-    #      only refreshed every 50-70s and can be badly stale mid-burst.
-    #   2. monitor.current_state (existing fallback, up to 50-70s stale).
+    #      only refreshed every 100-140s and can be badly stale mid-burst.
+    #   2. monitor.current_state (existing fallback, up to 100-140s stale).
     #   3. Ratio inference from our own position size (existing fallback,
     #      applied later at the `else` branch below) — used only when neither
     #      of the above is available.

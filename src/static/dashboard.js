@@ -863,7 +863,7 @@ function softSwap(el, renderFn) {
 // value descending (biggest exposure first). Sync column is the direct
 // answer to "positions desynced": our size vs. target_size × the ratio this
 // position was opened/last-added at (sync_pct/desynced come from sim.py's
-// _session_to_dict, refreshed on the same ~50-70s cadence as current_state).
+// _session_to_dict, refreshed on the same ~100-140s cadence as current_state).
 let _knownPositionKeys = new Set(); // symbol+side(+wallet) keys seen last render — new ones get a slide-in
 
 function renderPositions() {

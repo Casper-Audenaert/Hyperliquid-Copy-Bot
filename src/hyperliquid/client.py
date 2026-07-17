@@ -196,6 +196,17 @@ class HyperliquidClient:
             logger.error(f"Failed to get assets: {e}")
             return []
     
+    async def get_spot_meta(self) -> dict:
+        """Get the spot market universe/token metadata. Used to resolve a
+        spot fill's raw '@<index>' coin name (Hyperliquid's identifier for
+        any spot pair that hasn't graduated to a canonical listing — most
+        of them) to its actual base asset name, e.g. '@180' -> 'USDHL'."""
+        try:
+            return await self._post(self.info_url, {"type": "spotMeta"})
+        except Exception as e:
+            logger.error(f"Failed to get spot meta: {e}")
+            return {}
+
     async def get_all_mids(self) -> Dict[str, float]:
         """Get current mid prices for all symbols across all dexes"""
         all_mids: Dict[str, float] = {}

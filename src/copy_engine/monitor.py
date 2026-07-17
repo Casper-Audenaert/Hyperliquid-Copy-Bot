@@ -25,6 +25,65 @@ def _get_pool_lock() -> asyncio.Lock:
     return _ws_pool_lock
 
 
+# ── Spot symbol resolution ────────────────────────────────────────────────────
+# Hyperliquid spot fills report the pair as a bare index like "@180" instead of
+# a ticker for any pair that hasn't graduated to a "canonical" listing (most of
+# them — even fairly established tokens). Resolved once via spotMeta (the spot
+# universe changes rarely) and shared across every wallet, same single-flight-
+# cache shape as sim.py's mids/funding caches.
+_spot_symbol_map: Optional[dict] = None
+_spot_symbol_lock: Optional[asyncio.Lock] = None
+_spot_symbol_last_attempt: float = 0.0
+_SPOT_SYMBOL_RETRY_SECS = 300  # a failed fetch (e.g. rate-limited) retries at
+                                # most every 5min — never hammers an already-
+                                # rate-limited API once per "@N" fill
+
+
+def _get_spot_symbol_lock() -> asyncio.Lock:
+    global _spot_symbol_lock
+    if _spot_symbol_lock is None:
+        _spot_symbol_lock = asyncio.Lock()
+    return _spot_symbol_lock
+
+
+async def _resolve_spot_symbol(client: HyperliquidClient, coin: str) -> str:
+    """'@180' -> 'USDHL' (the pair's base asset name, via spotMeta). Falls
+    back to the raw '@N' on any fetch failure or unrecognized index — never
+    blocks or drops a fill over a display-name lookup.
+
+    BUG FIX: the first version of this cached a failed fetch the exact same
+    way as a successful-but-empty one (both left _spot_symbol_map as a plain
+    {}), so a single rate-limited attempt permanently disabled resolution
+    for the rest of the process's life — every "@N" fill silently checked
+    `if _spot_symbol_map is None` against an already-non-None empty dict and
+    never tried again. Now a failure leaves the cache as None (so a later
+    call retries) and only the timestamp throttles how often that retry can
+    fire, instead of a boolean-shaped "tried once, forever done" cache.
+    """
+    if not coin.startswith("@"):
+        return coin
+    global _spot_symbol_map, _spot_symbol_last_attempt
+    if _spot_symbol_map is None:
+        async with _get_spot_symbol_lock():
+            if _spot_symbol_map is None:
+                now = time.monotonic()
+                if now - _spot_symbol_last_attempt < _SPOT_SYMBOL_RETRY_SECS:
+                    return coin
+                _spot_symbol_last_attempt = now
+                meta = await client.get_spot_meta()  # already catches/logs its own errors, returns {} on failure
+                universe = meta.get("universe", [])
+                tokens = meta.get("tokens", [])
+                if universe and tokens:
+                    tok_by_idx = {t.get("index"): t.get("name") for t in tokens}
+                    _spot_symbol_map = {
+                        u["name"]: tok_by_idx.get(u["tokens"][0]) or u["name"]
+                        for u in universe
+                        if not u.get("isCanonical", True) and u.get("name", "").startswith("@")
+                    }
+                # else: leave as None — an empty/failed response retries after the throttle window
+    return (_spot_symbol_map or {}).get(coin, coin)
+
+
 def _wallets_on(ws: HyperliquidWebSocket) -> int:
     """Count distinct wallets assigned to this connection: those with a
     registered 'user:' callback PLUS those reserved at acquire time but not
@@ -254,7 +313,7 @@ class WalletMonitor:
             self._fill_consumer_task = None
 
     async def _periodic_state_refresh(self):
-        """Refresh current_state every ~60s independent of fill events.
+        """Refresh current_state every ~2min independent of fill events.
 
         Also the REST-driven safety net for position closes: once a wallet's
         connection is shared with others (pool full, MAX_WALLETS
@@ -264,13 +323,22 @@ class WalletMonitor:
         is the only remaining signal for "target closed a position with no
         fill we saw" in that case, restoring the safety net's documented
         purpose independent of WS delivery.
+
+        BUG FIX: was 50-70s — with 14 wallets all on this same cadence,
+        get_user_state alone averaged a REST call roughly every 4s across the
+        fleet, on top of everything else calling the same rate-limited IP
+        (funding rates, mids, style detection, replay fetches). Real 429s
+        were observed at just 11 wallets during testing. current_state is
+        already documented as an eventually-consistent safety net (fills are
+        the real-time signal via WS), so the safety net can afford to be
+        twice as slow in exchange for roughly half the REST load.
         """
         import random
         _FEED_STALE_SECS = 300  # 5 minutes with a connection that claims open but sent nothing
         _stale_alerted = False
         await asyncio.sleep(random.uniform(0, 30))  # initial stagger
         while True:
-            await asyncio.sleep(50 + random.uniform(0, 20))  # 50–70s jitter
+            await asyncio.sleep(100 + random.uniform(0, 40))  # 100–140s jitter
             try:
                 # Feed-health: distinguishes "target is just idle" from "the
                 # feed died" (a connection can report is_running=True while
@@ -404,6 +472,13 @@ class WalletMonitor:
             fill_user = (fill.get("user") or "").lower()
             if fill_user and fill_user != self.target_address.lower():
                 continue
+
+            raw_coin = fill.get("coin", "")
+            if raw_coin.startswith("@"):
+                # Resolve once here so every downstream consumer (position
+                # tracking, ghost tracking, DB rows, the dashboard) sees the
+                # friendly name — none of them need to know "@N" ever existed.
+                fill["coin"] = await _resolve_spot_symbol(self.client, raw_coin)
 
             symbol = fill.get("coin", "").upper()
             if symbol in settings.copy_rules.blocked_assets:
