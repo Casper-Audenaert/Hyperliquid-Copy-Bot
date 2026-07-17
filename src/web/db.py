@@ -4,7 +4,9 @@ import os
 from datetime import datetime, timedelta
 from typing import List, Optional
 
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, text, UniqueConstraint
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Float, Boolean, DateTime, text, UniqueConstraint, func,
+)
 from sqlalchemy.orm import DeclarativeBase, Session as DbSession
 
 from config.settings import settings
@@ -710,36 +712,59 @@ def _despike(rows: list) -> list:
 
 
 # Max points returned by db_get_equity_history — a long-running wallet logs a
-# point every 3s (never pruned, kept forever in the DB), so a 90-day window can
-# hold ~2.6M rows. The chart only has a few hundred horizontal pixels to draw
-# into, so anything past this is wasted JSON/network/render cost, not signal.
+# point every 3s and rows are never pruned (kept forever, by design), so a
+# wallet running for months can hold many millions of rows. The chart only has
+# a few hundred horizontal pixels to draw into, so anything past this is
+# wasted JSON/network/render cost, not signal. Raw unbounded data stays
+# reachable via the unbounded /api/export/equity CSV endpoint.
 _EQUITY_HISTORY_MAX_POINTS = 2000
 
 
-def _downsample(points: list, max_points: int = _EQUITY_HISTORY_MAX_POINTS) -> list:
-    n = len(points)
-    if n <= max_points:
-        return points
-    # (max_points-1) denominator anchors index 0 -> 0 and the last index -> n-1,
-    # so the most recent point (what a live dashboard cares about most) is
-    # always included instead of falling just short of the tail.
-    step = (n - 1) / (max_points - 1)
-    return [points[round(i * step)] for i in range(max_points)]
+def db_get_equity_history(wallet_addr: str, hours: int = 0,
+                          max_points: int = _EQUITY_HISTORY_MAX_POINTS) -> list:
+    """Returns the wallet's equity history, downsampled to at most max_points
+    points spanning the full requested time range.
 
-
-def db_get_equity_history(wallet_addr: str, hours: int = 24) -> list:
-    cutoff = datetime.utcnow() - timedelta(hours=hours if hours else 9999)
+    hours=0 (default) means "no time cutoff" — the entire retained history,
+    not just a recent window. Downsampling happens in SQL (bucket by rowid,
+    take one representative row per bucket) rather than fetching every row
+    into Python first: after months of 3s-cadence snapshots a wallet's table
+    can hold millions of rows, and building/despiking/downsampling a
+    multi-million-row Python list on every chart load does not scale — this
+    keeps Python-side memory and JSON payload size at O(max_points)
+    regardless of table size, while SQLite does the row-counting/bucketing
+    scan internally over the indexed (wallet_addr, timestamp) columns.
+    """
     with DbSession(_db_engine) as db:
-        rows = (db.query(EquitySnapshot.timestamp, EquitySnapshot.equity,
-                          EquitySnapshot.balance, EquitySnapshot.upnl)
-                .filter(EquitySnapshot.wallet_addr == wallet_addr,
-                        EquitySnapshot.timestamp >= cutoff)
-                .order_by(EquitySnapshot.timestamp)
-                .all())
+        filters = [EquitySnapshot.wallet_addr == wallet_addr]
+        if hours:
+            cutoff = datetime.utcnow() - timedelta(hours=hours)
+            filters.append(EquitySnapshot.timestamp >= cutoff)
+
+        min_id, max_id, count = (
+            db.query(func.min(EquitySnapshot.id), func.max(EquitySnapshot.id),
+                     func.count(EquitySnapshot.id))
+            .filter(*filters).one()
+        )
+        if not count:
+            return []
+
+        q = db.query(
+            EquitySnapshot.timestamp, EquitySnapshot.equity, EquitySnapshot.balance, EquitySnapshot.upnl,
+        ).filter(*filters)
+        if count > max_points:
+            # One representative row per bucket, chosen via rowid modulo — id is
+            # SQLite's implicit rowid, so this predicate is evaluated against the
+            # index itself and only the ~max_points accepted rows need a table
+            # lookup for equity/balance/upnl.
+            bucket_size = max(1, (max_id - min_id + 1) // max_points)
+            q = q.filter((EquitySnapshot.id - min_id) % bucket_size == 0)
+        rows = q.order_by(EquitySnapshot.timestamp).all()
+
     # timespec='milliseconds' → "YYYY-MM-DDTHH:MM:SS.mmm" — safe for all browsers
     raw = [{"t": ts.isoformat(timespec='milliseconds'), "equity": equity,
             "balance": balance, "upnl": upnl} for ts, equity, balance, upnl in rows]
-    return _downsample(_despike(raw))
+    return _despike(raw)
 
 
 def db_get_trades(wallet_addr: str, limit: int = 200,

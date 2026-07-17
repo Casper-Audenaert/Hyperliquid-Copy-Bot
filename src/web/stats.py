@@ -6,6 +6,8 @@ import statistics
 from collections import defaultdict, Counter
 from datetime import date, datetime, timedelta
 
+from loguru import logger
+
 from web.db import _db_engine, TradeRecord, EquitySnapshot, Wallet, db_get_trade_counters
 from sqlalchemy.orm import Session as DbSession
 from config.settings import settings
@@ -627,4 +629,4 @@ if __name__ == "__main__":
     assert act["longest_win_streak"] == 2, f"streak: {act['longest_win_streak']}"
     assert len(act["pnl_by_day"]) == 4,   f"pnl_by_day: {act['pnl_by_day']}"
 
-    print("PASS: stats.py self-check passed")
+    logger.info("PASS: stats.py self-check passed")

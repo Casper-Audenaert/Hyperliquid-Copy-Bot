@@ -6,6 +6,7 @@ All simulation logic is in web/sim.py; DB in web/db.py; stats in web/stats.py.
 import csv
 import io
 import os
+import sqlite3
 import sys
 import time
 import queue
@@ -23,11 +24,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 from config.settings import settings
 from utils.logger import setup_logger
 from web.db import (
-    _db_engine,
     add_wallet_to_db, remove_wallet_from_db,
     list_wallets_from_db, purge_wallet_data,
     db_get_equity_history, db_get_trades, db_get_hft_calibration_stats,
-    TradeRecord, EquitySnapshot,
 )
 from web.sim import _sessions, _create_session, start_session, _reinit_session, _session_to_dict
 from web.stats import compute_stats
@@ -75,6 +74,46 @@ def _emit_worker():
             logger.error(f"Emit worker error: {e}")
 
 
+# ── Data durability: daily backup + WAL checkpoint ──────────────────────────
+# EquitySnapshot rows are written every 3s forever (never pruned, by design —
+# see project notes), so months of retained history live in a single SQLite
+# file with no other durability net. A daily online backup means a corrupted
+# DB file or bad disk doesn't erase months of simulation history, and the WAL
+# checkpoint keeps the -wal file from growing unbounded under a constant
+# write rate.
+_DB_PATH = settings.database_url.removeprefix("sqlite:///")
+_BACKUP_DIR = Path(_DB_PATH).parent / "backups"
+_BACKUP_INTERVAL_SECS = 24 * 3600
+_BACKUP_RETAIN = 7
+
+
+def _backup_database():
+    _BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    dest = _BACKUP_DIR / f"trading-{datetime.now():%Y%m%d}.db"
+    try:
+        src = sqlite3.connect(_DB_PATH)
+        try:
+            dst = sqlite3.connect(str(dest))
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+            src.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            src.close()
+        for old in sorted(_BACKUP_DIR.glob("trading-*.db"))[:-_BACKUP_RETAIN]:
+            old.unlink(missing_ok=True)
+        logger.info(f"DB backup written: {dest.name}")
+    except Exception as e:
+        logger.error(f"DB backup failed: {e}")
+
+
+def _db_maintenance_worker():
+    while True:
+        _backup_database()
+        time.sleep(_BACKUP_INTERVAL_SECS)
+
+
 # ── Add-wallet start stagger ──────────────────────────────────────────────────
 # /api/add-wallet previously started every session immediately (offset_secs=0),
 # unlike the process-startup loader which staggers by 5s per wallet — already
@@ -117,9 +156,24 @@ def api_state():
     return jsonify([_session_to_dict(s) for s in list(_sessions.values())])
 
 
+@app.route("/api/full-state")
+def api_full_state():
+    """All sessions plus each one's recent equity history in a single call —
+    used on initial page load so an N-wallet dashboard doesn't need N separate
+    /api/history round-trips just to draw the first frame."""
+    out = []
+    for s in list(_sessions.values()):
+        d = _session_to_dict(s)
+        d["history"] = db_get_equity_history(s.address, hours=0, max_points=500)
+        out.append(d)
+    return jsonify(out)
+
+
 @app.route("/api/history/<wallet>")
 def api_history(wallet):
-    hours = int(request.args.get("hours", 24))
+    # hours=0 (default) = full retained history, not just a recent window —
+    # db_get_equity_history downsamples server-side so this stays cheap.
+    hours = int(request.args.get("hours", 0))
     return jsonify(db_get_equity_history(wallet.lower(), hours))
 
 
@@ -255,7 +309,7 @@ def _send_telegram(msg: str):
         return
     try:
         _requests.post(
-            f"https://api.telegram.org/bot{tok}/sendMessage",
+            f"{settings.telegram.api_base_url}/bot{tok}/sendMessage",
             json={"chat_id": chat, "text": msg, "parse_mode": "HTML"},
             timeout=5,
         )
@@ -370,6 +424,7 @@ if __name__ == "__main__":
 
     # 3. Drain the emit queue from a Flask-SocketIO background task
     socketio.start_background_task(_emit_worker)
+    socketio.start_background_task(_db_maintenance_worker)
 
     port = int(os.getenv("WEB_PORT", 5000))
     logger.info(f"Dashboard → http://localhost:{port}")

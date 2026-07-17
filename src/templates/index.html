@@ -22,12 +22,18 @@
 
   --brand:#7C6CFF;
   --brand-a:rgba(124,108,255,0.10); --brand-b:rgba(124,108,255,0.26);
+  /* Text color for text sitting ON TOP of a solid --brand fill (e.g. the
+     primary button) — verified 4.5:1 AA against --brand in each theme;
+     --brand itself is too light in dark mode and too dark in light mode to
+     share one fixed text color across both. */
+  --brand-ink:#080B14;
+  --brand-hover:#8F81FF;
 
   --green:#16C784; --green-a:rgba(22,199,132,0.10); --green-b:rgba(22,199,132,0.25);
   --red:#F0506A;   --red-a:rgba(240,80,106,0.10);   --red-b:rgba(240,80,106,0.25);
   --warn:#F5A524;  --warn-a:rgba(245,165,36,0.12);
 
-  --r:8px; --r2:12px;
+  --r:6px; --r2:12px;
   --font:'Space Grotesk',-apple-system,BlinkMacSystemFont,sans-serif;
   --mono:'JetBrains Mono','Cascadia Code',monospace;
 
@@ -35,6 +41,16 @@
   --ease-in: cubic-bezier(.4,0,1,1);    /* for elements leaving/collapsing */
   --dur-fast: 150ms;
   --dur-med: 220ms;
+
+  /* Spacing scale — 4px base. Prefer these over ad-hoc px values in new/touched rules. */
+  --sp-xs:4px; --sp-sm:8px; --sp-md:12px; --sp-lg:16px; --sp-xl:24px; --sp-2xl:32px; --sp-3xl:48px;
+
+  /* Elevation — response-only. Nothing gets a shadow at rest; see DESIGN.md's Response-Only Rule. */
+  --sh-hover: 0 4px 16px rgba(0,0,0,.24);
+  --sh-selected: 0 0 0 1px var(--brand-b), 0 4px 20px rgba(124,108,255,.15);
+  --sh-float: 0 8px 32px rgba(0,0,0,.4);
+  --sh-modal: 0 40px 80px rgba(0,0,0,.6), 0 0 0 1px rgba(255,255,255,.04);
+  --sh-drawer: 4px 0 24px rgba(0,0,0,.5);
 }
 
 /* ── Light theme ── */
@@ -44,6 +60,15 @@
   --hr:rgba(0,0,0,0.07);
   --brand:#5D4FDB;
   --brand-a:rgba(93,79,219,0.08); --brand-b:rgba(93,79,219,0.20);
+  --brand-ink:#FFFFFF;
+  --brand-hover:#4A3EC4;
+
+  /* Shadows read as muddy/heavy on a light surface at dark-theme opacity — halve it. */
+  --sh-hover: 0 4px 16px rgba(15,22,38,.10);
+  --sh-selected: 0 0 0 1px var(--brand-b), 0 4px 20px rgba(93,79,219,.12);
+  --sh-float: 0 8px 32px rgba(15,22,38,.16);
+  --sh-modal: 0 40px 80px rgba(15,22,38,.24), 0 0 0 1px rgba(15,22,38,.04);
+  --sh-drawer: 4px 0 24px rgba(15,22,38,.18);
 }
 
 /* ── Root layout — 4-zone grid ── */
@@ -55,7 +80,7 @@ body{display:grid;grid-template-rows:52px 1fr;grid-template-columns:244px 1fr}
 
 /* ── Header ── */
 header{
-  grid-column:1/-1;display:flex;align-items:center;gap:12px;padding:0 18px;
+  grid-column:1/-1;display:flex;align-items:center;gap:var(--sp-md);padding:0 var(--sp-lg);
   background:var(--s1);border-bottom:1px solid var(--hr);z-index:20;position:relative;
 }
 .logo{display:flex;align-items:center;gap:9px;flex-shrink:0}
@@ -86,22 +111,25 @@ header{
 
 /* ── Buttons ── */
 .btn{
-  display:inline-flex;align-items:center;gap:5px;padding:5px 12px;
-  border-radius:7px;border:1px solid var(--hr);background:var(--s2);
+  display:inline-flex;align-items:center;gap:5px;padding:6px 14px;
+  border-radius:var(--r);border:1px solid var(--hr);background:var(--s2);
   color:var(--t2);cursor:pointer;font-size:12px;font-weight:500;
   font-family:var(--font);transition:all var(--dur-fast) var(--ease);white-space:nowrap
 }
-.btn:hover{border-color:rgba(255,255,255,.15);color:var(--t1)}
-.btn-brand{border-color:var(--brand-b);color:var(--brand);background:var(--brand-a)}
-.btn-brand:hover{background:rgba(124,108,255,.18);border-color:var(--brand)}
+.btn:hover{border-color:rgba(255,255,255,.15);color:var(--t1);box-shadow:var(--sh-hover)}
+/* Primary action — the one place a solid (not tinted-ghost) violet fill
+   appears, so "Add Wallet" reads unambiguously as the primary action next
+   to the ghost buttons around it. */
+.btn-brand{border-color:var(--brand);color:var(--brand-ink);background:var(--brand);font-weight:600}
+.btn-brand:hover{background:var(--brand-hover);border-color:var(--brand-hover);box-shadow:var(--sh-hover)}
 .btn-danger{border-color:var(--red-b);color:var(--red);background:var(--red-a)}
 .btn-danger:hover{background:rgba(240,80,106,.16);border-color:var(--red)}
 .theme-btn{
-  width:30px;height:30px;border-radius:8px;border:1px solid var(--hr);
+  width:30px;height:30px;border-radius:var(--r);border:1px solid var(--hr);
   background:var(--s2);color:var(--t2);cursor:pointer;font-size:14px;
   display:grid;place-items:center;transition:all var(--dur-fast) var(--ease);flex-shrink:0
 }
-.theme-btn:hover{color:var(--t1)}
+.theme-btn:hover{color:var(--t1);box-shadow:var(--sh-hover)}
 
 /* ── Sidebar ── */
 .sidebar{
@@ -126,10 +154,12 @@ header{
 /* Wallet cards */
 .wcard{
   border:1px solid var(--hr);border-radius:var(--r);background:var(--s2);
-  cursor:pointer;transition:border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease), opacity var(--dur-med) var(--ease);position:relative;
+  cursor:pointer;position:relative;box-shadow:0 0 0 0 transparent;
+  transition:border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease),
+             opacity var(--dur-med) var(--ease), box-shadow var(--dur-fast) var(--ease);
 }
-.wcard:hover{border-color:rgba(255,255,255,.15)}
-.wcard.sel{border-color:var(--brand-b);background:var(--brand-a)}
+.wcard:hover{border-color:rgba(255,255,255,.15);box-shadow:var(--sh-hover)}
+.wcard.sel{border-color:var(--brand-b);background:var(--brand-a);box-shadow:var(--sh-selected)}
 .wcard-inner{padding:10px 11px}
 .wc-header{display:flex;align-items:center;gap:6px;margin-bottom:4px}
 .wc-rank{font-size:9px;font-weight:700;color:var(--t3);font-family:var(--mono);width:14px;flex-shrink:0}
@@ -173,20 +203,53 @@ header{
 /* ── Main — flex column ── */
 .main{grid-row:2;display:flex;flex-direction:column;overflow:hidden;min-height:0}
 
-/* KPI strip */
-.kpi-bar{
-  display:grid;grid-template-columns:repeat(6,1fr);flex-shrink:0;
-  background:var(--s1);border-bottom:1px solid var(--hr)
+/* ── Copy decision indicator ── */
+.decision-panel{margin:var(--sp-md) var(--sp-md) 0;flex-shrink:0}
+.dg-body{display:flex;align-items:center;gap:var(--sp-xl);padding:var(--sp-lg) var(--sp-xl);flex-wrap:wrap}
+.dg-gauge{position:relative;width:180px;height:104px;flex-shrink:0}
+.dg-gauge svg{width:100%;height:100%;overflow:visible}
+.dg-needle{transition:transform .5s var(--ease)}
+.dg-score-txt{position:absolute;left:50%;bottom:0;transform:translateX(-50%);text-align:center}
+.dg-score-num{font-size:26px;font-weight:800;font-family:var(--mono);line-height:1}
+.dg-score-lbl{font-size:9px;color:var(--t3);text-transform:uppercase;letter-spacing:1px}
+.dg-info{flex:1;min-width:240px}
+.dg-decision{font-size:22px;font-weight:800;letter-spacing:.5px;margin-bottom:4px}
+.dg-reasons{margin:6px 0 10px;padding-left:16px;font-size:11px;color:var(--t2);line-height:1.6}
+.dg-row{display:flex;align-items:center;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--t2);margin-bottom:6px}
+.dg-badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700}
+.dg-spark{display:inline-flex;vertical-align:middle;margin-left:6px}
+.dg-meta{font-size:10px;color:var(--t3);margin-top:8px}
+.dg-ticker{font-size:10px;color:var(--t3)}
+@media(max-width:768px){
+  .decision-panel{margin:var(--sp-sm) var(--sp-sm) 0}
+  .dg-body{padding:var(--sp-md);gap:var(--sp-md)}
+  .dg-gauge{width:140px;height:82px}
+  .dg-score-num{font-size:20px}
 }
-.kpi{padding:11px 16px;border-right:1px solid var(--hr);position:relative;overflow:hidden}
+
+/* KPI strip — two tiers. Hero: the numbers worth a glance from across the
+   room (Display scale). Secondary: supporting detail, denser and quieter.
+   Hierarchy comes from type scale alone, per the "instrument panel, not
+   decorated dashboard" rule — no per-tile shadows or boxed cards. */
+.kpi-bar{display:flex;flex-direction:column;flex-shrink:0;background:var(--s1);border-bottom:1px solid var(--hr)}
+.kpi-tier{display:grid;grid-template-columns:repeat(auto-fit,minmax(115px,1fr))}
+.kpi-tier-hero{border-bottom:1px solid var(--hr)}
+.kpi-tier-sub{background:color-mix(in srgb, var(--s1) 88%, var(--bg) 12%)}
+.kpi{padding:var(--sp-md) var(--sp-lg);border-right:1px solid var(--hr);position:relative;overflow:hidden}
 .kpi:last-child{border-right:none}
 .kpi::after{content:'';position:absolute;inset:0;background:transparent;transition:background .6s var(--ease);pointer-events:none}
 .kpi.flash-g::after{background:var(--green-a)}.kpi.flash-r::after{background:var(--red-a)}
-.kpi-lbl{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--t3);margin-bottom:5px}
+.kpi-lbl{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--t3);margin-bottom:6px}
 .kpi-val{font-size:19px;font-weight:700;font-family:var(--mono);letter-spacing:-.5px;line-height:1}
 .kpi-val.g{color:var(--green)}.kpi-val.r{color:var(--red)}
-.kpi-sub{font-size:10px;font-family:var(--mono);color:var(--t2);margin-top:3px}
+.kpi-sub{font-size:10px;font-family:var(--mono);color:var(--t2);margin-top:4px}
 .kpi-sub.g{color:var(--green)}.kpi-sub.r{color:var(--red)}
+.kpi-tier-hero .kpi{padding:var(--sp-lg) var(--sp-lg) var(--sp-md)}
+.kpi-tier-hero .kpi-val{font-size:26px;letter-spacing:-.7px}
+.kpi-tier-sub .kpi{padding:var(--sp-sm) var(--sp-lg)}
+.kpi-tier-sub .kpi-lbl{margin-bottom:3px}
+.kpi-tier-sub .kpi-val{font-size:15px;letter-spacing:-.3px}
+.kpi-tier-sub .kpi-sub{margin-top:2px}
 
 /* ── Content grid — 3 columns, 2 rows ─────────────────────────────────────
    Col 1+2: chart (row 1) | positions (row 2) | feed (row 2)
@@ -197,7 +260,7 @@ header{
   display:grid;
   grid-template-columns:1fr 1fr 360px;
   grid-template-rows:1.1fr 1fr;    /* chart still biggest, but positions/feed noticeably taller */
-  gap:12px;padding:12px;
+  gap:var(--sp-md);padding:var(--sp-md);
 }
 .chart-panel{grid-column:1/3;grid-row:1;min-height:0}
 .stats-panel{grid-column:3;grid-row:1/3;min-height:0;overflow:hidden}
@@ -271,11 +334,14 @@ header{
 .pos-scroll{flex:1;overflow-y:auto;padding:8px;min-height:0}
 .no-pos{padding:24px 0;text-align:center;color:var(--t3);font-size:12px}
 .pc{
-  border:1px solid var(--hr);border-left:3px solid transparent;
+  border:1px solid var(--hr);
   border-radius:var(--r);padding:9px 11px;margin-bottom:6px;background:var(--s2)
 }
 .pc:last-child{margin-bottom:0}
-.pc.long{border-left-color:var(--green)}.pc.short{border-left-color:var(--red)}
+/* Long/short reads from the side-tag badge below, not a border stripe — a
+   faint full-card tint reinforces it without adding a decorative accent. */
+.pc.long{background:color-mix(in srgb, var(--s2) 94%, var(--green) 6%)}
+.pc.short{background:color-mix(in srgb, var(--s2) 94%, var(--red) 6%)}
 .pc.fnew{animation:fslide var(--dur-med) var(--ease)}
 .pc-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px}
 .pc-sym{font-size:14px;font-weight:700;letter-spacing:-.3px}
@@ -311,6 +377,11 @@ header{
 .ftbl tr:hover td{background:var(--s2)}
 .fnew td{animation:fslide .2s ease}
 @keyframes fslide{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:translateY(0)}}
+.feed-pager{display:flex;align-items:center;justify-content:center;gap:12px;padding:8px;border-top:1px solid var(--hr);flex-shrink:0}
+.feed-pager button{background:var(--s2);border:1px solid var(--hr);color:var(--t2);border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;transition:background .2s var(--ease)}
+.feed-pager button:hover:not(:disabled){background:var(--s3)}
+.feed-pager button:disabled{opacity:.4;cursor:default}
+.feed-pager span{font-size:11px;color:var(--t3)}
 .dc{display:inline-block;padding:2px 7px;border-radius:4px;font-size:9px;font-weight:600;white-space:nowrap}
 .d-ol{background:var(--green-a);color:var(--green);border:1px solid var(--green-b)}
 .d-os{background:var(--red-a);color:var(--red);border:1px solid var(--red-b)}
@@ -380,7 +451,7 @@ header{
   display:flex;align-items:center;gap:10px;
   padding:12px 16px;border-radius:10px;font-size:13px;font-weight:500;
   background:var(--s2);border:1px solid var(--hr);
-  box-shadow:0 8px 32px rgba(0,0,0,.4);
+  box-shadow:var(--sh-float);
   transform:translateY(12px);opacity:0;pointer-events:none;
   transition:opacity .2s ease,transform .2s ease;
 }
@@ -423,7 +494,7 @@ header{
 .mbg.open{display:flex}
 .mbox{
   background:var(--s2);border:1px solid var(--hr);border-radius:16px;padding:28px;width:400px;
-  box-shadow:0 40px 80px rgba(0,0,0,.6),0 0 0 1px rgba(255,255,255,.04)
+  box-shadow:var(--sh-modal)
 }
 .mbox h2{font-size:16px;font-weight:700;margin-bottom:4px}
 .msub{font-size:12px;color:var(--t2);margin-bottom:16px}
@@ -437,20 +508,20 @@ header{
   letter-spacing:.6px;color:var(--t2);margin-bottom:6px}
 .mf input,.mf textarea{
   width:100%;padding:9px 11px;background:var(--bg);border:1px solid var(--hr);
-  border-radius:8px;color:var(--t1);font-size:13px;font-family:var(--mono);
-  outline:none;transition:border-color .14s
+  border-radius:var(--r);color:var(--t1);font-size:13px;font-family:var(--mono);
+  outline:none;transition:border-color var(--dur-fast) var(--ease)
 }
 .mf input:focus,.mf textarea:focus{border-color:var(--brand)}
 .mf textarea{resize:vertical;min-height:72px;line-height:1.5}
 .mhint{font-size:10px;color:var(--t3);margin-top:5px;line-height:1.4}
 .mfoot{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
 /* ── Compare cards ── */
-.cmp-cards{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:10px;overflow-y:auto}
+.cmp-cards{display:grid;grid-template-columns:1fr 1fr;gap:var(--sp-sm);padding:var(--sp-md);overflow-y:auto}
 .cmp-card{
   background:var(--s2);border:1px solid var(--hr);border-radius:var(--r);
-  padding:9px 10px;cursor:pointer;transition:border-color .14s,box-shadow .14s
+  padding:9px 10px;cursor:pointer;transition:border-color var(--dur-fast) var(--ease),box-shadow var(--dur-fast) var(--ease)
 }
-.cmp-card:hover{border-color:rgba(255,255,255,.16);box-shadow:0 2px 10px rgba(0,0,0,.25)}
+.cmp-card:hover{border-color:rgba(255,255,255,.16);box-shadow:var(--sh-hover)}
 .cmp-card-top{display:flex;align-items:center;gap:5px;margin-bottom:3px}
 .cmp-card-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
 .cmp-card-name{font-size:11px;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -502,16 +573,19 @@ header{
 
 /* ── Hamburger button (desktop: hidden) ── */
 .ham-btn{
-  display:none;width:30px;height:30px;border-radius:8px;border:1px solid var(--hr);
+  display:none;width:30px;height:30px;border-radius:var(--r);border:1px solid var(--hr);
   background:var(--s2);color:var(--t2);cursor:pointer;font-size:16px;
-  align-items:center;justify-content:center;transition:all .14s;flex-shrink:0;
+  align-items:center;justify-content:center;transition:all var(--dur-fast) var(--ease);flex-shrink:0;
   font-family:var(--font)
 }
-.ham-btn:hover{color:var(--t1)}
+.ham-btn:hover{color:var(--t1);box-shadow:var(--sh-hover)}
 
 /* Sidebar tap-to-close overlay (desktop: inert) */
 .sb-overlay{display:none;position:fixed;top:52px;left:0;right:0;bottom:0;z-index:49;background:rgba(0,0,0,.5)}
 .sb-overlay.sb-open{display:block}
+
+/* Bottom wallet-switcher bar — mobile only, see the 768px block below */
+.mobile-tabbar{display:none}
 
 /* ── Mobile — 768px ── */
 @media(max-width:768px){
@@ -526,7 +600,7 @@ header{
     position:fixed;left:0;top:52px;bottom:0;
     width:80%;max-width:280px;
     transform:translateX(-100%);transition:transform .25s ease;
-    z-index:50;box-shadow:4px 0 24px rgba(0,0,0,.5)
+    z-index:50;box-shadow:var(--sh-drawer)
   }
   .sidebar.sb-open{transform:translateX(0)}
 
@@ -538,21 +612,40 @@ header{
   header{gap:8px;padding:0 12px}
   .h-right{gap:6px}
 
-  /* KPI bar: 3 columns */
-  .kpi-bar{grid-template-columns:repeat(3,1fr)}
-  .kpi{padding:10px 12px}
-  .kpi-val{font-size:15px}
+  .kpi{padding:var(--sp-sm) var(--sp-md)}
   .kpi-lbl{font-size:8px}
   .kpi-sub{font-size:9px}
+  .kpi-tier-hero .kpi{padding:var(--sp-md) var(--sp-md) var(--sp-sm)}
+  .kpi-tier-hero .kpi-val{font-size:19px}
+  .kpi-tier-sub .kpi{padding:6px var(--sp-md)}
+  .kpi-tier-sub .kpi-val{font-size:13px}
 
-  /* Main: scrollable column */
-  .main{overflow-y:auto;grid-row:2}
+  /* Main: scrollable column, leave room for the bottom tabbar */
+  .main{overflow-y:auto;grid-row:2;padding-bottom:56px}
+
+  /* Bottom wallet-switcher bar — one-tap switching without opening the drawer */
+  .mobile-tabbar{
+    display:flex;position:fixed;left:0;right:0;bottom:0;z-index:48;
+    background:var(--s1);border-top:1px solid var(--hr);
+    overflow-x:auto;padding:var(--sp-sm);gap:var(--sp-xs)
+  }
+  .mtab{
+    flex:0 0 auto;display:flex;flex-direction:column;align-items:center;gap:2px;
+    background:transparent;border:1px solid transparent;border-radius:var(--r);
+    padding:var(--sp-xs) var(--sp-md);color:var(--t2);cursor:pointer;
+    transition:background var(--dur-fast) var(--ease),border-color var(--dur-fast) var(--ease)
+  }
+  .mtab.on{background:var(--brand-a);border-color:var(--brand-b)}
+  .mtab-dot{width:6px;height:6px;border-radius:50%}
+  .mtab-init{font-size:11px;font-weight:700;font-family:var(--mono)}
+  .mtab-ret{font-size:8px;font-family:var(--mono)}
+  .mtab-ret.pos{color:var(--green)} .mtab-ret.neg{color:var(--red)} .mtab-ret.z{color:var(--t3)}
 
   /* Content grid: single column, fixed panel heights */
   .content-grid{
     grid-template-columns:1fr;
-    grid-template-rows:320px 420px 280px 340px;
-    gap:10px;padding:10px
+    grid-template-rows:340px 400px 280px 340px;
+    gap:var(--sp-sm);padding:var(--sp-sm)
   }
   .chart-panel{grid-column:1;grid-row:1}
   .stats-panel{grid-column:1;grid-row:2}
@@ -575,9 +668,9 @@ header{
 
 /* ── Mobile — 480px (small phones) ── */
 @media(max-width:480px){
-  /* KPI bar: 2 columns */
-  .kpi-bar{grid-template-columns:repeat(2,1fr)}
-  .kpi-val{font-size:13px}
+  .kpi-tier{grid-template-columns:repeat(2,1fr)}
+  .kpi-tier-hero .kpi-val{font-size:17px}
+  .kpi-tier-sub .kpi-val{font-size:12px}
 }
 </style>
 </head>
@@ -619,18 +712,33 @@ header{
   </div>
 </aside>
 <div class="sb-overlay" id="sb-overlay" onclick="closeSidebar()"></div>
+<nav class="mobile-tabbar" id="mobile-tabbar"></nav>
 
 <!-- ── Main ── -->
 <div class="main">
 
-  <!-- KPI strip -->
+  <!-- KPI strip — two tiers: the numbers you actually glance at (hero),
+       then supporting detail (secondary). Same element ids either way, so
+       dashboard.js's setKpi()/renderKpis() needed zero changes for this. -->
   <div class="kpi-bar">
-    <div class="kpi" id="kc-b"><div class="kpi-lbl" title="Free cash = equity − locked margin − unrealized PnL. Can be negative when positions lock more collateral than starting capital.">Free Cash</div><div class="kpi-val mono" id="kv-b">—</div><div class="kpi-sub mono" id="ks-b"></div></div>
-    <div class="kpi" id="kc-u"><div class="kpi-lbl">Unrealized PnL</div><div class="kpi-val mono" id="kv-u">—</div><div class="kpi-sub mono" id="ks-u"></div></div>
-    <div class="kpi" id="kc-e"><div class="kpi-lbl">Equity</div><div class="kpi-val mono" id="kv-e">—</div><div class="kpi-sub mono" id="ks-e"></div></div>
-    <div class="kpi" id="kc-p"><div class="kpi-lbl">Realized PnL</div><div class="kpi-val mono" id="kv-p">—</div><div class="kpi-sub mono" id="ks-p"></div></div>
-    <div class="kpi" id="kc-w"><div class="kpi-lbl">Win Rate</div><div class="kpi-val mono" id="kv-w">—</div><div class="kpi-sub mono" id="ks-w"></div></div>
-    <div class="kpi" id="kc-t"><div class="kpi-lbl">Trades</div><div class="kpi-val mono" id="kv-t">—</div><div class="kpi-sub mono" id="ks-t"></div></div>
+    <div class="kpi-tier kpi-tier-hero">
+      <div class="kpi" id="kc-e"><div class="kpi-lbl">Equity</div><div class="kpi-val mono" id="kv-e">—</div><div class="kpi-sub mono" id="ks-e"></div></div>
+      <div class="kpi" id="kc-p"><div class="kpi-lbl">Realized PnL</div><div class="kpi-val mono" id="kv-p">—</div><div class="kpi-sub mono" id="ks-p"></div></div>
+      <div class="kpi" id="kc-u"><div class="kpi-lbl">Unrealized PnL</div><div class="kpi-val mono" id="kv-u">—</div><div class="kpi-sub mono" id="ks-u"></div></div>
+      <div class="kpi" id="kc-w"><div class="kpi-lbl">Win Rate</div><div class="kpi-val mono" id="kv-w">—</div><div class="kpi-sub mono" id="ks-w"></div></div>
+    </div>
+    <div class="kpi-tier kpi-tier-sub">
+      <div class="kpi" id="kc-b"><div class="kpi-lbl" title="Free cash = equity − locked margin − unrealized PnL. Can be negative when positions lock more collateral than starting capital.">Free Cash</div><div class="kpi-val mono" id="kv-b">—</div><div class="kpi-sub mono" id="ks-b"></div></div>
+      <div class="kpi" id="kc-t"><div class="kpi-lbl">Trades</div><div class="kpi-val mono" id="kv-t">—</div><div class="kpi-sub mono" id="ks-t"></div></div>
+      <div class="kpi" id="kc-f"><div class="kpi-lbl">Fees Paid</div><div class="kpi-val mono" id="kv-f">—</div><div class="kpi-sub mono" id="ks-f"></div></div>
+      <div class="kpi" id="kc-sh"><div class="kpi-lbl">Sharpe</div><div class="kpi-val mono" id="kv-sh">—</div><div class="kpi-sub mono" id="ks-sh"></div></div>
+      <div class="kpi" id="kc-dd"><div class="kpi-lbl">Max Drawdown</div><div class="kpi-val mono" id="kv-dd">—</div><div class="kpi-sub mono" id="ks-dd"></div></div>
+    </div>
+  </div>
+
+  <!-- Copy decision indicator -->
+  <div class="panel decision-panel" id="decision-panel" style="display:none">
+    <div id="decision-widget"></div>
   </div>
 
   <!-- Content grid: chart + stats + positions + feed -->
@@ -643,8 +751,8 @@ header{
         <div style="display:flex;align-items:center;gap:6px">
           <div class="range-row">
             <span class="rp" data-h="1"   onclick="setRange(this)">1H</span>
-            <span class="rp" data-h="4"   onclick="setRange(this)">4H</span>
-            <span class="rp on" data-h="24" onclick="setRange(this)">1D</span>
+            <span class="rp" data-h="6"   onclick="setRange(this)">6H</span>
+            <span class="rp on" data-h="24" onclick="setRange(this)">24H</span>
             <span class="rp" data-h="168" onclick="setRange(this)">7D</span>
             <span class="rp" data-h="0"   onclick="setRange(this)">ALL</span>
           </div>
@@ -712,6 +820,11 @@ header{
             <tr id="feed-ph"><td colspan="9" class="no-feed">Waiting for fills…</td></tr>
           </tbody>
         </table>
+      </div>
+      <div class="feed-pager">
+        <button onclick="feedPage(-1)" id="feed-prev">‹ Prev</button>
+        <span id="feed-page-lbl" class="mono">1 / 1</span>
+        <button onclick="feedPage(1)" id="feed-next">Next ›</button>
       </div>
     </div>
 
