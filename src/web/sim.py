@@ -818,32 +818,6 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             _mark_skip(session, fill_id, "position_cap", emit_fn=emit_fn, symbol=symbol)
             return
 
-    # ── Net exposure guard ────────────────────────────────────────────────────
-    if is_opening and not is_flip:
-        # Use current market prices for notional — cost basis (p["value"]) would
-        # understate exposure for positions that have moved significantly.
-        _px_map: dict = {}
-        if session.monitor and session.monitor.current_state:
-            _px_map = {p.symbol: p.current_price
-                       for p in session.monitor.current_state.positions if p.current_price > 0}
-        def _cur_notional(p: dict, sym: str) -> float:
-            px = _px_map.get(sym) or p.get("entry_price", 1)
-            return abs(p.get("size", 0)) * px
-        long_n  = sum(_cur_notional(p, s) for s, p in session.simulated_positions.items()
-                      if p.get("side", "").upper() == "LONG")
-        short_n = sum(_cur_notional(p, s) for s, p in session.simulated_positions.items()
-                      if p.get("side", "").upper() == "SHORT")
-        eq = (session.simulated_balance
-              + sum(p.get("margin_used", 0) for p in session.simulated_positions.values())
-              + _upnl(session))
-        new_long  = long_n  + (our_notional if position_side == PositionSide.LONG  else 0)
-        new_short = short_n + (our_notional if position_side == PositionSide.SHORT else 0)
-        cap = settings.risk_management.max_net_exposure_pct
-        if eq > 0 and cap > 0 and abs(new_long - new_short) / eq > cap:
-            logger.warning(f"[{session.label}] Net exposure guard: skip {symbol}")
-            _mark_skip(session, fill_id, "exposure", emit_fn=emit_fn, symbol=symbol)
-            return
-
     # ── Fee ───────────────────────────────────────────────────────────────────
     # Use post-slippage price so fee matches the actual executed notional.
     is_flip_check = ">" in direction
@@ -1093,13 +1067,13 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             position_value = our_size * price
             margin_req     = position_value / max(our_leverage, 1)
 
-            # Re-validate the position-count and net-exposure guards here too.
-            # C8's per-wallet FIFO queue means fills for one session no longer
-            # run _process_fill concurrently, so these can no longer actually
-            # lose a race against a sibling fill the way the pre-lock checks
-            # above could when dispatch was still create_task-per-fill —
-            # they're now redundant-but-harmless defense in depth against any
-            # future change to that guarantee, not a live correctness need.
+            # Re-validate the position-count guard here too. C8's per-wallet FIFO
+            # queue means fills for one session no longer run _process_fill
+            # concurrently, so this can no longer actually lose a race against a
+            # sibling fill the way the pre-lock check above could when dispatch
+            # was still create_task-per-fill — it's now redundant-but-harmless
+            # defense in depth against any future change to that guarantee, not
+            # a live correctness need.
             if is_opening and not is_flip:
                 max_trades = settings.copy_rules.max_open_trades
                 if max_trades and len(session.simulated_positions) >= max_trades:
@@ -1108,30 +1082,6 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
                         f"[{session.label}] Position cap re-check failed: {symbol} — skip"
                     )
                     return
-                cap = settings.risk_management.max_net_exposure_pct
-                if cap > 0:
-                    _px_map = {p.symbol: p.current_price
-                               for p in (session.monitor.current_state.positions
-                                         if session.monitor and session.monitor.current_state else [])
-                               if p.current_price > 0}
-                    def _cur_notional(p: dict, sym: str) -> float:
-                        px = _px_map.get(sym) or p.get("entry_price", 1)
-                        return abs(p.get("size", 0)) * px
-                    long_n  = sum(_cur_notional(p, s) for s, p in session.simulated_positions.items()
-                                  if p.get("side", "").upper() == "LONG")
-                    short_n = sum(_cur_notional(p, s) for s, p in session.simulated_positions.items()
-                                  if p.get("side", "").upper() == "SHORT")
-                    eq = (session.simulated_balance
-                          + sum(p.get("margin_used", 0) for p in session.simulated_positions.values())
-                          + _upnl(session))
-                    new_long  = long_n  + (our_notional if position_side == PositionSide.LONG  else 0)
-                    new_short = short_n + (our_notional if position_side == PositionSide.SHORT else 0)
-                    if eq > 0 and abs(new_long - new_short) / eq > cap:
-                        _mark_skip(session, fill_id, "exposure", emit_fn=emit_fn, symbol=symbol)
-                        logger.warning(
-                            f"[{session.label}] Net exposure re-check failed: {symbol} — skip"
-                        )
-                        return
 
             # Re-validate affordability here too, using the live balance —
             # this is the point that actually spends it, so together with the

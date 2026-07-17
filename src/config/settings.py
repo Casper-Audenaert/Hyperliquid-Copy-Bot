@@ -40,7 +40,6 @@ class RiskManagementConfig(BaseModel):
     max_daily_loss_usd: float = 500.0
     fast_loss_pct: float = 0.05           # pause if equity drops this fraction within the window
     fast_loss_window_secs: int = 300      # rolling window for the circuit breaker (5 minutes)
-    max_net_exposure_pct: float = 0.80    # |long_notional - short_notional| / equity cap
 
 class CopyStyleConfig(BaseModel):
     hft_threshold_fills_per_hour: int = 60   # fills/hr above this → "HFT" badge (informational only; all styles copy every fill live)
