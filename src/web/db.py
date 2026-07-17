@@ -43,6 +43,7 @@ class Wallet(Base):
     stats_counters = Column(String, nullable=True)         # JSON blob of lifetime trade aggregates, see db_get_trade_counters
     ratio_mode        = Column(String, default="fixed")    # "fixed" | "proportional" | "fixed_amount"
     fixed_amount_usd  = Column(Float, nullable=True)        # only meaningful when ratio_mode == "fixed_amount"
+    last_fill_time_ms = Column(Integer, default=0)          # exchange ms of the last fill we processed — restart gap-replay watermark
 
 
 class TradeRecord(Base):
@@ -160,6 +161,7 @@ for _col, _ddl in [
     ("stats_counters", "ALTER TABLE wallets ADD COLUMN stats_counters TEXT"),
     ("ratio_mode",       "ALTER TABLE wallets ADD COLUMN ratio_mode TEXT DEFAULT 'fixed'"),
     ("fixed_amount_usd", "ALTER TABLE wallets ADD COLUMN fixed_amount_usd REAL"),
+    ("last_fill_time_ms", "ALTER TABLE wallets ADD COLUMN last_fill_time_ms INTEGER DEFAULT 0"),
 ]:
     try:
         with _db_engine.connect() as conn:
@@ -357,6 +359,16 @@ def db_update_wallet_style(address: str, copy_mode: str, debounce_secs: int, det
             w.debounce_secs  = debounce_secs
             w.detected_style = detected_style
             db.commit()
+
+
+def db_update_last_fill_time(address: str, ts_ms: int):
+    """Persist the fill-clock watermark so a restart can replay exactly the
+    fills that happened during downtime instead of silently dropping them
+    (see WalletMonitor._last_fill_time). Cheap single-column UPDATE — caller
+    throttles how often this is invoked."""
+    with DbSession(_db_engine) as db:
+        db.query(Wallet).filter(Wallet.address == address).update({"last_fill_time_ms": ts_ms})
+        db.commit()
 
 
 def remove_wallet_from_db(address: str):

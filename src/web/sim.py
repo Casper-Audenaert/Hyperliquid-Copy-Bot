@@ -1530,11 +1530,13 @@ async def _periodic_liquidation_check(session: WalletSession, emit_fn: Callable)
 def _create_session(address: str, label: str, start_balance: float = None,
                     copy_mode: str = "all_fills", debounce_secs: int = 30,
                     detected_style: str = "Swing", ratio_mode: str = "fixed",
-                    fixed_amount_usd: float | None = None) -> "WalletSession":
+                    fixed_amount_usd: float | None = None,
+                    last_fill_time_ms: int = 0) -> "WalletSession":
     address = address.lower()
     balance = float(start_balance) if start_balance else settings.simulated_account_balance
     client  = HyperliquidClient(settings.hyperliquid.api_url)
-    monitor = WalletMonitor(address, settings.hyperliquid.api_url, settings.hyperliquid.ws_url)
+    monitor = WalletMonitor(address, settings.hyperliquid.api_url, settings.hyperliquid.ws_url,
+                             last_fill_time_ms=last_fill_time_ms)
     sizer = PositionSizer()
     session = WalletSession(
         address=address, label=label,

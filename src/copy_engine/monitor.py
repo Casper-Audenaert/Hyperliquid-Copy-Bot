@@ -1,5 +1,6 @@
 import asyncio
 import aiohttp
+import time
 from typing import Callable, Optional, List
 from loguru import logger
 from hyperliquid.client import HyperliquidClient, get_startup_sem
@@ -11,7 +12,8 @@ from hyperliquid.models import Position, Order, UserState, WebSocketUpdate, Posi
 # HL enforces 15 WS connections per IP.  All monitors share connections from
 # this pool rather than each opening their own.  Each WS handles unlimited
 # subscriptions, so in practice a single connection serves all wallets.
-_MAX_WS_CONNECTIONS = 14     # keep 1 slot free for other HL WS usage
+MAX_WALLETS = 14     # keep 1 slot free for other HL WS usage
+_REPLAY_FILL_CAP = 2000     # Hyperliquid userFills REST endpoint's own max return size
 _ws_pool: List[HyperliquidWebSocket] = []
 _ws_pool_lock: Optional[asyncio.Lock] = None   # lazily created in the asyncio loop
 
@@ -24,52 +26,82 @@ def _get_pool_lock() -> asyncio.Lock:
 
 
 def _wallets_on(ws: HyperliquidWebSocket) -> int:
-    """Count distinct wallets already routed to this connection (by their
-    'user:' callback registration — subscribe_user_events registers this key
-    right after a monitor acquires its connection)."""
-    return sum(1 for k in ws.callbacks if k.startswith("user:"))
+    """Count distinct wallets assigned to this connection: those with a
+    registered 'user:' callback PLUS those reserved at acquire time but not
+    yet subscribed (subscribe_user_events runs after awaited REST calls, so
+    counting callbacks alone races concurrent wallet additions)."""
+    registered = {k.split(":", 1)[1] for k in ws.callbacks if k.startswith("user:")}
+    return len(registered | ws.reserved_users)
 
 
-async def _acquire_shared_ws(ws_url: str) -> HyperliquidWebSocket:
-    """Distribute wallets one-per-connection up to _MAX_WS_CONNECTIONS, then
+async def _acquire_shared_ws(ws_url: str, address: str) -> HyperliquidWebSocket:
+    """Distribute wallets one-per-connection up to MAX_WALLETS, then
     fall back to the least-loaded connection once the pool is full.
 
-    Previously this always returned _ws_pool[0] once the pool held anything
-    (`if _ws_pool: return min(...)` on a list that could never grow past its
-    first entry) — every wallet funneled onto ONE socket regardless of
-    _MAX_WS_CONNECTIONS, making it a single point of failure for the whole
-    deployment and, combined with the userEvents-contamination fix (which
-    only delivers unattributable messages when exactly one monitor shares a
-    connection), silently dropping ALL userEvents traffic once 2+ wallets
-    existed. See _periodic_state_refresh's REST-driven safety net below for
-    the position-close signal that dropping restores.
+    The wallet's address is RESERVED on the chosen connection here, inside the
+    pool lock, so a concurrently-added wallet can never pick the same
+    connection while this one is still working through its pre-subscribe
+    awaits. Guarantees one-wallet-per-connection whenever the pool has room.
     """
+    addr_lower = address.lower()
     async with _get_pool_lock():
         if _ws_pool:
             free = [w for w in _ws_pool if _wallets_on(w) == 0]
             if free:
+                free[0].reserved_users.add(addr_lower)
                 return free[0]
-            if len(_ws_pool) < _MAX_WS_CONNECTIONS:
+            if len(_ws_pool) < MAX_WALLETS:
                 ws = HyperliquidWebSocket(ws_url)
+                ws.reserved_users.add(addr_lower)
                 _ws_pool.append(ws)
                 return ws
-            return min(_ws_pool, key=_wallets_on)
+            ws = min(_ws_pool, key=_wallets_on)
+            ws.reserved_users.add(addr_lower)
+            logger.warning(
+                f"WS pool full ({len(_ws_pool)} connections) — {addr_lower[:10]}… "
+                f"SHARES a connection ({_wallets_on(ws)} wallets on it). "
+                f"userEvents position-close/leverage signals are degraded for these "
+                f"wallets; the periodic REST refresh is the fallback."
+            )
+            _alert_shared_connection(addr_lower, _wallets_on(ws))
+            return ws
 
         # Pool is empty — create the first shared connection
         ws = HyperliquidWebSocket(ws_url)
+        ws.reserved_users.add(addr_lower)
         _ws_pool.append(ws)
         return ws
 
 
+def _alert_shared_connection(addr_lower: str, wallet_count: int):
+    """Operator-facing alert when a connection ends up serving 2+ wallets —
+    should never happen at ≤14 wallets now that acquisition reserves slots."""
+    try:
+        from web_app import _send_telegram  # late import to avoid circular
+        _send_telegram(
+            f"⚠️ <b>WS CONNECTION SHARING</b>\n{addr_lower[:10]}… now shares a "
+            f"connection with {wallet_count - 1} other wallet(s). Position-close/"
+            f"leverage WS signals degraded; REST refresh is covering."
+        )
+    except Exception:
+        pass
+
+
 async def _release_wallet_from_pool(address: str, dexs: list):
-    """Remove a wallet's subscriptions and callback from its shared WS.
-    Called when a wallet is removed from monitoring."""
+    """Remove a wallet's subscriptions, callback, and reservation from its
+    shared WS. Called when a wallet is removed from monitoring."""
     addr_lower = address.lower()
     async with _get_pool_lock():
         for ws in _ws_pool:
-            if f"user:{addr_lower}" in ws.callbacks:
-                await ws.unsubscribe_user_events(address, dexs)
-                await ws.unsubscribe_user_fills(address)
+            # Match by reservation too: a wallet that failed between acquire
+            # and subscribe has a reservation but no callback — without this
+            # its slot would leak and block a future wallet from a free
+            # connection.
+            if f"user:{addr_lower}" in ws.callbacks or addr_lower in ws.reserved_users:
+                if f"user:{addr_lower}" in ws.callbacks:
+                    await ws.unsubscribe_user_events(address, dexs)
+                    await ws.unsubscribe_user_fills(address)
+                ws.reserved_users.discard(addr_lower)
                 # Remove the reconnect handler registered for this address
                 ws.on_reconnect_handlers = [
                     h for h in ws.on_reconnect_handlers
@@ -85,6 +117,7 @@ class WalletMonitor:
         target_address: str,
         api_url: str = "https://api.hyperliquid.xyz",
         ws_url: str = "wss://api.hyperliquid.xyz/ws",
+        last_fill_time_ms: int = 0,
     ):
         self.target_address = target_address
         self.api_url = api_url
@@ -99,14 +132,23 @@ class WalletMonitor:
         self._state_refresh_task: Optional[asyncio.Task] = None
         # Bounds concurrent in-flight fill callbacks (each does a DB write + REST
         # fetch and contends on the session's state lock). Without this, a burst
-        # of fills (an HFT target, or a post-reconnect replay of up to 500 fills)
+        # of fills (an HFT target, or a post-reconnect replay of up to 2000 fills)
         # spawns one task per fill with no concurrency limit — tasks still queue
         # up instantly (create_task is never blocked), only their execution is
         # throttled, so no fill is dropped, just serialized in slices of 25.
         self._fill_sem = asyncio.Semaphore(25)
 
-        # Track the timestamp of the last processed fill for gap recovery
-        self._last_fill_time: int = 0
+        # Track the timestamp of the last processed fill for gap recovery.
+        # BUG FIX: this used to always start at 0 and was never persisted, so a
+        # process restart made the next userFills snapshot treat EVERY fill
+        # during the downtime window as pre-existing "history" and silently
+        # drop all of it (see _handle_user_fills_event) — trades that actually
+        # happened while the bot was down were never copied. Restoring the
+        # persisted watermark here (see db_update_last_fill_time /
+        # WalletSession.last_fill_time_ms) makes the same downtime window a
+        # replayable gap instead.
+        self._last_fill_time: int = last_fill_time_ms
+        self._last_fill_persist_ts: float = 0.0  # monotonic time of last DB persist (throttle)
 
         # Callbacks set by the session layer
         self.on_new_position: Optional[Callable] = None
@@ -131,8 +173,10 @@ class WalletMonitor:
         logger.info(f"Starting monitoring for {self.target_address}")
         await self.get_current_state()
 
-        # Attach to (or create) a shared WS connection from the pool
-        shared_ws = await _acquire_shared_ws(self.ws_url)
+        # Attach to (or create) a shared WS connection from the pool.
+        # The pool reserves this wallet's slot on the chosen connection
+        # atomically, so concurrent wallet additions can't share a socket.
+        shared_ws = await _acquire_shared_ws(self.ws_url, self.target_address)
         self.ws = shared_ws
 
         # Register this monitor's reconnect/fill-replay handler
@@ -176,6 +220,15 @@ class WalletMonitor:
         # Note: do NOT call await shared_ws.listen() here — it is already running
         # as an asyncio task created above (or by a previous monitor).
 
+        # A restored (nonzero) fill clock means this process just (re)started
+        # with a persisted watermark from before — replay whatever happened
+        # during the downtime gap. The userFills isSnapshot delivered by the
+        # subscribe above already covers HL's own "recent fills" window; this
+        # REST-paginated replay is the thorough backstop for a longer gap.
+        # tid dedup downstream makes any overlap between the two safe.
+        if self._last_fill_time > 0:
+            asyncio.create_task(self._replay_missed_fills())
+
     async def stop_monitoring(self):
         logger.info(f"Stopping monitoring for {self.target_address}")
         await _release_wallet_from_pool(self.target_address, self.client.dexs)
@@ -192,7 +245,7 @@ class WalletMonitor:
         """Refresh current_state every ~60s independent of fill events.
 
         Also the REST-driven safety net for position closes: once a wallet's
-        connection is shared with others (pool full, _MAX_WS_CONNECTIONS
+        connection is shared with others (pool full, MAX_WALLETS
         reached), unattributable userEvents messages are dropped by design
         (see websocket.py), so on_position_close never fires from WS for that
         wallet. This periodic REST comparison against the previous snapshot
@@ -297,6 +350,7 @@ class WalletMonitor:
 
     async def _handle_fills(self, fills: List[dict]):
         from config.settings import settings
+        _clock_before = self._last_fill_time
         for fill in fills:
             # Per-fill address check: HL includes "user" in each fill dict.
             # If it's present and doesn't match our target, skip this fill — it
@@ -332,6 +386,29 @@ class WalletMonitor:
                         self.on_order_fill(fill)
                     except Exception as e:
                         logger.error(f"Fill callback error: {e}")
+
+        if self._last_fill_time > _clock_before:
+            self._maybe_persist_fill_clock()
+
+    def _maybe_persist_fill_clock(self):
+        """Throttled (≤1/5s) persist of the fill-clock watermark to the DB so
+        a restart can restore it — see the note on __init__'s
+        _last_fill_time. Fire-and-forget: a missed persist just means a
+        slightly larger (still correct, still bounded by the replay cap)
+        replay window after the next restart, never data loss."""
+        now = time.monotonic()
+        if now - self._last_fill_persist_ts < 5.0:
+            return
+        self._last_fill_persist_ts = now
+        ts = self._last_fill_time
+        asyncio.create_task(self._persist_fill_clock(ts))
+
+    async def _persist_fill_clock(self, ts_ms: int):
+        try:
+            from web.db import db_update_last_fill_time
+            await asyncio.to_thread(db_update_last_fill_time, self.target_address.lower(), ts_ms)
+        except Exception as e:
+            logger.debug(f"Fill clock persist failed (non-fatal): {e}")
 
     async def _run_fill_callback(self, fill: dict):
         async with self._fill_sem:
@@ -372,15 +449,21 @@ class WalletMonitor:
                     except Exception:
                         continue
             if all_new:
-                if len(all_new) > 500:
-                    dropped = len(all_new) - 500
-                    logger.warning(f"Replay capped at 500 fills (had {len(all_new)}) — likely HFT target")
+                # 2000 = Hyperliquid's userFills REST endpoint's own max return size,
+                # so this cap only ever bites when the gap genuinely exceeds what a
+                # single non-time-bounded request can return at all. Algorithmic
+                # targets can blow through the old 500-fill cap in minutes.
+                if len(all_new) > _REPLAY_FILL_CAP:
+                    dropped = len(all_new) - _REPLAY_FILL_CAP
+                    logger.warning(
+                        f"Replay capped at {_REPLAY_FILL_CAP} fills (had {len(all_new)}) — likely HFT target"
+                    )
                     if self.on_alert:
                         self.on_alert(
                             f"Replay truncated for {self.target_address[:10]}…: "
                             f"{dropped} older missed fill(s) were dropped, not copied"
                         )
-                    all_new = sorted(all_new, key=lambda f: f.get("time", 0))[-500:]
+                    all_new = sorted(all_new, key=lambda f: f.get("time", 0))[-_REPLAY_FILL_CAP:]
                 logger.info(f"Replaying {len(all_new)} missed fills across {len(self.client.dexs)} DEX(es)")
                 await self._handle_fills(sorted(all_new, key=lambda f: f.get("time", 0)))
         except Exception as e:

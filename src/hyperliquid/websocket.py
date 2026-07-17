@@ -24,6 +24,14 @@ class HyperliquidWebSocket:
         self.reconnect_delay = 5
         self.subscriptions: Dict[str, Any] = {}
         self.callbacks: Dict[str, Callable] = {}
+        # Wallet addresses assigned to this connection by the pool, reserved at
+        # ACQUIRE time (under the pool lock) rather than at subscribe time.
+        # BUG FIX: the pool previously counted only registered "user:" callbacks,
+        # which a monitor registers well after acquiring its connection (after
+        # awaited REST calls) — so two wallets added concurrently could both see
+        # the same connection as "free" and end up sharing it even below the
+        # connection cap, silently degrading their userEvents delivery.
+        self.reserved_users: set = set()
         self.heartbeat_task: Optional[asyncio.Task] = None
         self.heartbeat_interval = 55  # Send ping every 55s (server closes at 60s)
         # List of handlers — all are called on reconnect so every monitor can

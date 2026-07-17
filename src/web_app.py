@@ -29,6 +29,7 @@ from web.db import (
     db_get_equity_history, db_get_trades, db_get_hft_calibration_stats,
 )
 from web.sim import _sessions, _create_session, start_session, _reinit_session, _session_to_dict
+from copy_engine.monitor import MAX_WALLETS
 from web.stats import compute_stats
 
 setup_logger(settings.log_file, settings.log_level)
@@ -225,6 +226,11 @@ def api_add_wallet():
         return jsonify({"error": "address required"}), 400
     if address in _sessions:
         return jsonify({"error": "already monitored"}), 409
+    if len(_sessions) >= MAX_WALLETS:
+        return jsonify({
+            "error": f"Max {MAX_WALLETS} wallets — Hyperliquid allows 15 WebSocket "
+                     f"connections per IP and 1 is kept in reserve."
+        }), 409
 
     session = _create_session(address, label, start_balance,
                                ratio_mode=ratio_mode, fixed_amount_usd=fixed_amount_usd)
@@ -416,6 +422,7 @@ if __name__ == "__main__":
             detected_style=getattr(w, "detected_style", "Swing") or "Swing",
             ratio_mode=getattr(w, "ratio_mode", "fixed") or "fixed",
             fixed_amount_usd=getattr(w, "fixed_amount_usd", None),
+            last_fill_time_ms=getattr(w, "last_fill_time_ms", 0) or 0,
         )
         # Stagger starts by 5s each — 2s was too tight for 20+ wallets each making
         # 9+ REST calls during startup (fill history + style detection)

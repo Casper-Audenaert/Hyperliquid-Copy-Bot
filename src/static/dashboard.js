@@ -2228,7 +2228,7 @@ async function addWallet() {
   }
 
   btn.disabled = true;
-  let succeeded = 0, failed = 0;
+  let succeeded = 0, failed = 0, lastError = '';
 
   for (let i = 0; i < entries.length; i++) {
     btn.textContent = entries.length > 1 ? `Adding ${i + 1}/${entries.length}…` : 'Adding…';
@@ -2246,15 +2246,18 @@ async function addWallet() {
         }),
       });
       const d = await r.json();
-      if (d.ok) succeeded++; else failed++;
+      if (d.ok) { succeeded++; } else { failed++; if (d.error) lastError = d.error; }
     } catch { failed++; }
   }
 
   closeModal();
-  const sub = failed > 0 ? `${failed} already monitored or invalid` : '';
+  // Surface the server's actual reason (e.g. the wallet-cap message) instead of
+  // a generic "already monitored or invalid" when we have one — that message
+  // was previously discarded even though the server always sends it.
+  const sub = failed > 0 ? (lastError || `${failed} already monitored or invalid`) : '';
   showToast(
     succeeded === 1 ? 'Wallet added' : `${succeeded} wallet${succeeded !== 1 ? 's' : ''} added`,
-    sub, '✓'
+    sub, failed > 0 && succeeded === 0 ? '⚠' : '✓'
   );
 }
 
@@ -2293,7 +2296,7 @@ async function addTestWallets() {
   }
 
   btn.disabled = true;
-  let succeeded = 0, failed = 0;
+  let succeeded = 0, failed = 0, lastError = '';
   for (let i = 0; i < addrs.length; i++) {
     btn.textContent = `Adding ${i + 1}/${addrs.length}…`;
     const address = addrs[i].toLowerCase();
@@ -2304,13 +2307,13 @@ async function addTestWallets() {
         body: JSON.stringify({ address, label, start_balance: defaultBal }),
       });
       const d = await r.json();
-      if (d.ok) succeeded++; else failed++;
+      if (d.ok) { succeeded++; } else { failed++; if (d.error) lastError = d.error; }
     } catch { failed++; }
   }
 
   closeTestModal();
-  const sub = failed > 0 ? `${failed} already monitored or invalid` : '';
-  showToast(`${succeeded} wallet${succeeded !== 1 ? 's' : ''} added`, sub, '✓');
+  const sub = failed > 0 ? (lastError || `${failed} already monitored or invalid`) : '';
+  showToast(`${succeeded} wallet${succeeded !== 1 ? 's' : ''} added`, sub, failed > 0 && succeeded === 0 ? '⚠' : '✓');
 }
 
 // ── SocketIO events ────────────────────────────────────────────────────────
