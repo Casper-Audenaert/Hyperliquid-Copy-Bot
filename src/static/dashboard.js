@@ -406,7 +406,7 @@ function _rebuildChartImpl() {
       upnl: p.upnl,
     }));
     return {
-      label: s.label || addr.slice(0,8), data, borderColor: col,
+      addr, label: s.label || addr.slice(0,8), data, borderColor: col,
       backgroundColor: compareMode ? col+'18' : buildGrad(ctx, col),
       borderWidth:2, pointRadius:0, pointHoverRadius:5,
       pointHoverBackgroundColor:col, fill:!compareMode, tension:0.18,
@@ -474,7 +474,7 @@ function addEquityPoint(addr, pt) {
   const cur = curWallet();
   if (!compareMode && cur !== addr) return;
 
-  const ds = chart.data.datasets.find(d => d.label === state[addr].label);
+  const ds = chart.data.datasets.find(d => d.addr === addr);
   const sb = state[addr].start_balance || 1;
   const y  = usePctView() ? ((pt.equity / sb) - 1) * 100 : usePnlView() ? (pt.equity - sb) : pt.equity;
   if (ds) {
@@ -869,7 +869,7 @@ let _knownPositionKeys = new Set(); // symbol+side(+wallet) keys seen last rende
 function renderPositions() {
   const cur  = curWallet();
   const sess = compareMode ? Object.values(state) : (state[cur] ? [state[cur]] : []);
-  const all  = sess.flatMap(s=>(s.positions||[]).map(p=>({...p,_lbl:s.label})));
+  const all  = sess.flatMap(s=>(s.positions||[]).map(p=>({...p,_lbl:s.label,_addr:s.address})));
   document.getElementById('pos-cnt').textContent = all.length;
   const wrap = document.getElementById('pos-list');
   if (!all.length) { wrap.innerHTML='<div class="no-pos">No open positions</div>'; _knownPositionKeys = new Set(); return; }
@@ -879,7 +879,7 @@ function renderPositions() {
   const _nextKeys = new Set();
   const rows = all.map(p => {
     const side    = (p.side||'LONG').toLowerCase();
-    const key     = `${p._lbl}:${p.symbol}:${side}`;
+    const key     = `${p._addr}:${p.symbol}:${side}`;
     _nextKeys.add(key);
     const isNew   = !_knownPositionKeys.has(key);
     const upnl    = p.upnl ?? 0;
@@ -2686,7 +2686,7 @@ socket.on('equity_tick', tick => {
   // 3-point median sees [spike, spike] as normal (median = spike → no correction).
   const addr = tick.wallet;
   const h    = state[addr]?._history;
-  const ds   = chart?.data?.datasets?.find(d => d.label === state[addr]?.label);
+  const ds   = chart?.data?.datasets?.find(d => d.addr === addr);
   const sb   = state[addr]?.start_balance || 1;
 
   if (h && h.length >= 2) {
