@@ -611,19 +611,36 @@ def _ratio_for_new_position(session: WalletSession, target_size: float, price: f
     return session.copy_ratio  # "fixed" (default) — unchanged behavior
 
 
-def _mark_skip(session: "WalletSession", fill_id, category: str, count: bool = True) -> None:
+# Rare, decision-relevant skip reasons only — ghosted/dust_buffered are
+# high-frequency (every fill on an actively-traded ghost/accumulating-dust
+# symbol hits them) and are counter-only, surfaced via skip_counts instead
+# of flooding the socket with an event per fill.
+_SKIP_EMIT_CATEGORIES = frozenset({"deviation", "exposure", "affordability", "position_cap", "dust_skipped"})
+
+
+def _mark_skip(session: "WalletSession", fill_id, category: str, count: bool = True,
+                emit_fn: Callable = None, symbol: str = "") -> None:
     """Record a skip at one of the guard sites below: bump the per-reason
     breakdown (skip_counts, dashboard-visible) and, for "true" skips, the
     aggregate skipped_fills_count that copy_efficiency_pct is derived from —
     then mark the fill processed so a WS-reconnect replay of the same fill
     doesn't recount it. `count=False` for reasons that aren't a permanent
-    miss (ghosted may later flip into a copy; dust_buffered may later flush)."""
+    miss (ghosted may later flip into a copy; dust_buffered may later flush).
+    Also emits a compact 'skip' socket event for the rare/decision-relevant
+    categories, for an inline Trade History row and a toast — see
+    _SKIP_EMIT_CATEGORIES."""
     session.skip_counts[category] = session.skip_counts.get(category, 0) + 1
     session._skip_counts_dirty = True
     if count:
         session.skipped_fills_count += 1
     session._processed_fill_ids[fill_id] = None
     _evict_fill_ids(session)
+    if emit_fn and category in _SKIP_EMIT_CATEGORIES:
+        emit_fn("skip", {
+            "wallet": session.address, "label": session.label,
+            "symbol": symbol, "reason": category,
+            "timestamp": datetime.utcnow().isoformat(timespec='milliseconds'),
+        })
 
 
 async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_fn: Callable) -> None:
@@ -633,7 +650,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
         # Skip external-builder markets (pre-IPO stocks, tokenised assets, etc.)
         # Coin names like "XYZ:SNDK" are routed via HL external builders, not perp fills.
         logger.debug(f"[{session.label}] External-market fill skipped ({symbol})")
-        _mark_skip(session, fill_id, "external_market")
+        _mark_skip(session, fill_id, "external_market", emit_fn=emit_fn, symbol=symbol)
         return
     side_str    = fill_data.get("side", "")
     target_size = abs(float(fill_data.get("sz", 0)))
@@ -712,7 +729,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     # (a reversal invalidates whatever thesis the buffer was accumulating
     # toward) — mixing it into a VWAP with the new side makes no sense.
     if is_flip and our_notional < DUST_GUARD:
-        _mark_skip(session, fill_id, "dust_skipped")
+        _mark_skip(session, fill_id, "dust_skipped", emit_fn=emit_fn, symbol=symbol)
         return
 
     # Dust accumulator (faithful mirror): a plain open/add below HL's real $10
@@ -736,7 +753,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
         buf_notional = buf["px_volume"]
         if buf_notional < DUST_GUARD:
             session.pending_dust[symbol] = buf
-            _mark_skip(session, fill_id, "dust_buffered", count=False)
+            _mark_skip(session, fill_id, "dust_buffered", count=False, emit_fn=emit_fn, symbol=symbol)
             return
         # Cumulative notional crossed the floor — flush as one aggregated open
         # at VWAP, falling through to the normal path below (deviation guard,
@@ -766,7 +783,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             if cur_mid and cur_mid > 0:
                 deviation_pct = abs(cur_mid - price) / price * 100
                 if deviation_pct > max_dev:
-                    _mark_skip(session, fill_id, "deviation")
+                    _mark_skip(session, fill_id, "deviation", emit_fn=emit_fn, symbol=symbol)
                     logger.warning(
                         f"[{session.label}] Entry deviation guard: {symbol} target fill "
                         f"${price:,.4f} vs current ${cur_mid:,.4f} "
@@ -798,7 +815,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
         max_trades = settings.copy_rules.max_open_trades
         if max_trades and len(session.simulated_positions) >= max_trades:
             logger.warning(f"[{session.label}] Position cap ({max_trades}) hit — skip {symbol}")
-            _mark_skip(session, fill_id, "position_cap")
+            _mark_skip(session, fill_id, "position_cap", emit_fn=emit_fn, symbol=symbol)
             return
 
     # ── Net exposure guard ────────────────────────────────────────────────────
@@ -824,7 +841,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
         cap = settings.risk_management.max_net_exposure_pct
         if eq > 0 and cap > 0 and abs(new_long - new_short) / eq > cap:
             logger.warning(f"[{session.label}] Net exposure guard: skip {symbol}")
-            _mark_skip(session, fill_id, "exposure")
+            _mark_skip(session, fill_id, "exposure", emit_fn=emit_fn, symbol=symbol)
             return
 
     # ── Fee ───────────────────────────────────────────────────────────────────
@@ -871,7 +888,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     if is_opening and not is_flip:
         _margin_est = our_size * price / max(our_leverage, 1)
         if _margin_est > session.simulated_balance:
-            _mark_skip(session, fill_id, "affordability")
+            _mark_skip(session, fill_id, "affordability", emit_fn=emit_fn, symbol=symbol)
             logger.warning(
                 f"[{session.label}] Affordability guard: {symbol} needs "
                 f"~${_margin_est:,.0f} margin but free balance is "
@@ -889,7 +906,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     # which reject a copy attempt we actually could have made.
     if is_closing and not is_flip and symbol not in session.simulated_positions:
         session.pending_dust.pop(symbol, None)
-        _mark_skip(session, fill_id, "other", count=False)
+        _mark_skip(session, fill_id, "other", count=False, emit_fn=emit_fn, symbol=symbol)
         return
 
     # Snapshot target's pre-close position size for close-fraction calculation.
@@ -1086,7 +1103,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             if is_opening and not is_flip:
                 max_trades = settings.copy_rules.max_open_trades
                 if max_trades and len(session.simulated_positions) >= max_trades:
-                    _mark_skip(session, fill_id, "position_cap")
+                    _mark_skip(session, fill_id, "position_cap", emit_fn=emit_fn, symbol=symbol)
                     logger.warning(
                         f"[{session.label}] Position cap re-check failed: {symbol} — skip"
                     )
@@ -1110,7 +1127,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
                     new_long  = long_n  + (our_notional if position_side == PositionSide.LONG  else 0)
                     new_short = short_n + (our_notional if position_side == PositionSide.SHORT else 0)
                     if eq > 0 and abs(new_long - new_short) / eq > cap:
-                        _mark_skip(session, fill_id, "exposure")
+                        _mark_skip(session, fill_id, "exposure", emit_fn=emit_fn, symbol=symbol)
                         logger.warning(
                             f"[{session.label}] Net exposure re-check failed: {symbol} — skip"
                         )
@@ -1122,7 +1139,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             # backstop if a future change reintroduces concurrent processing
             # for one session (see the comment on those re-checks).
             if margin_req > session.simulated_balance:
-                _mark_skip(session, fill_id, "affordability")
+                _mark_skip(session, fill_id, "affordability", emit_fn=emit_fn, symbol=symbol)
                 logger.warning(
                     f"[{session.label}] Affordability re-check failed: {symbol} needs "
                     f"${margin_req:,.2f} margin but free balance is "
@@ -1359,7 +1376,7 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
 
             # Blocked assets
             if symbol.upper() in settings.copy_rules.blocked_assets:
-                _mark_skip(session, fill_id, "blocked")
+                _mark_skip(session, fill_id, "blocked", emit_fn=emit_fn, symbol=symbol)
                 return
 
             # Ghost guard — positions we chose not to open at startup.
@@ -1398,7 +1415,7 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
                         # already held when we started tracking it) — a real hot path
                         # for busy algorithmic wallets, not an edge case.
                         await asyncio.to_thread(db_upsert_ghost, session.address, symbol, ghost)
-                        _mark_skip(session, fill_id, "ghosted", count=False)
+                        _mark_skip(session, fill_id, "ghosted", count=False, emit_fn=emit_fn, symbol=symbol)
                     return
 
             assert symbol not in session.ghost_positions, f"BUG: {symbol} still in ghost_positions at order placement"

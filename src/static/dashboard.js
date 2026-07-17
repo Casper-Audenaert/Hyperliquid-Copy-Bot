@@ -53,8 +53,9 @@ const _statsRefreshTimers = {}; // addr -> timeout id, for scheduleStatsRefresh(
 let compareSelection = new Set(); // addrs visible in compare mode
 let showCombined     = false;     // overlay combined portfolio curve
 let showUnderwater   = false;     // toggle underwater sub-chart
-let pctViewSingle    = false;     // single-wallet main chart: $ equity vs % return
-const usePctView     = () => compareMode || pctViewSingle;
+let chartMode        = 'value';   // single-wallet main chart: 'value' | 'pnl' | 'pct' — compare mode always shows %
+const usePctView     = () => compareMode || chartMode === 'pct';
+const usePnlView     = () => !compareMode && chartMode === 'pnl';
 let sortCol          = 'score';
 let sortDir          = -1;        // -1 = desc
 let cmpTab           = 'leaderboard';
@@ -127,12 +128,12 @@ function toggleTheme() {
   document.getElementById('theme-btn').textContent = saved === 'light' ? '☾' : '☀';
 })();
 
-// Init chart value-mode ($ vs %) from localStorage
-pctViewSingle = localStorage.getItem('hl-chart-pct-view') === '1';
-if (pctViewSingle) {
-  const _btn = document.getElementById('btn-pct-view');
-  if (_btn) _btn.classList.add('on');
-}
+// Init chart mode (Value/PnL/%) from localStorage — 'hl-chart-pct-view'
+// (legacy key, boolean) still honored so an existing user's saved
+// preference survives the Value/PnL/% split without silently resetting.
+const _savedChartMode = localStorage.getItem('hl-chart-mode');
+chartMode = _savedChartMode || (localStorage.getItem('hl-chart-pct-view') === '1' ? 'pct' : 'value');
+document.querySelectorAll('#chart-mode-btns .rp').forEach(b => b.classList.toggle('on', b.dataset.mode === chartMode));
 
 // ── Formatters ─────────────────────────────────────────────────────────────
 const fUsd  = n => n == null ? '—' : (n < 0 ? '-$' : '$') + Math.abs(n).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
@@ -196,9 +197,10 @@ function initChart() {
         tooltip: {
           backgroundColor: c.s1, borderColor: c.hr, borderWidth: 1,
           titleColor: c.t1, bodyColor: c.t2, padding: 12,
-          filter: item => item.dataset.label !== 'Start Balance',
+          filter: item => item.dataset.label !== 'Start Balance' && item.dataset.label !== 'Breakeven',
           callbacks: { label: ctx => {
-            const base = ` ${ctx.dataset.label}: ${usePctView() ? fPct(ctx.parsed.y) : fUsd(ctx.parsed.y)}`;
+            const val  = usePctView() ? fPct(ctx.parsed.y) : usePnlView() ? (ctx.parsed.y>=0?'+':'')+fPnl(ctx.parsed.y) : fUsd(ctx.parsed.y);
+            const base = ` ${ctx.dataset.label}: ${val}`;
             const u = ctx.raw?.upnl;
             return u != null ? [base, ` uPnL: ${fUsd(u)}`] : base;
           } }
@@ -209,7 +211,7 @@ function initChart() {
         x: { type:'time', time:{ tooltipFormat:'HH:mm:ss', displayFormats:{minute:'HH:mm',hour:'HH:mm',day:'MMM d'} },
              ticks:{color:c.t3,maxTicksLimit:8,font:{size:10}}, grid:{color:c.hr+'88'}, border:{color:c.hr} },
         y: { ticks:{ color:c.t3, font:{size:10},
-                     callback: v => usePctView() ? (v>=0?'+':'')+v.toFixed(1)+'%' : fUsd(v) },
+                     callback: v => usePctView() ? (v>=0?'+':'')+v.toFixed(1)+'%' : usePnlView() ? (v>=0?'+':'')+fPnl(v) : fUsd(v) },
              grid:{color:c.hr+'88'}, border:{color:c.hr} }
       }
     }
@@ -269,11 +271,10 @@ function _renderUnderwaterChartImpl(addr) {
   });
 }
 
-function toggleChartValueMode() {
-  pctViewSingle = !pctViewSingle;
-  localStorage.setItem('hl-chart-pct-view', pctViewSingle ? '1' : '0');
-  const btn = document.getElementById('btn-pct-view');
-  if (btn) btn.classList.toggle('on', pctViewSingle);
+function setChartMode(el) {
+  chartMode = el.dataset.mode;
+  localStorage.setItem('hl-chart-mode', chartMode);
+  document.querySelectorAll('#chart-mode-btns .rp').forEach(b => b.classList.toggle('on', b === el));
   softSwap(document.getElementById('chart-canvas'), rebuildChart);
 }
 
@@ -377,8 +378,9 @@ function _rebuildChartImpl() {
   const c     = chartColors();
   const ctx   = document.getElementById('chart-canvas').getContext('2d');
 
-  document.getElementById('chart-ttl').textContent =
-    compareMode ? '% Return Comparison (normalized)' : (pctViewSingle ? '% Return' : 'Equity Curve');
+  document.getElementById('chart-ttl').textContent = compareMode
+    ? '% Return Comparison (normalized)'
+    : (chartMode === 'pct' ? '% Return' : chartMode === 'pnl' ? 'PnL Curve' : 'Equity Curve');
 
   // Update chart theme colors
   chart.options.plugins.legend.labels.color   = c.t2;
@@ -400,7 +402,7 @@ function _rebuildChartImpl() {
     const hist = filteredHistory(addr);
     const data = hist.map(p => ({
       x: new Date(p.t).getTime(),
-      y: usePctView() ? ((p.equity / sb) - 1) * 100 : p.equity,
+      y: usePctView() ? ((p.equity / sb) - 1) * 100 : usePnlView() ? (p.equity - sb) : p.equity,
       upnl: p.upnl,
     }));
     return {
@@ -410,15 +412,16 @@ function _rebuildChartImpl() {
       pointHoverBackgroundColor:col, fill:!compareMode, tension:0.18,
     };
   });
-  // Dashed reference line at start balance ($ view) / 0% (% view) — single
-  // wallet only (compare mode already normalizes every line to 0% at start,
-  // so the reference would just duplicate the x-axis).
+  // Dashed reference line at start balance (Value mode) / breakeven (PnL & %
+  // modes) — single wallet only (compare mode already normalizes every line
+  // to 0% at start, so the reference would just duplicate the x-axis).
   if (!compareMode && addrs.length === 1 && state[addrs[0]]) {
     const primary = chart.data.datasets[0]?.data || [];
     if (primary.length >= 2) {
-      const y0 = usePctView() ? 0 : (state[addrs[0]].start_balance || 0);
+      const y0 = (usePctView() || usePnlView()) ? 0 : (state[addrs[0]].start_balance || 0);
       chart.data.datasets.push({
-        label: 'Start Balance', borderColor: 'rgba(255,255,255,0.35)', borderWidth: 1,
+        label: (usePctView() || usePnlView()) ? 'Breakeven' : 'Start Balance',
+        borderColor: 'rgba(255,255,255,0.35)', borderWidth: 1,
         borderDash: [4, 4], backgroundColor: 'transparent', pointRadius: 0,
         pointHoverRadius: 0, fill: false, tension: 0,
         data: [{x: primary[0].x, y: y0}, {x: primary[primary.length-1].x, y: y0}],
@@ -473,7 +476,7 @@ function addEquityPoint(addr, pt) {
 
   const ds = chart.data.datasets.find(d => d.label === state[addr].label);
   const sb = state[addr].start_balance || 1;
-  const y  = usePctView() ? ((pt.equity / sb) - 1) * 100 : pt.equity;
+  const y  = usePctView() ? ((pt.equity / sb) - 1) * 100 : usePnlView() ? (pt.equity - sb) : pt.equity;
   if (ds) {
     ds.data.push({ x: new Date(pt.t).getTime(), y, upnl: pt.upnl });
     if (ds.data.length > 5000) ds.data.shift();
@@ -663,11 +666,13 @@ function selectWallet(addr) {
   document.getElementById('cmp-tabs').style.display = 'none';
   document.getElementById('combined-btn').style.display = 'none';
   document.getElementById('analysis-btns').style.display = '';
+  document.getElementById('chart-mode-btns').style.display = '';
   showCombined = false;
   renderSidebar();
   renderWalletHeader();
   renderKpis();
   renderPositions();
+  renderGhostTab();
   rebuildChart();
   if (showUnderwater) renderUnderwaterChart(addr);
   loadTrades(addr);
@@ -704,12 +709,14 @@ function toggleCompare() {
   document.getElementById('cmp-tabs').style.display = compareMode ? 'flex' : 'none';
   document.getElementById('combined-btn').style.display = compareMode ? '' : 'none';
   document.getElementById('analysis-btns').style.display = compareMode ? 'none' : '';
+  document.getElementById('chart-mode-btns').style.display = compareMode ? 'none' : '';
   if (!compareMode) { showCombined = false; document.getElementById('combined-btn').classList.remove('on'); }
   renderSidebar();
   renderWalletHeader();
   _applyCompareTabVisibility();
   renderKpis();
   renderPositions();
+  if (!compareMode) renderGhostTab();
   rebuildChart();
   if (compareMode) {
     // The decision widget is a single-wallet view — hide it rather than leave
@@ -913,6 +920,72 @@ function renderPositions() {
   _knownPositionKeys = _nextKeys;
 }
 
+// ── Ghosted / Skipped tab ──────────────────────────────────────────────────
+// Single-wallet only — hidden in compare mode by _applyCompareTabVisibility.
+const _SKIP_REASON_META = {
+  ghosted:        { label: 'Ghosted adds',     tip: 'Target added to a pre-existing position we never opened (new-trades-only policy) — tracked but never copied' },
+  dust_buffered:  { label: 'Dust buffering',   tip: 'Sub-$10 opens/adds accumulating toward one aggregated copy — not lost, just not big enough to place alone yet' },
+  dust_skipped:   { label: 'Dust discarded',   tip: 'A dust buffer or sub-floor flip was discarded (target closed before it ever crossed the floor)' },
+  deviation:      { label: 'Price deviation',  tip: "Target's reported fill price had already diverged too far from the live market" },
+  exposure:       { label: 'Net exposure cap', tip: 'Would have pushed long/short net exposure past the configured limit' },
+  affordability:  { label: 'Affordability',    tip: 'Required margin exceeded free balance' },
+  position_cap:   { label: 'Position cap',     tip: 'Max open positions limit reached' },
+  blocked:        { label: 'Blocked asset',    tip: 'Symbol is on the blocked-assets list' },
+  external_market:{ label: 'External market',  tip: 'External-builder market (pre-IPO/tokenized), not a perp fill' },
+  other:          { label: 'Other',            tip: 'Target closed/reduced a symbol we never tracked (pre-dates this session)' },
+};
+
+function renderGhostTab() {
+  const cur = curWallet();
+  const s = !compareMode && cur ? state[cur] : null;
+  const wrap = document.getElementById('ghost-list');
+  const ghosted = s?.ghosted || [];
+  const dust = s?.pending_dust || [];
+  const skipCounts = s?.skip_counts || {};
+  const nonzeroReasons = Object.entries(skipCounts).filter(([,n]) => n > 0);
+
+  document.getElementById('ghost-cnt').textContent = ghosted.length;
+
+  if (!s) { wrap.innerHTML = '<div class="no-pos">Select a wallet to see ghosted positions and skip reasons</div>'; return; }
+
+  const chipsHtml = nonzeroReasons.length ? `<div class="ghost-chips">${
+    nonzeroReasons.map(([reason, n]) => {
+      const meta = _SKIP_REASON_META[reason] || { label: reason, tip: reason };
+      return `<span class="ghost-chip" title="${meta.tip}">${meta.label}: <span class="mono">${n}</span></span>`;
+    }).join('')
+  }</div>` : '';
+
+  const ghostedHtml = ghosted.length ? `<table class="ftbl">
+    <thead><tr><th>Symbol</th><th>Side</th><th>Target Size</th><th>Target Lev</th><th>Reason</th><th>Last Seen</th></tr></thead>
+    <tbody>${ghosted.map(g => `<tr title="Pre-existing position — new-trades-only policy: never copied, unblocks once the target fully closes it">
+      <td class="pc-sym">${g.symbol}</td>
+      <td><span class="side-tag ${(g.side||'LONG').toLowerCase()}">${(g.side||'LONG').toUpperCase()}</span></td>
+      <td class="mono">${fNum(g.target_size)}</td>
+      <td class="mono">${g.target_leverage}×</td>
+      <td>${g.reason_skipped || '—'}</td>
+      <td class="mono">${g.last_seen_at ? fTime(g.last_seen_at) : '—'}</td>
+    </tr>`).join('')}</tbody>
+  </table>` : '';
+
+  const dustHtml = dust.length ? `<table class="ftbl">
+    <thead><tr><th>Symbol</th><th>Side</th><th>Accumulated</th><th>Fills</th><th>VWAP</th></tr></thead>
+    <tbody>${dust.map(d => `<tr title="Sub-$10 fills accumulating toward one aggregated copy — fires as a single open once the floor is crossed">
+      <td class="pc-sym">${d.symbol}</td>
+      <td><span class="side-tag ${(d.side||'LONG').toLowerCase()}">${(d.side||'LONG').toUpperCase()}</span></td>
+      <td class="mono">accumulating: ${fUsd(d.notional)} of $10</td>
+      <td class="mono">${d.fill_count} fill${d.fill_count!==1?'s':''}</td>
+      <td class="mono">$${fPx(d.vwap)}</td>
+    </tr>`).join('')}</tbody>
+  </table>` : '';
+
+  const sections = [];
+  if (chipsHtml) sections.push(`<div class="ghost-section"><div class="ghost-section-hdr">Skip Reasons</div>${chipsHtml}</div>`);
+  if (ghostedHtml) sections.push(`<div class="ghost-section"><div class="ghost-section-hdr">Ghosted Positions (${ghosted.length})</div>${ghostedHtml}</div>`);
+  if (dustHtml) sections.push(`<div class="ghost-section"><div class="ghost-section-hdr">Accumulating Dust (${dust.length})</div>${dustHtml}</div>`);
+
+  wrap.innerHTML = sections.length ? sections.join('') : '<div class="no-pos">No ghosted positions or skipped fills</div>';
+}
+
 // ── Trade feed pagination ────────────────────────────────────────────────
 // Rows are always fully rendered into the DOM (fed by live socket prepends,
 // capped at 200) — pagination here just hides/shows rows client-side rather
@@ -1020,6 +1093,34 @@ function prependFundingRow(f) {
       <td class="wlbl">${f.label||''}</td>`;
     tbody.prepend(tr);
   });
+  while (tbody.children.length > 200) tbody.removeChild(tbody.lastChild);
+  _scheduleFeedPagination();
+}
+
+// A rare, decision-relevant skip (deviation/exposure/affordability/
+// position_cap/dust_skipped — see sim.py's _SKIP_EMIT_CATEGORIES) gets an
+// inline info row in the Trade History feed, same pattern as funding rows —
+// ghosted/dust_buffered are high-frequency and stay counter-only (Ghosted/
+// Skipped tab), never reaching this handler at all.
+function prependSkipRow(sk) {
+  const tbody = document.getElementById('feed-body');
+  const ph    = document.getElementById('feed-ph');
+  if (ph) ph.remove();
+
+  const meta = _SKIP_REASON_META[sk.reason] || { label: sk.reason };
+  const tr = document.createElement('tr');
+  tr.className = 'fnew';
+  tr.innerHTML = `
+    <td class="mono dim">${fTime(sk.timestamp||new Date().toISOString())}</td>
+    <td><span class="sym-b">${sk.symbol||'—'}</span></td>
+    <td><span class="dc" style="color:var(--warn)" title="${meta.tip||''}">Skipped: ${meta.label}</span></td>
+    <td class="mono dim">—</td>
+    <td class="mono dim">—</td>
+    <td class="mono dim">—</td>
+    <td class="dim">—</td>
+    <td class="mono dim">—</td>
+    <td class="wlbl">${sk.label||''}</td>`;
+  tbody.prepend(tr);
   while (tbody.children.length > 200) tbody.removeChild(tbody.lastChild);
   _scheduleFeedPagination();
 }
@@ -2208,7 +2309,12 @@ function filterFeed() {
 
 // ── Controls ───────────────────────────────────────────────────────────────
 function setRange(el) {
-  document.querySelectorAll('.rp').forEach(r=>r.classList.remove('on'));
+  // BUG FIX: was document.querySelectorAll('.rp') — a global selector that also
+  // cleared the visual "on" state of the unrelated Portfolio/DD/chart-mode
+  // toggle buttons (they share the .rp class for styling only), leaving those
+  // buttons looking off while still functionally on until the next click.
+  // Scoped to just the date-range pills, which are the only ones setRange owns.
+  document.querySelectorAll('#range-row-dates .rp').forEach(r=>r.classList.remove('on'));
   el.classList.add('on');
   rangeHours = parseInt(el.dataset.h)||0;
   softSwap(document.getElementById('chart-canvas'), rebuildChart);
@@ -2485,6 +2591,7 @@ function _scheduleStateRender() {
     renderWalletHeader();
     renderKpis();
     renderPositions();
+    if (!compareMode) renderGhostTab();
     if (compareMode) renderComparePanel();
   });
 }
@@ -2559,6 +2666,15 @@ socket.on('funding', f => {
   }
 });
 
+socket.on('skip', sk => {
+  const cur = curWallet();
+  if (compareMode || !cur || cur === sk.wallet) {
+    prependSkipRow(sk);
+  }
+  const meta = _SKIP_REASON_META[sk.reason] || { label: sk.reason };
+  showToast(`${sk.label||'Wallet'}: skip`, `${sk.symbol||''} — ${meta.label}`, '⚠');
+});
+
 socket.on('equity_tick', tick => {
   // Retroactive spike correction: each incoming tick gives us the "right" context
   // to correct the PREVIOUS point (3-point: h[-2], h[-1], tick) and the point
@@ -2619,6 +2735,7 @@ socket.on('wallet_removed', d => {
   renderWalletHeader();
   renderKpis();
   renderPositions();
+  if (!compareMode) renderGhostTab();
   rebuildChart();
   if (compareMode) renderComparePanel();
   if (wasActive) {
@@ -2704,6 +2821,7 @@ socket.on('clear', async d => {
   renderWalletHeader();
   renderKpis();
   renderPositions();
+  if (!compareMode) renderGhostTab();
 });
 
 // Hide single-label field when multiple addresses are entered (DOM already loaded — script is at end of body)

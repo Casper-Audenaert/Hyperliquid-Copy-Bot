@@ -385,6 +385,16 @@ header{
 .lev-tag{font-size:11px;font-family:var(--mono);color:var(--t2)}
 .wallet-badge-inline{font-size:9px;color:var(--t3);text-transform:uppercase;letter-spacing:.4px;margin-right:4px}
 
+/* ── Ghosted / Skipped tab ── */
+.ghost-section{padding:14px}
+.ghost-section+.ghost-section{border-top:1px solid var(--hr)}
+.ghost-section-hdr{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--brand);margin-bottom:10px}
+.ghost-chips{display:flex;flex-wrap:wrap;gap:6px}
+.ghost-chip{
+  display:inline-flex;align-items:center;gap:5px;padding:4px 9px;border-radius:20px;
+  font-size:11px;background:var(--s2);border:1px solid var(--hr);color:var(--t2);cursor:help
+}
+
 /* ── Trade feed ── */
 .feed-scroll{flex:1;overflow-y:auto;min-height:0}
 .no-feed{padding:24px 0;text-align:center;color:var(--t3);font-size:12px}
@@ -764,11 +774,12 @@ header{
       <div class="phdr">
         <span class="ptitle" id="chart-ttl">Equity Curve</span>
         <div style="display:flex;align-items:center;gap:6px">
-          <div class="range-row">
+          <div class="range-row" id="range-row-dates">
             <span class="rp" data-h="1"   onclick="setRange(this)">1H</span>
             <span class="rp" data-h="6"   onclick="setRange(this)">6H</span>
             <span class="rp on" data-h="24" onclick="setRange(this)">24H</span>
             <span class="rp" data-h="168" onclick="setRange(this)">7D</span>
+            <span class="rp" data-h="720" onclick="setRange(this)">30D</span>
             <span class="rp" data-h="0"   onclick="setRange(this)">ALL</span>
           </div>
           <div class="range-row">
@@ -776,7 +787,11 @@ header{
           </div>
           <div class="range-row" id="analysis-btns" style="display:none">
             <span class="rp" id="btn-underwater" onclick="toggleSubChart('underwater')" title="Drawdown depth over time">▽ DD</span>
-            <span class="rp" id="btn-pct-view" onclick="toggleChartValueMode()" title="Switch between dollar equity and percentage return — % stays readable as the account grows">%</span>
+          </div>
+          <div class="range-row" id="chart-mode-btns">
+            <span class="rp on" data-mode="value" onclick="setChartMode(this)" title="Dollar equity">Value</span>
+            <span class="rp"    data-mode="pnl"   onclick="setChartMode(this)" title="Dollar PnL = equity − start balance">PnL</span>
+            <span class="rp"    data-mode="pct"   onclick="setChartMode(this)" title="Percentage return — stays readable as the account grows">%</span>
           </div>
         </div>
       </div>
