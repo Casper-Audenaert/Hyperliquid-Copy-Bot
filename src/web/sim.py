@@ -48,39 +48,71 @@ DUST_GUARD = 10.0  # HL's real minimum order notional — fills below this are s
 _funding_cache: dict = {}
 _funding_cache_ts: float = 0.0
 _FUNDING_TTL = 35.0
+_funding_lock: Optional[asyncio.Lock] = None   # lazily created in the asyncio loop
 
 _mids_cache: dict = {}
 _mids_cache_ts: float = 0.0
 _MIDS_TTL = 3.0   # 3s: accurate enough for debounce re-pricing; was 10s
+_mids_lock: Optional[asyncio.Lock] = None      # lazily created in the asyncio loop
+
+
+def _get_funding_lock() -> asyncio.Lock:
+    global _funding_lock
+    if _funding_lock is None:
+        _funding_lock = asyncio.Lock()
+    return _funding_lock
+
+
+def _get_mids_lock() -> asyncio.Lock:
+    global _mids_lock
+    if _mids_lock is None:
+        _mids_lock = asyncio.Lock()
+    return _mids_lock
 
 
 async def _get_shared_funding_rates(client: HyperliquidClient) -> dict:
+    """Single-flight: at 14 wallets, a TTL expiry can otherwise be hit by all
+    14 sessions' periodic loops within the same tick, each independently
+    firing a 9-DEX REST fetch (14x the necessary load). The lock collapses
+    that burst to exactly one fetch; every other caller just waits for it and
+    reads the now-fresh cache (double-checked TTL, so a caller that arrives
+    after the fetch completes doesn't refetch redundantly either)."""
     global _funding_cache, _funding_cache_ts
     now = time.monotonic()
     if _funding_cache and (now - _funding_cache_ts) < _FUNDING_TTL:
         return _funding_cache
-    rates = await client.get_funding_rates()
-    _funding_cache    = rates
-    _funding_cache_ts = now
-    return rates
+    async with _get_funding_lock():
+        now = time.monotonic()
+        if _funding_cache and (now - _funding_cache_ts) < _FUNDING_TTL:
+            return _funding_cache
+        rates = await client.get_funding_rates()
+        _funding_cache    = rates
+        _funding_cache_ts = now
+        return rates
 
 
 async def _get_shared_mids(client: HyperliquidClient) -> dict:
+    """Single-flight version of the mids cache — see _get_shared_funding_rates
+    for why this matters at 14 concurrent wallets."""
     global _mids_cache, _mids_cache_ts
     now = time.monotonic()
     if _mids_cache and (now - _mids_cache_ts) < _MIDS_TTL:
         return _mids_cache
-    mids = await client.get_all_mids()
-    # Merge (not replace) — get_all_mids() fetches per sub-dex and silently drops a
-    # dex's symbols on a transient per-dex failure. Replacing the whole cache would
-    # wipe out still-valid prices for every symbol on that dex until the next
-    # successful fetch, causing equity to intermittently compute UPNL=0 for held
-    # positions on that dex (visible as a synchronized square-wave chart across
-    # every wallet holding that symbol, since this cache is shared module-wide).
-    if mids:
-        _mids_cache.update(mids)
-        _mids_cache_ts = now
-    return _mids_cache or mids or {}
+    async with _get_mids_lock():
+        now = time.monotonic()
+        if _mids_cache and (now - _mids_cache_ts) < _MIDS_TTL:
+            return _mids_cache
+        mids = await client.get_all_mids()
+        # Merge (not replace) — get_all_mids() fetches per sub-dex and silently drops a
+        # dex's symbols on a transient per-dex failure. Replacing the whole cache would
+        # wipe out still-valid prices for every symbol on that dex until the next
+        # successful fetch, causing equity to intermittently compute UPNL=0 for held
+        # positions on that dex (visible as a synchronized square-wave chart across
+        # every wallet holding that symbol, since this cache is shared module-wide).
+        if mids:
+            _mids_cache.update(mids)
+            _mids_cache_ts = now
+        return _mids_cache or mids or {}
 
 
 @dataclass
