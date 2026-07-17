@@ -130,6 +130,12 @@ class WalletSession:
     start_balance: float = 10_000.0
     simulated_positions: dict = field(default_factory=dict)
     ghost_positions: dict = field(default_factory=dict)    # symbol → ghost metadata; never generate orders for these
+    # symbol → {size, px_volume, side, first_ts, fill_count} — sub-dust-floor opens/adds
+    # accumulate here (VWAP = px_volume/size) instead of being dropped, until their
+    # cumulative notional crosses DUST_GUARD and fires one aggregated open. In-memory
+    # only: at most DUST_GUARD (~$10) of not-yet-copied size per symbol is lost on a
+    # restart, an acceptable tradeoff for not persisting a write on every sub-dust fill.
+    pending_dust: dict = field(default_factory=dict)
     copy_mode: str      = "all_fills"       # always "all_fills" now — every fill is copied live; field/DB column kept for legacy rows
     debounce_secs: int  = 30               # unused (debounced copy mode was removed) — kept only so legacy DB rows still round-trip
     ratio_mode: str = "fixed"                    # "fixed" | "proportional" | "fixed_amount" — set once at add-time, never mutated
@@ -622,11 +628,13 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     # blocked by a same-notional-as-an-open-order minimum: reducing risk to
     # match the target is not "placing a new order," and skipping it only
     # makes the desync worse, not better.
-    # Flips ARE still dust-gated: unlike a plain close, `our_size` for a flip
-    # is the genuinely new position's size on the opposite side (resolved via
-    # _ratio_for_new_position above), not a phantom value — the same "can we
-    # actually place this order" question applies as for a fresh open.
-    if not (is_closing and not is_flip) and our_notional < DUST_GUARD:
+    # Flips ARE still dust-gated outright (no accumulation): unlike a plain
+    # open/add, `our_size` for a flip is the genuinely new position's size on
+    # the opposite side (resolved via _ratio_for_new_position above), and a
+    # flip already discards any pending dust buffer for this symbol below
+    # (a reversal invalidates whatever thesis the buffer was accumulating
+    # toward) — mixing it into a VWAP with the new side makes no sense.
+    if is_flip and our_notional < DUST_GUARD:
         session.skipped_fills_count += 1
         # Mark processed even though skipped — otherwise a WS-reconnect replay of this
         # same fill re-triggers this branch every time, inflating skipped_fills_count
@@ -634,6 +642,46 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
         session._processed_fill_ids[fill_id] = None
         _evict_fill_ids(session)
         return
+
+    # Dust accumulator (faithful mirror): a plain open/add below HL's real $10
+    # minimum order notional can't be placed alone. Rather than dropping it,
+    # accumulate at VWAP into session.pending_dust[symbol] and fire ONE
+    # aggregated open once the cumulative copied notional crosses the floor.
+    # Ghosted symbols never reach here (on_order_fill's ghost guard returns
+    # earlier); a side reversal mid-accumulation discards the stale buffer
+    # instead of mixing opposite sides into one VWAP.
+    if is_opening and not is_flip and our_notional < DUST_GUARD:
+        fill_side = position_side.value
+        buf = session.pending_dust.get(symbol)
+        if buf and buf["side"] != fill_side:
+            buf = None
+        if buf is None:
+            buf = {"size": 0.0, "px_volume": 0.0, "side": fill_side,
+                   "first_ts": time.time(), "fill_count": 0}
+        buf["size"]       += our_size
+        buf["px_volume"]  += our_size * price
+        buf["fill_count"] += 1
+        buf_notional = buf["px_volume"]
+        if buf_notional < DUST_GUARD:
+            session.pending_dust[symbol] = buf
+            session.skipped_fills_count += 1
+            session._processed_fill_ids[fill_id] = None
+            _evict_fill_ids(session)
+            return
+        # Cumulative notional crossed the floor — flush as one aggregated open
+        # at VWAP, falling through to the normal path below (deviation guard,
+        # fee, leverage, and affordability are all re-evaluated against these
+        # aggregated values, exactly as for any other open).
+        session.pending_dust.pop(symbol, None)
+        our_size     = buf["size"]
+        price        = buf["px_volume"] / buf["size"]
+        our_notional = buf_notional
+        emit_size    = our_size
+        logger.info(
+            f"[{session.label}] Dust accumulator flushed {symbol}: "
+            f"{buf['fill_count']} fills -> size={our_size:.6f} @ VWAP ${price:,.4f} "
+            f"(${our_notional:,.2f})"
+        )
 
     # ── Entry deviation guard ─────────────────────────────────────────────────
     # Skip if the target's reported fill price has already diverged too far from
@@ -769,8 +817,13 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             )
             return
 
-    # Guard: close for a position we never tracked → skip (pre-dates our session)
+    # Guard: close for a position we never tracked → skip (pre-dates our session).
+    # Also covers a symbol that was only ever a dust buffer (never flushed to a
+    # real position) and the target now closes it — nothing to close on our
+    # side, so discard the buffer rather than leaving it to accumulate toward
+    # a position the target no longer even holds.
     if is_closing and not is_flip and symbol not in session.simulated_positions:
+        session.pending_dust.pop(symbol, None)
         session._processed_fill_ids[fill_id] = None
         _evict_fill_ids(session)
         return
@@ -837,6 +890,10 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
 
         # ── Close / Reduce fill ───────────────────────────────────────────────
         if is_closing and not is_flip and symbol in session.simulated_positions:
+            # Target officially reduced/closed a real position — any not-yet-
+            # flushed dust buffer for this symbol (from adds too small to have
+            # fired an aggregated open yet) is moot now; discard it.
+            session.pending_dust.pop(symbol, None)
             pos      = session.simulated_positions[symbol]
             pos_size = abs(pos["size"])
 
@@ -920,6 +977,13 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
 
         # ── Open / Add / Flip fill ────────────────────────────────────────────
         else:
+            if is_flip:
+                # A reversal invalidates whatever thesis a pending dust buffer
+                # for this symbol was accumulating toward (it was sized/sided
+                # for the OLD direction) — discard it; the flip's own size
+                # (never dust-accumulated — see the flip dust-gate above) opens
+                # the new side below on its own terms.
+                session.pending_dust.pop(symbol, None)
             if is_flip and symbol in session.simulated_positions:
                 old_pos  = session.simulated_positions[symbol]
                 old_side = old_pos.get("side", "").upper()
@@ -2100,6 +2164,7 @@ async def _reinit_session_body(session: WalletSession, emit_fn: Callable):
     session.simulated_balance    = session.start_balance
     session.simulated_positions  = {}
     session.ghost_positions      = {}
+    session.pending_dust         = {}
     session.simulated_pnl        = 0.0
     session.total_fees_paid      = 0.0
     session.total_funding_paid   = 0.0

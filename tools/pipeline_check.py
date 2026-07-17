@@ -212,6 +212,41 @@ async def scenario_snapshot_lock_deferred():
     del sim._sessions[s.address]
 
 
+async def scenario_dust_accumulator():
+    print("\n== scenario: sub-floor opens accumulate at VWAP until the dust floor is crossed ==")
+    sim._mids_cache.clear()
+    sim._mids_cache.update({"DUST": 100.0, "DUST2": 100.0})
+    s = make_session("0x_dust", "Dust", 10_000.0)
+    cbs = sim.make_callbacks(s, lambda *a, **k: None)
+    now = int(time.time() * 1000)
+
+    # Each fill alone is $5 notional (target_size=5 * ratio=0.01 * price=100) —
+    # below the $10 dust floor — so neither should open a position by itself.
+    await cbs["on_order_fill"](make_fill("DUST", "Open Long", "B", 5.0, 100.0, 901, now))
+    check("first sub-floor fill buffers, does not open", "DUST" not in s.simulated_positions)
+    check("dust buffer recorded the fill",
+          "DUST" in s.pending_dust and s.pending_dust["DUST"]["fill_count"] == 1)
+
+    await cbs["on_order_fill"](make_fill("DUST", "Add Long", "B", 5.0, 100.0, 902, now + 100))
+    check("second sub-floor fill crosses the floor and flushes an aggregated open",
+          "DUST" in s.simulated_positions)
+    check("dust buffer cleared after flush", "DUST" not in s.pending_dust)
+    check("aggregated open size equals the sum of both fills' our_size",
+          abs(abs(s.simulated_positions["DUST"]["size"]) - 0.10) < 1e-6,
+          f"size={s.simulated_positions['DUST']['size']}")
+
+    # A close for a symbol that only ever had a dust buffer (never flushed to a
+    # real position) must discard the buffer, not leave it accumulating toward
+    # a position the target no longer even holds.
+    await cbs["on_order_fill"](make_fill("DUST2", "Open Long", "B", 5.0, 100.0, 903, now + 200))
+    check("DUST2 buffered sub-floor", "DUST2" in s.pending_dust)
+    await cbs["on_order_fill"](make_fill("DUST2", "Close Long", "A", 5.0, 100.0, 904, now + 300,
+                                          start_position=5.0))
+    check("close with no real position discards the dust buffer", "DUST2" not in s.pending_dust)
+
+    del sim._sessions[s.address]
+
+
 async def scenario_hft_round_trips():
     print("\n== scenario: rapid open/close round-trips are ALL copied (no debounce drop) ==")
     sim._mids_cache.clear()
@@ -347,6 +382,7 @@ async def main():
     await scenario_partial_close_start_position()
     await scenario_dedup_idempotence()
     await scenario_snapshot_lock_deferred()
+    await scenario_dust_accumulator()
     await scenario_hft_round_trips()
     await scenario_dedup_timestamp_fallback()
     await scenario_fifo_ordering()
