@@ -55,7 +55,14 @@ class HyperliquidClient:
     
     async def _post(self, url: str, data: dict, _retries: int = 3) -> dict:
         """Make POST request with exponential backoff retry, rate-limited by global semaphore."""
-        if not self.session:
+        # BUG FIX: monitor.py's get_current_state() wraps each periodic refresh in
+        # `async with self.client:`, which calls close() on exit — but the same
+        # client object is reused afterward (e.g. by _resolve_spot_symbol). A bare
+        # `if not self.session` doesn't catch "exists but closed", so any call after
+        # the first refresh reused a dead session and every request failed with
+        # aiohttp's "Session is closed" (observed live, mistaken for rate-limiting
+        # until the actual error was checked in the logs).
+        if not self.session or self.session.closed:
             self.session = aiohttp.ClientSession()
 
         last_exc: Exception = RuntimeError("no attempts made")
