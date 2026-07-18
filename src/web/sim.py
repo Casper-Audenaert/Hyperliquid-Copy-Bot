@@ -1971,6 +1971,33 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
             f"ratio 1:{int(1/session.copy_ratio)} ({session.copy_ratio*100:.4f}%)"
         )
 
+        # BUG FIX: a position restored from the DB carries whatever copy_ratio
+        # was stored the moment it was first opened. Under "fixed" mode that's
+        # architecturally supposed to always equal session.copy_ratio (one
+        # constant ratio for the whole session) — but some already-persisted
+        # positions were found with copy_ratio=1.0 baked in (from an earlier
+        # bug or a since-changed code path), which is silently wrong two ways:
+        # it corrupts the Sync% drift indicator (compares against a phantom
+        # "expected size" ~1000x too big, showing every position as massively
+        # desynced when the real per-fill sizing was fine all along), and more
+        # seriously would size any FUTURE add to that same position at the
+        # wrong ratio (_process_fill reuses a tracked position's own stored
+        # copy_ratio for adds). Realign every restored position to the
+        # freshly-computed session.copy_ratio so a stale value can't keep
+        # propagating forward across restarts forever. Skipped for
+        # "proportional" mode, where a per-position ratio that differs from
+        # the current session-level one is the correct, intentional behavior.
+        if session.ratio_mode == "fixed":
+            for _sym, _pos in session.simulated_positions.items():
+                _stored = _pos.get("copy_ratio") or 0
+                if _stored <= 0 or abs(_stored - session.copy_ratio) / session.copy_ratio > 0.01:
+                    logger.warning(
+                        f"[{session.label}] Correcting stale copy_ratio for {_sym}: "
+                        f"{_stored} -> {session.copy_ratio}"
+                    )
+                    _pos["copy_ratio"] = session.copy_ratio
+                    await asyncio.to_thread(db_upsert_position, session.address, _sym, _pos)
+
         # ── Ghost reconciliation on restart ───────────────────────────────────
         # Load persisted ghost positions then cross-check against live target.
         # Prune ghosts the target no longer holds; update last_seen for the rest.
