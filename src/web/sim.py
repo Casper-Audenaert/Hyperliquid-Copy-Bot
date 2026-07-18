@@ -50,7 +50,7 @@ _sessions: dict = {}
 _SKIP_CATEGORIES = (
     "ghosted", "dust_buffered", "dust_skipped", "deviation", "exposure",
     "affordability", "position_cap", "blocked", "external_market", "other",
-    "ratio_unvalidated",
+    "ratio_unvalidated", "downsized",
 )
 
 DUST_GUARD = settings.copy_rules.min_position_size_usd  # HL's real minimum order notional (configurable via MIN_POSITION_SIZE_USD) — fills below this are skipped (same as live trading)
@@ -150,7 +150,6 @@ class WalletSession:
     position_sizer: PositionSizer
     client: HyperliquidClient
 
-    is_paused: bool = False
     copy_ratio: float = 1.0          # frozen for ratio_mode="fixed"; recomputed on each new position for "proportional" (via _ratio_for_new_position)
     # False until a target state fetch has ACTUALLY succeeded at least once this
     # session. Guards against opening a brand-new position with copy_ratio still
@@ -455,7 +454,6 @@ def _session_to_dict(s: WalletSession, price_override: dict | None = None) -> di
 
     return {
         "address": s.address, "label": s.label,
-        "is_paused": s.is_paused,
         "trades_copied_count": s.trades_copied_count,
         "skipped_fills_count": s.skipped_fills_count,
         "copy_efficiency_pct": copy_efficiency,
@@ -605,6 +603,68 @@ def _equity_from_cache(session: "WalletSession") -> tuple[float, float, float]:
     return session.simulated_balance + margin + upnl, session.simulated_balance, upnl
 
 
+async def _reconcile_symbol_aliases(session: "WalletSession", canon: str) -> None:
+    """Fold raw '@N' aliases of this fill's canonical symbol back into it.
+
+    fill['coin'] is resolved '@N' → base-asset name at ingestion
+    (monitor._resolve_spot_symbol), but that resolution is cache-dependent: a
+    cold cache (e.g. boot under rate-limiting) passes the raw '@N' through, so
+    the same market can end up split across TWO keys — observed live as one
+    wallet holding both a 'UBTC' and an '@142' position simultaneously, each
+    with its own dust buffer. Closes then route to only one of the keys and
+    the other desyncs forever. On every processed fill, rename (or same-side
+    merge) any stray '@N' twin of this fill's canonical key across positions,
+    dust buffers, and ghosts, in memory and in the DB."""
+    if canon.startswith("@"):
+        return  # cache still cold for this fill too — nothing to reconcile against
+    for k in [k for k in list(session.simulated_positions)
+              if k.startswith("@") and resolve_spot_symbol_display(k) == canon]:
+        stray = session.simulated_positions.pop(k)
+        cur   = session.simulated_positions.get(canon)
+        if cur is None:
+            session.simulated_positions[canon] = stray
+            logger.info(f"[{session.label}] Position key '{k}' renamed to '{canon}' (spot-alias reconciliation)")
+        elif cur.get("side") == stray.get("side"):
+            tot = abs(cur["size"]) + abs(stray["size"])
+            if tot > 0:
+                cur["entry_price"] = (abs(cur["size"]) * cur["entry_price"]
+                                      + abs(stray["size"]) * stray["entry_price"]) / tot
+            cur["size"]         = tot if cur.get("side") == "long" else -tot
+            cur["value"]        = cur.get("value", 0.0) + stray.get("value", 0.0)
+            cur["margin_used"]  = cur.get("margin_used", 0.0) + stray.get("margin_used", 0.0)
+            cur["funding_paid"] = cur.get("funding_paid", 0.0) + stray.get("funding_paid", 0.0)
+            logger.warning(f"[{session.label}] Merged duplicate '{k}' position into '{canon}' (spot-alias split)")
+        else:
+            # Opposite sides — netting them would invent a fill that never
+            # happened; keep both and surface it instead of guessing.
+            session.simulated_positions[k] = stray
+            logger.warning(
+                f"[{session.label}] '{k}' and '{canon}' hold OPPOSITE sides — left both in place"
+            )
+            continue
+        await asyncio.to_thread(db_delete_position, session.address, k)
+        await asyncio.to_thread(db_upsert_position, session.address, canon,
+                                session.simulated_positions[canon])
+    for k in [k for k in list(session.pending_dust)
+              if k.startswith("@") and resolve_spot_symbol_display(k) == canon]:
+        stray = session.pending_dust.pop(k)
+        cur   = session.pending_dust.get(canon)
+        if cur is None:
+            session.pending_dust[canon] = stray
+        elif cur.get("side") == stray.get("side"):
+            cur["size"]       += stray["size"]
+            cur["px_volume"]  += stray["px_volume"]
+            cur["fill_count"] += stray["fill_count"]
+        # opposite-side stray buffer: drop, same rule as a side reversal
+    for k in [k for k in list(session.ghost_positions)
+              if k.startswith("@") and resolve_spot_symbol_display(k) == canon]:
+        stray = session.ghost_positions.pop(k)
+        if canon not in session.ghost_positions:
+            session.ghost_positions[canon] = stray
+            await asyncio.to_thread(db_upsert_ghost, session.address, canon, stray)
+        await asyncio.to_thread(db_delete_ghost, session.address, k)
+
+
 def _ratio_for_new_position(session: WalletSession, target_size: float, price: float) -> float:
     """Resolve the ratio to use when opening a position not already tracked.
 
@@ -704,6 +764,11 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
         logger.debug(f"[{session.label}] External-market fill skipped ({symbol})")
         _mark_skip(session, fill_id, "external_market", emit_fn=emit_fn, symbol=symbol)
         return
+    # Canonicalize: the monitor resolves '@N' → base-asset name at ingestion,
+    # but only when its cache is warm — re-try here (cache may have warmed since)
+    # and fold any stray keys the cold-cache window created for this market.
+    symbol = resolve_spot_symbol_display(symbol)
+    await _reconcile_symbol_aliases(session, symbol)
     side_str    = fill_data.get("side", "")
     target_size = abs(float(fill_data.get("sz", 0)))
     price       = float(fill_data.get("px", 0))
@@ -750,17 +815,44 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             is_opening = True
 
     # Guard: close for a position we never tracked → skip (pre-dates our session).
-    # Also covers a symbol that was only ever a dust buffer (never flushed to a
-    # real position) and the target now closes it — nothing to close on our
-    # side, so discard the buffer rather than leaving it to accumulate toward
-    # a position the target no longer even holds. Not counted toward
-    # skipped_fills_count: there's nothing WE could have copied here (no
-    # symbol tracking existed on our side at all). Must run BEFORE the ratio
-    # resolution/validation below: an untracked close is not a "new position",
-    # and letting it fall into the ratio_unvalidated guard would wrongly count
-    # it against copy_efficiency_pct during a rate-limited startup window.
+    # Not counted toward skipped_fills_count: there's nothing WE could have
+    # copied here (no symbol tracking existed on our side at all). Must run
+    # BEFORE the ratio resolution/validation below: an untracked close is not a
+    # "new position", and letting it fall into the ratio_unvalidated guard
+    # would wrongly count it against copy_efficiency_pct during a rate-limited
+    # startup window.
+    #
+    # Dust-buffer handling — BUG FIX: this used to pop the ENTIRE pending_dust
+    # buffer on EVERY untracked close, including partial reduces. For an HFT
+    # target scalping in rapid open/close bursts at a tiny copy ratio (every
+    # copied open sub-$10 → buffered), each interleaved partial close wiped the
+    # whole accumulation, so the sim could only ever capture the last ~$10
+    # sliver of a position the target built hundreds of times larger —
+    # observed live as Sync 0.5-1.7% on the very first copied trades. A close
+    # is a *fractional* reduction of the target's position, so mirror exactly
+    # that: shrink the same-side buffer by the fraction the target actually
+    # closed (pre-fill size from the fill's own `startPosition`, the same
+    # authoritative source the real close path uses below). Discard entirely
+    # only on a full close (or when startPosition is missing/zero — unknowable
+    # fraction, keep the old conservative wipe).
     if is_closing and not is_flip and symbol not in session.simulated_positions:
-        session.pending_dust.pop(symbol, None)
+        buf = session.pending_dust.get(symbol)
+        if buf is not None and buf.get("side") == position_side.value:
+            try:
+                start_abs = abs(float(fill_data.get("startPosition")))
+            except (TypeError, ValueError):
+                start_abs = 0.0
+            remaining = start_abs - target_size
+            if start_abs > 0 and remaining > start_abs * 0.01:
+                frac_kept = remaining / start_abs
+                buf["size"]      *= frac_kept
+                buf["px_volume"] *= frac_kept
+            else:
+                session.pending_dust.pop(symbol, None)
+        elif buf is not None:
+            # Opposite-side buffer vs the side being closed — stale thesis,
+            # discard (pre-fix behavior).
+            session.pending_dust.pop(symbol, None)
         _mark_skip(session, fill_id, "other", count=False, emit_fn=emit_fn, symbol=symbol)
         return
 
@@ -959,22 +1051,47 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
 
     pnl_realized = None
 
-    # Affordability guard: if the margin required exceeds free cash, skip.
-    # Spot buys (1x leverage) and very large positions create margin = full notional.
-    # The target's spot position won't appear in current_state.positions, so
-    # target_leverage defaults to 1.0 → margin = our_size * price. With a $10k
-    # sim account we can never put up $387k margin — skip it rather than letting
-    # the balance go deeply negative (which corrupts all subsequent equity calcs).
+    # Affordability guard: when the margin required exceeds free cash, DOWNSIZE
+    # to what the account can actually put up (industry "partial copy") instead
+    # of skipping the trade outright — some copy participation beats none, and
+    # the position's own stored copy_ratio still governs later adds/closes so
+    # the books stay consistent. The notional budget reserves room for the
+    # taker fee too (margin + fee must both fit in free cash). If even the
+    # affordable notional is below HL's $10 minimum order, nothing can be
+    # placed — that stays a counted "affordability" skip.
     if is_opening and not is_flip:
-        _margin_est = our_size * price / max(our_leverage, 1)
+        _lev = max(our_leverage, 1)
+        _margin_est = our_size * price / _lev
         if _margin_est > session.simulated_balance:
-            _mark_skip(session, fill_id, "affordability", emit_fn=emit_fn, symbol=symbol)
+            _notional_max = (session.simulated_balance * 0.995
+                             / (1.0 / _lev + settings.taker_fee_rate))
+            if _notional_max < DUST_GUARD:
+                _mark_skip(session, fill_id, "affordability", emit_fn=emit_fn, symbol=symbol)
+                logger.warning(
+                    f"[{session.label}] Affordability guard: {symbol} needs "
+                    f"~${_margin_est:,.0f} margin but free balance "
+                    f"${session.simulated_balance:,.0f} can't even cover HL's "
+                    f"${DUST_GUARD:.0f} minimum ({our_leverage:.0f}x lev) — skip"
+                )
+                return
+            _full_size   = our_size
+            our_size     = _notional_max / price
+            our_notional = our_size * price
+            emit_size    = our_size
+            # Recompute the fee for the downsized notional (this branch is a
+            # plain open/add — never a flip, so the fee is single-leg).
+            fill_fee = our_notional * settings.taker_fee_rate
+            # Surface the partial copy in the dashboard's skip-reason breakdown
+            # WITHOUT _mark_skip: this fill still executes (must not be marked
+            # processed yet, and it isn't a missed copy for copy_efficiency).
+            session.skip_counts["downsized"] = session.skip_counts.get("downsized", 0) + 1
+            session._skip_counts_dirty = True
             logger.warning(
-                f"[{session.label}] Affordability guard: {symbol} needs "
-                f"~${_margin_est:,.0f} margin but free balance is "
-                f"${session.simulated_balance:,.0f} ({our_leverage:.0f}x lev) — skip"
+                f"[{session.label}] Affordability: downsized {symbol} "
+                f"{_full_size:.6f} → {our_size:.6f} "
+                f"(${_margin_est:,.0f} margin needed, ${session.simulated_balance:,.0f} free, "
+                f"{our_leverage:.0f}x lev) — partial copy"
             )
-            return
 
     # Snapshot target's pre-close position size for close-fraction calculation.
     # 3-tier resolution, most exact first:
@@ -1170,6 +1287,10 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             if is_opening and not is_flip:
                 max_trades = settings.copy_rules.max_open_trades
                 if max_trades and len(session.simulated_positions) >= max_trades:
+                    # Refund the fee taken at the top of the lock — a skipped
+                    # order was never placed, so it costs nothing.
+                    session.simulated_balance += fill_fee
+                    session.total_fees_paid   -= fill_fee
                     _mark_skip(session, fill_id, "position_cap", emit_fn=emit_fn, symbol=symbol)
                     logger.warning(
                         f"[{session.label}] Position cap re-check failed: {symbol} — skip"
@@ -1182,6 +1303,10 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             # backstop if a future change reintroduces concurrent processing
             # for one session (see the comment on those re-checks).
             if margin_req > session.simulated_balance:
+                # Refund the fee taken at the top of the lock — a skipped
+                # order was never placed, so it costs nothing.
+                session.simulated_balance += fill_fee
+                session.total_fees_paid   -= fill_fee
                 _mark_skip(session, fill_id, "affordability", emit_fn=emit_fn, symbol=symbol)
                 logger.warning(
                     f"[{session.label}] Affordability re-check failed: {symbol} needs "
@@ -1389,8 +1514,6 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
 
     async def on_order_fill(fill_data: dict):
         if session.address not in _sessions:
-            return
-        if session.is_paused:
             return
 
         # Dedup by tid (trade ID — exchange sequence identity, long memory: the
@@ -1651,7 +1774,7 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
             # Uses a provisional equity estimate; equity is recomputed after the
             # liquidation pass below so the pause check there reflects current state.
             rm = settings.risk_management
-            if rm.fast_loss_pct > 0 and not session.is_paused and len(session.equity_history) >= 2:
+            if rm.fast_loss_pct > 0 and len(session.equity_history) >= 2:
                 window_ago = (
                     datetime.utcnow() - timedelta(seconds=rm.fast_loss_window_secs)
                 ).isoformat()
@@ -1698,7 +1821,7 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
                                else size * (entry - px))
             equity = session.simulated_balance + total_margin + total_upnl
 
-            if equity <= 0 and not session.is_paused:
+            if equity <= 0:
                 # Alert only — don't pause. Real exchanges enforce this via liquidation
                 # at the position level (already handled by _check_and_liquidate), not
                 # by freezing the account. Equity should not reach 0 with proper
