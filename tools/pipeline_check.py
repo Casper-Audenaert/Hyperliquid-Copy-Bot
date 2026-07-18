@@ -526,6 +526,196 @@ async def scenario_money_math_invariant(n_wallets: int):
     check("60-fill x N-wallet burst completed in reasonable time", elapsed < 30.0, f"{elapsed}s")
 
 
+async def scenario_dust_buffer_survives_partial_close():
+    """BUG FIX regression: an untracked partial close used to wipe the ENTIRE
+    pending_dust buffer — for HFT scalper targets at tiny ratios (every copied
+    open sub-$10) each interleaved partial close reset the accumulation to
+    zero, capturing only ~$10 slivers of positions built 100x larger (observed
+    live: Sync 0.5-1.7%). A partial close must scale the buffer by the closed
+    fraction; only a FULL close discards it."""
+    print("\n== scenario: dust buffer survives untracked partial close ==")
+    sim._mids_cache.clear()
+    sim._mids_cache.update({"ZEC": 500.0})
+    s = make_session("0x_dustclose", "DustClose", 10_000.0)
+    cbs = sim.make_callbacks(s, lambda *a, **k: None)
+    now = int(time.time() * 1000)
+
+    for i in range(3):  # 3 sub-dust opens: 0.1 * 0.01 * $500 = $0.50 each
+        await cbs["on_order_fill"](make_fill("ZEC", "Open Short", "A", 0.1, 500.0, 9100 + i, now + i))
+    check("sub-$10 opens accumulated into dust buffer", "ZEC" in s.pending_dust)
+    buf_size_before = s.pending_dust["ZEC"]["size"]
+    check("buffer holds all 3 copied fills", abs(buf_size_before - 0.003) < 1e-9,
+          f"size={buf_size_before}")
+
+    # Target partially closes 4 of its 10 ZEC (fraction 0.4) — we track no position.
+    await cbs["on_order_fill"](make_fill("ZEC", "Close Short", "B", 4.0, 500.0, 9110, now + 10,
+                                          start_position=-10.0))
+    check("partial untracked close KEEPS the buffer", "ZEC" in s.pending_dust)
+    check("buffer scaled by the closed fraction (x0.6)",
+          abs(s.pending_dust["ZEC"]["size"] - buf_size_before * 0.6) < 1e-9,
+          f"size={s.pending_dust['ZEC']['size']}")
+    check("untracked close not counted against copy efficiency", s.skipped_fills_count == 0)
+
+    # Target fully closes the remaining 6 — now the buffer must go.
+    await cbs["on_order_fill"](make_fill("ZEC", "Close Short", "B", 6.0, 500.0, 9111, now + 20,
+                                          start_position=-6.0))
+    check("full untracked close discards the buffer", "ZEC" not in s.pending_dust)
+    del sim._sessions[s.address]
+
+
+async def scenario_spot_alias_reconciliation():
+    """BUG FIX regression: '@N' → base-name resolution at ingestion is
+    cache-dependent, so a cold cache (boot under rate limiting) could key the
+    same market under BOTH its raw '@N' index and its resolved name (observed
+    live: 'UBTC' and '@142' positions coexisting on one wallet). A processed
+    fill for the resolved name must fold the stray '@N' twin back in."""
+    print("\n== scenario: spot-alias position reconciliation ==")
+    from copy_engine import monitor as monitor_mod
+    sim._mids_cache.clear()
+    sim._mids_cache.update({"UBTC": 64_000.0})
+    saved_map = monitor_mod._spot_symbol_map
+    monitor_mod._spot_symbol_map = {"@142": "UBTC"}
+    try:
+        s = make_session("0x_alias", "Alias", 10_000.0)
+        cbs = sim.make_callbacks(s, lambda *a, **k: None)
+        now = int(time.time() * 1000)
+        # Simulate a position + dust buffer created while the cache was cold (raw key).
+        s.simulated_positions["@142"] = {
+            "size": -0.001, "entry_price": 64_000.0, "leverage": 1,
+            "side": "short", "value": 64.0, "margin_used": 64.0, "copy_ratio": 0.01,
+        }
+        s.pending_dust["@142"] = {"size": 0.00002, "px_volume": 1.28, "side": "short",
+                                  "first_ts": time.time(), "fill_count": 1}
+        # A fill for the SAME market arrives post-warm under its resolved name.
+        await cbs["on_order_fill"](make_fill("UBTC", "Open Short", "A", 0.05, 64_000.0, 9200, now,
+                                              start_position=-10.0))
+        check("stray '@142' position key is gone", "@142" not in s.simulated_positions)
+        check("canonical 'UBTC' position exists", "UBTC" in s.simulated_positions)
+        merged = abs(s.simulated_positions["UBTC"]["size"])
+        # 0.001 (stray) + 0.05 * 0.01 (this fill) = 0.0015
+        check("sizes merged: stray + new fill", abs(merged - 0.0015) < 1e-9, f"size={merged}")
+        check("stray dust buffer folded under canonical key", "@142" not in s.pending_dust)
+        del sim._sessions[s.address]
+    finally:
+        monitor_mod._spot_symbol_map = saved_map
+
+
+def _assert_sane(s, tag):
+    """No NaN/inf anywhere money-shaped, balance never negative."""
+    vals = [("balance", s.simulated_balance), ("pnl", s.simulated_pnl),
+            ("fees", s.total_fees_paid)]
+    for sym, p in s.simulated_positions.items():
+        vals += [(f"{sym}.size", p["size"]), (f"{sym}.entry", p["entry_price"]),
+                 (f"{sym}.margin", p.get("margin_used", 0))]
+    for name, v in vals:
+        check(f"{tag}: {name} is finite", v == v and abs(v) != float("inf"), f"{name}={v}")
+    check(f"{tag}: balance never negative", s.simulated_balance >= 0,
+          f"balance={s.simulated_balance}")
+
+
+async def scenario_downsize_on_unaffordable():
+    """Industry 'partial copy': an open whose full copy size exceeds free
+    margin is DOWNSIZED to the largest affordable size (margin + fee both fit
+    in free cash), not skipped — unless even that is under HL's $10 minimum,
+    which stays a counted affordability skip."""
+    print("\n== scenario: unaffordable open downsizes instead of skipping ==")
+    sim._mids_cache.clear()
+    sim._mids_cache.update({"BTC": 50_000.0})
+    s = make_session("0x_downsize", "Downsize", 1_000.0)
+    cbs = sim.make_callbacks(s, lambda *a, **k: None)
+    now = int(time.time() * 1000)
+
+    # Full copy would be 1.0 * 0.01 * $50k = $500 notional at 1x — affordable.
+    # 10.0 * 0.01 * $50k = $5,000 notional needs $5,000 margin vs $1,000 free.
+    await cbs["on_order_fill"](make_fill("BTC", "Open Long", "B", 10.0, 50_000.0, 9300, now))
+    check("position opened despite unaffordable full size", "BTC" in s.simulated_positions)
+    pos = s.simulated_positions["BTC"]
+    margin = pos["margin_used"]
+    check("downsized margin fits free balance", margin <= 1_000.0, f"margin={margin}")
+    check("downsized notional is substantial (not dust)", abs(pos["size"]) * 50_000.0 > 900.0,
+          f"notional={abs(pos['size']) * 50_000.0}")
+    check("downsize surfaced in skip_counts", s.skip_counts.get("downsized", 0) == 1,
+          f"skip_counts={dict(s.skip_counts)}")
+    check("downsize NOT counted as a missed copy", s.skipped_fills_count == 0)
+    check("balance non-negative after fee+margin", s.simulated_balance >= 0,
+          f"balance={s.simulated_balance}")
+    check("trade counted as copied", s.trades_copied_count == 1)
+
+    # Drain the account so the affordable notional falls under $10 — must skip.
+    s.simulated_balance = 5.0
+    await cbs["on_order_fill"](make_fill("ETH", "Open Long", "B", 10.0, 3_000.0, 9301, now + 10))
+    check("sub-$10 affordable budget still skips (HL minimum)",
+          "ETH" not in s.simulated_positions)
+    check("that skip IS counted as affordability", s.skip_counts.get("affordability", 0) == 1,
+          f"skip_counts={dict(s.skip_counts)}")
+    del sim._sessions[s.address]
+
+
+async def scenario_amount_sweep():
+    """'Works with any amount entered': for start balances from $10 to $100M
+    across all 3 ratio modes, run open → add → partial close → full close and
+    assert (a) no NaN/inf ever, (b) balance never negative, (c) strict money
+    conservation: end balance == start − fees + realized PnL, (d) accounts too
+    small to trade skip CLEANLY (dust/affordability) instead of corrupting.
+    A $10 account genuinely cannot open at 1x with HL's $10 minimum — the
+    correct outcome there is zero trades and an intact $10, not a crash."""
+    print("\n== scenario: amount sweep -- $10 to $100M x 3 ratio modes ==")
+    from types import SimpleNamespace
+    PX = 50_000.0
+    TARGET_EQ = 1_000_000.0
+    tid = [20_000]
+
+    for start in (10.0, 250.0, 10_000.0, 1_000_000.0, 100_000_000.0):
+        for mode in ("fixed", "proportional", "fixed_amount"):
+            sim._mids_cache.clear()
+            sim._mids_cache.update({"BTC": PX})
+            s = make_session(f"0x_amt_{int(start)}_{mode}", f"A{int(start)}{mode[:4]}", start)
+            s.ratio_mode = mode
+            if mode == "fixed_amount":
+                s.fixed_amount_usd = min(max(12.0, start * 0.001), start * 0.5)
+            s.copy_ratio = start / TARGET_EQ
+            s.monitor.current_state = SimpleNamespace(balance=TARGET_EQ, positions=[])
+            cbs = sim.make_callbacks(s, lambda *a, **k: None)
+            now = int(time.time() * 1000)
+            tag = f"${start:,.0f}/{mode}"
+
+            if mode == "fixed_amount":
+                t_sz = 2.0  # our notional is fixed_amount_usd regardless of target size
+            else:
+                # aim our phase-1 notional at 30% of the account (1x margin)
+                t_sz = (start * 0.3) / (s.copy_ratio * PX)
+
+            def fill(dir_, side, sz, start_pos=None):
+                tid[0] += 1
+                return make_fill("BTC", dir_, side, round(sz, 8), PX, tid[0], now + tid[0],
+                                 start_position=start_pos)
+
+            await cbs["on_order_fill"](fill("Open Long", "B", t_sz))
+            _assert_sane(s, tag + " open")
+            await cbs["on_order_fill"](fill("Open Long", "B", t_sz * 0.5))
+            _assert_sane(s, tag + " add")
+            await cbs["on_order_fill"](fill("Close Long", "A", t_sz * 0.9, start_pos=t_sz * 1.5))
+            _assert_sane(s, tag + " partial close")
+            await cbs["on_order_fill"](fill("Close Long", "A", t_sz * 0.6, start_pos=t_sz * 0.6))
+            _assert_sane(s, tag + " full close")
+
+            check(f"{tag}: no position left open", "BTC" not in s.simulated_positions,
+                  f"positions={list(s.simulated_positions)}")
+            # Money conservation: whatever subset of fills actually executed
+            # (skips are legitimate for small accounts), the books must balance.
+            expected = start - s.total_fees_paid + s.simulated_pnl
+            tol = max(1e-6, start * 1e-9)
+            check(f"{tag}: money conserved (end == start - fees + pnl)",
+                  abs(s.simulated_balance - expected) < tol,
+                  f"end={s.simulated_balance!r} expected={expected!r} "
+                  f"(fees={s.total_fees_paid}, pnl={s.simulated_pnl}, "
+                  f"trades={s.trades_copied_count}, skips={dict(s.skip_counts)})")
+            if start >= 250.0:
+                check(f"{tag}: account actually traded", s.trades_copied_count > 0,
+                      f"skips={dict(s.skip_counts)}")
+            del sim._sessions[s.address]
+
+
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--wallets", type=int, default=14)
@@ -540,6 +730,10 @@ async def main():
     await scenario_proportional_self_heals_after_failed_boot()
     await scenario_position_drift()
     await scenario_dust_accumulator()
+    await scenario_dust_buffer_survives_partial_close()
+    await scenario_spot_alias_reconciliation()
+    await scenario_downsize_on_unaffordable()
+    await scenario_amount_sweep()
     await scenario_hft_round_trips()
     await scenario_dedup_timestamp_fallback()
     await scenario_fifo_ordering()

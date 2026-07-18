@@ -99,8 +99,6 @@ header{
 .pulse-dot::after{content:'';position:absolute;inset:2px;border-radius:50%;background:var(--green)}
 .pulse-dot::before{content:'';position:absolute;inset:0;border-radius:50%;background:var(--green);animation:ring 2.4s ease infinite}
 @keyframes ring{0%,100%{transform:scale(1);opacity:.5}60%{transform:scale(2.6);opacity:0}}
-.pulse-dot.paused::before{animation:none;background:var(--warn)}
-.pulse-dot.paused::after{background:var(--warn)}
 #live-txt{font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--t2)}
 
 .pill{padding:2px 9px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;flex-shrink:0}
@@ -165,7 +163,6 @@ header{
 .wc-header{display:flex;align-items:center;gap:6px;margin-bottom:4px}
 .wc-rank{font-size:9px;font-weight:700;color:var(--t3);font-family:var(--mono);width:14px;flex-shrink:0}
 .wc-dot{width:6px;height:6px;border-radius:50%;background:var(--green);flex-shrink:0}
-.wc-dot.paused{background:var(--warn)}
 .wc-name{font-weight:600;font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .wc-actions{display:flex;gap:5px;opacity:.75;transition:opacity var(--dur-fast) var(--ease);flex-shrink:0}
 .wcard:hover .wc-actions{opacity:1}

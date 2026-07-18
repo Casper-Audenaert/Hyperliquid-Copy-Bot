@@ -5,6 +5,7 @@ All simulation logic is in web/sim.py; DB in web/db.py; stats in web/stats.py.
 """
 import csv
 import io
+import math
 import os
 import sqlite3
 import sys
@@ -253,6 +254,13 @@ def api_add_wallet():
         start_balance = float(data.get("start_balance") or settings.simulated_account_balance)
     except (TypeError, ValueError):
         start_balance = settings.simulated_account_balance
+    # Trust boundary: a negative balance flips every position's sign, 0 zeroes
+    # every ratio, and NaN/Infinity (which float() happily parses from JSON
+    # strings) poisons every downstream equity/ratio computation. 1e12 is an
+    # arbitrary-but-generous ceiling that keeps float math well away from
+    # precision loss.
+    if not math.isfinite(start_balance) or not (0 < start_balance <= 1e12):
+        return jsonify({"error": "start_balance must be a positive finite number (max 1e12)"}), 400
 
     ratio_mode = (data.get("ratio_mode") or "proportional").strip().lower()
     if ratio_mode not in ("fixed", "proportional", "fixed_amount"):
@@ -263,8 +271,11 @@ def api_add_wallet():
             fixed_amount_usd = float(data.get("fixed_amount_usd"))
         except (TypeError, ValueError):
             fixed_amount_usd = None
-        if not fixed_amount_usd or fixed_amount_usd <= 0:
-            return jsonify({"error": "fixed_amount_usd must be a positive number for Fixed Amount mode"}), 400
+        # NaN fails every comparison (so `<= 0` can't catch it) and +inf passes
+        # `> 0` — both must be rejected explicitly, same reasoning as above.
+        if not fixed_amount_usd or not math.isfinite(fixed_amount_usd) \
+                or not (0 < fixed_amount_usd <= 1e12):
+            return jsonify({"error": "fixed_amount_usd must be a positive finite number for Fixed Amount mode"}), 400
 
     if not address:
         return jsonify({"error": "address required"}), 400
@@ -329,26 +340,6 @@ def api_clear():
     return jsonify({"ok": True})
 
 
-@app.route("/api/pause/<wallet>", methods=["POST"])
-def api_pause(wallet):
-    s = _sessions.get(wallet.lower())
-    if not s:
-        return jsonify({"error": "not found"}), 404
-    s.is_paused = True
-    _safe_emit("state_update", _session_to_dict(s))
-    return jsonify({"ok": True})
-
-
-@app.route("/api/resume/<wallet>", methods=["POST"])
-def api_resume(wallet):
-    s = _sessions.get(wallet.lower())
-    if not s:
-        return jsonify({"error": "not found"}), 404
-    s.is_paused = False
-    _safe_emit("state_update", _session_to_dict(s))
-    return jsonify({"ok": True})
-
-
 # ── Telegram alerting ─────────────────────────────────────────────────────────
 
 def _send_telegram(msg: str):
@@ -385,7 +376,6 @@ def api_health():
         fq = getattr(s.monitor, "_fill_queue", None) if s.monitor else None
         wallets[addr] = {
             "label":            s.label,
-            "is_paused":        s.is_paused,
             "uptime_h":         round(uptime, 2),
             "trades_copied":    s.trades_copied_count,
             "ws_connected":     ws_ok,

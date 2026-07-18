@@ -625,7 +625,7 @@ function renderSidebar() {
   <div class="wcard-inner">
     <div class="wc-header">
       <span class="wc-rank">#${rank+1}</span>
-      <div class="wc-dot${s.is_paused?' paused':''}" style="background:${s.is_paused?'var(--warn)':clr(addr)}"></div>
+      <div class="wc-dot" style="background:${clr(addr)}"></div>
       <span class="wc-name" title="${addr}">${s.label}</span>
       ${_walletStatusBadgesHtml(addr, s)}
       <div class="wc-actions">
@@ -661,7 +661,7 @@ function renderMobileBar(sortedAddrs, cur) {
     const sel = !compareMode && cur === addr;
     const ret = s.return_pct || 0;
     return `<button class="mtab${sel?' on':''}" onclick="selectWallet('${addr}')" title="${s.label}">
-      <span class="mtab-dot" style="background:${s.is_paused?'var(--warn)':clr(addr)}"></span>
+      <span class="mtab-dot" style="background:${clr(addr)}"></span>
       <span class="mtab-init">${initials}</span>
       <span class="mtab-ret ${ret>0?'pos':ret<0?'neg':'z'}">${fPct(ret)}</span>
     </button>`;
@@ -822,14 +822,6 @@ function renderKpis() {
   const maxDd = dds.length ? Math.min(...dds) : null;
   setKpi('dd', maxDd!=null ? maxDd.toFixed(1)+'%' : '—', '', maxDd!=null ? -Math.abs(maxDd) : null);
 
-  // Header: in compare mode, individual wallet cards already show each wallet's
-  // paused state via an orange dot — don't hoist that into the global banner,
-  // which would show "PAUSED" just because one of 21 wallets hit a circuit
-  // breaker, making it look like the entire system is stopped.
-  const paused = !compareMode && sess.some(s=>s.is_paused);
-  document.getElementById('pdot').className       = 'pulse-dot'+(paused?' paused':'');
-  document.getElementById('live-txt').textContent = paused ? 'PAUSED' : 'LIVE';
-
   const uptime = Math.max(0, ...sess.map(s => s.uptime_h || 0));
   // Auto-advance default range so users see full history after extended runs
   if (rangeHours === 24 && uptime > 168) {       // > 7 days running → show ALL
@@ -958,6 +950,7 @@ const _SKIP_REASON_META = {
   external_market:{ label: 'External market',  tip: 'External-builder market (pre-IPO/tokenized), not a perp fill' },
   other:          { label: 'Other',            tip: 'Target closed/reduced a symbol we never tracked (pre-dates this session)' },
   ratio_unvalidated: { label: 'Ratio not ready', tip: "Target account state hasn't loaded yet this session (likely rate-limited) — skipped rather than open at an unproven size; the next fill copies normally once it loads" },
+  downsized:      { label: 'Downsized',        tip: 'Full copy size exceeded free margin — opened at the largest affordable size instead of skipping (partial copy)' },
 };
 
 function renderGhostTab() {
