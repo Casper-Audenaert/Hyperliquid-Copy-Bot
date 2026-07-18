@@ -768,12 +768,11 @@ def _mark_skip(session: "WalletSession", fill_id, category: str, count: bool = T
 async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_fn: Callable) -> None:
     """Process a confirmed fill: size, fee, slippage, guards, position update, DB, emit."""
     symbol      = fill_data.get("coin", "")
-    if ":" in symbol:
-        # Skip external-builder markets (pre-IPO stocks, tokenised assets, etc.)
-        # Coin names like "XYZ:SNDK" are routed via HL external builders, not perp fills.
-        logger.debug(f"[{session.label}] External-market fill skipped ({symbol})")
-        _mark_skip(session, fill_id, "external_market", emit_fn=emit_fn, symbol=symbol)
-        return
+    # Builder-dex markets ("xyz:SNDK" etc.) are copied like any other perp —
+    # HL delivers the same canonical coin string in fills, clearinghouseState,
+    # allMids, and funding across every dex, so no special-casing is needed.
+    # (An "external_market" skip lived here until 2026-07-18; removed on user
+    # request — ALL trade activity of a target is copied.)
     # Canonicalize: the monitor resolves '@N' → base-asset name at ingestion,
     # but only when its cache is warm — re-try here (cache may have warmed since)
     # and fold any stray keys the cold-cache window created for this market.
@@ -2097,8 +2096,9 @@ def evaluate_startup_position(
         if policy.startup_mode != "always_seed":
             return "GHOST_ONLY", 0.0, "drawdown_guard"
 
-    # 10. Soft checks
-    soft_flag = (
+    # 10. Soft checks — bypassed under always_seed like guards 2-9: faithful
+    # "copy open trades" means full size, not a halved hedge.
+    soft_flag = policy.startup_mode != "always_seed" and (
         drift > policy.max_seed_drift_pct * 0.66
         or pos.leverage > max(2, policy.max_seed_leverage * 0.75)
     )
@@ -2305,6 +2305,9 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
                 if pos.symbol in session.simulated_positions or pos.symbol in session.ghost_positions:
                     continue
 
+                # Builder-dex positions ("xyz:...") seed like any other — their
+                # live fills are copied too (external_market skip removed).
+
                 # Require a real mid price — never fall back to pos.entry_price.
                 # Seeding at a historical entry price would inherit the target's
                 # unrealized P&L and make equity jump to an unearned value at startup.
@@ -2368,6 +2371,40 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
                 )
                 pos_value = seed_size * mark_px
                 margin    = pos_value / max(your_lev, 1)
+
+                # Affordability (same policy as the live fill path): the seed
+                # loop deducts margin+fee below with nothing else stopping it —
+                # under always_seed with a whale-sized book this could drive the
+                # balance negative. Downsize to the largest affordable seed
+                # (margin + taker fee both fit in remaining free cash); if even
+                # that is under HL's $10 minimum, ghost with an honest reason.
+                _lev = max(your_lev, 1)
+                if margin + pos_value * settings.taker_fee_rate > session.simulated_balance:
+                    _notional_max = (session.simulated_balance * 0.995
+                                     / (1.0 / _lev + settings.taker_fee_rate))
+                    if _notional_max < DUST_GUARD:
+                        ghost = {
+                            "side":               "LONG" if pos.size > 0 else "SHORT",
+                            "target_size":        abs(pos.size),
+                            "target_entry_price": pos.entry_price or mark_px,
+                            "target_leverage":    pos.leverage,
+                            "reason_skipped":     "affordability",
+                            "detected_at":        datetime.utcnow().isoformat(timespec='milliseconds'),
+                            "last_seen_at":       datetime.utcnow().isoformat(timespec='milliseconds'),
+                        }
+                        session.ghost_positions[pos.symbol] = ghost
+                        await asyncio.to_thread(db_upsert_ghost, session.address, pos.symbol, ghost)
+                        counts["GHOST_ONLY"] += 1
+                        ghost_reasons["affordability"] = ghost_reasons.get("affordability", 0) + 1
+                        continue
+                    seed_size = _notional_max / mark_px
+                    pos_value = seed_size * mark_px
+                    margin    = pos_value / _lev
+                    session.skip_counts["downsized"] = session.skip_counts.get("downsized", 0) + 1
+                    session._skip_counts_dirty = True
+                    logger.info(f"[{session.label}] Seed {pos.symbol} downsized to fit free margin "
+                                f"(${pos_value:,.0f} notional at {your_lev}x)")
+
                 is_long   = pos.size > 0
                 seed_fee  = pos_value * settings.taker_fee_rate
 
@@ -2436,6 +2473,17 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
                 f"GHOST={counts['GHOST_ONLY']} reasons={ghost_reasons}"
             )
 
+    if not (state and state.balance > 0):
+        # Every retry failed (boot-burst rate limiting) — without recovery this
+        # wallet would spend the WHOLE session with an unvalidated ratio and,
+        # under always_seed, an unseeded book (seeding only runs at boot or
+        # reinit). Observed live: 5 of 14 wallets bookless after one bad boot.
+        logger.warning(
+            f"[{session.label}] Initial state fetch failed every retry — "
+            f"scheduling late-boot recovery (ratio + book seed)"
+        )
+        asyncio.create_task(_late_boot_recovery(session, emit_fn))
+
     # Pull historical fills for the feed
     session.recent_fills = await _fetch_target_fills(session)
     logger.info(f"[{session.label}] Loaded {len(session.recent_fills)} historical fills")
@@ -2468,6 +2516,26 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
     emit_fn("state_update", _session_to_dict(session))
     logger.info(f"[{session.label}] Starting WebSocket monitoring…")
     await session.monitor.start_monitoring()
+
+
+async def _late_boot_recovery(session: WalletSession, emit_fn: Callable):
+    """Self-heal for a wallet whose start_session state fetch failed every
+    retry: poll until the monitor's ~2min periodic refresh proves the target
+    is reachable again, then run a full reinit (fetch + ratio validation +
+    book seed) — the same path the manual Reset button uses. Exits once the
+    wallet validates by any path (incl. proportional's per-fill heal) or is
+    removed. Without this, an always_seed wallet stays bookless all session
+    after one rate-limited boot."""
+    while session.address in _sessions and not session._ratio_validated:
+        await asyncio.sleep(90 + random.uniform(0, 30))
+        if session._ratio_validated or session.address not in _sessions:
+            break
+        st = session.monitor.current_state if session.monitor else None
+        if st and st.balance > 0:
+            logger.info(f"[{session.label}] Late boot recovery: target reachable again — validating ratio and seeding book")
+            await _reinit_session(session, emit_fn)
+            # loop re-checks _ratio_validated: if the reinit's own fetch
+            # failed again, keep polling.
 
 
 async def _reinit_session(session: WalletSession, emit_fn: Callable):
@@ -2551,6 +2619,7 @@ async def _reinit_session_body(session: WalletSession, emit_fn: Callable):
             ghost_reasons: dict = {}
 
             for pos in state.positions:
+                # Builder-dex positions seed like any other (see start_session).
                 mark_px_raw = all_mids.get(pos.symbol)
                 if not mark_px_raw or float(mark_px_raw) <= 0:
                     ghost = {
@@ -2602,6 +2671,37 @@ async def _reinit_session_body(session: WalletSession, emit_fn: Callable):
                 )
                 pos_value = seed_size * mark_px
                 margin    = pos_value / max(your_lev, 1)
+
+                # Affordability: same downsize-or-ghost policy as start_session's
+                # seed loop (see comment there) — the unconditional deduction
+                # below must never drive the balance negative.
+                _lev = max(your_lev, 1)
+                if margin + pos_value * settings.taker_fee_rate > session.simulated_balance:
+                    _notional_max = (session.simulated_balance * 0.995
+                                     / (1.0 / _lev + settings.taker_fee_rate))
+                    if _notional_max < DUST_GUARD:
+                        ghost = {
+                            "side":               "LONG" if pos.size > 0 else "SHORT",
+                            "target_size":        abs(pos.size),
+                            "target_entry_price": pos.entry_price or mark_px,
+                            "target_leverage":    pos.leverage,
+                            "reason_skipped":     "affordability",
+                            "detected_at":        datetime.utcnow().isoformat(timespec='milliseconds'),
+                            "last_seen_at":       datetime.utcnow().isoformat(timespec='milliseconds'),
+                        }
+                        session.ghost_positions[pos.symbol] = ghost
+                        await asyncio.to_thread(db_upsert_ghost, session.address, pos.symbol, ghost)
+                        counts["GHOST_ONLY"] += 1
+                        ghost_reasons["affordability"] = ghost_reasons.get("affordability", 0) + 1
+                        continue
+                    seed_size = _notional_max / mark_px
+                    pos_value = seed_size * mark_px
+                    margin    = pos_value / _lev
+                    session.skip_counts["downsized"] = session.skip_counts.get("downsized", 0) + 1
+                    session._skip_counts_dirty = True
+                    logger.info(f"[{session.label}] Seed {pos.symbol} downsized to fit free margin "
+                                f"(${pos_value:,.0f} notional at {your_lev}x)")
+
                 is_long   = pos.size > 0
                 seed_fee  = pos_value * settings.taker_fee_rate
 

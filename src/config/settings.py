@@ -50,14 +50,18 @@ class SimAccuracyConfig(BaseModel):
     maker_close_rate: float = 0.0      # fraction of close fills charged at maker fee rate
 
 class StartupSeedingPolicy(BaseModel):
-    # always_skip = "new trades only", matching how Bybit/Binance/OKX copy trading
-    # works: a target's pre-existing positions are never seeded — they become
-    # ghosts, and each symbol unblocks for copying once the target closes it.
-    # (eToro-style "copy open trades" = always_seed + startup_seed_size_multiplier 1.0)
-    startup_mode: str = "always_skip"             # "smart_safe" | "always_seed" | "always_skip"
-    max_seed_drift_pct: float = 0.015             # 1.5% max entry drift before ghosting
-    max_seed_leverage: int = 4                    # cap leverage at seed time
-    startup_seed_size_multiplier: float = 0.35    # scale down seed size vs live copy size
+    # always_seed + multiplier 1.0 = eToro-style "copy open trades": every
+    # position the target already holds is seeded at CURRENT mark price
+    # ("copy from now", uPnL starts ~0) at full ratio-scaled size with the
+    # target's leverage mirrored (per-asset caps still apply via
+    # PositionSizer). Chosen 2026-07-18 after the previous "new trades only"
+    # default (always_skip, the Bybit/OKX model) combined with
+    # wipe-on-restart left ~$860M of target book permanently ghosted and the
+    # account near-empty after every boot.
+    startup_mode: str = "always_seed"             # "smart_safe" | "always_seed" | "always_skip"
+    max_seed_drift_pct: float = 0.015             # 1.5% max entry drift before ghosting (smart_safe only)
+    max_seed_leverage: int = 50                   # mirror the target's leverage (per-asset caps still apply)
+    startup_seed_size_multiplier: float = 1.0     # full copy size (eToro "copy open trades")
     max_seed_position_notional_pct: float = 0.03  # 3% per-position exposure limit
     max_total_copied_exposure_pct: float = 0.25   # 25% total portfolio exposure limit
     max_symbol_exposure_pct: float = 0.10         # 10% per-symbol exposure limit

@@ -613,6 +613,29 @@ def _assert_sane(s, tag):
           f"balance={s.simulated_balance}")
 
 
+async def scenario_builder_dex_fills_copied():
+    """Builder-dex markets ('xyz:SNDK' etc.) must copy like any perp — the old
+    external_market skip was removed 2026-07-18 on user request ('copy ALL
+    trade activity'). HL uses one canonical coin string across fills, state,
+    mids, and funding, so no special-casing is needed."""
+    print("\n== scenario: builder-dex (xyz:) fills are copied like any perp ==")
+    sim._mids_cache.clear()
+    sim._mids_cache.update({"xyz:NVDA": 200.0})
+    s = make_session("0x_xyz", "Xyz", 10_000.0)
+    cbs = sim.make_callbacks(s, lambda *a, **k: None)
+    now = int(time.time() * 1000)
+    await cbs["on_order_fill"](make_fill("xyz:NVDA", "Open Long", "B", 50.0, 200.0, 9400, now))
+    check("xyz: open produced a position", "xyz:NVDA" in s.simulated_positions)
+    await cbs["on_order_fill"](make_fill("xyz:NVDA", "Close Long", "A", 50.0, 202.0, 9401, now + 10,
+                                          start_position=50.0))
+    check("xyz: close removed the position and realized pnl",
+          "xyz:NVDA" not in s.simulated_positions and s.simulated_pnl > 0,
+          f"pnl={s.simulated_pnl}")
+    check("no external_market skip recorded", s.skip_counts.get("external_market", 0) == 0,
+          f"skip_counts={dict(s.skip_counts)}")
+    del sim._sessions[s.address]
+
+
 async def scenario_sync_counts_pending_dust():
     """Sync% must count the same-side pending dust buffer as ours: at tiny
     copy ratios a position is born from its first ~$10 flush while the rest of
@@ -772,6 +795,7 @@ async def main():
     await scenario_dust_accumulator()
     await scenario_dust_buffer_survives_partial_close()
     await scenario_spot_alias_reconciliation()
+    await scenario_builder_dex_fills_copied()
     await scenario_sync_counts_pending_dust()
     await scenario_downsize_on_unaffordable()
     await scenario_amount_sweep()
