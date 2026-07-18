@@ -613,6 +613,46 @@ def _assert_sane(s, tag):
           f"balance={s.simulated_balance}")
 
 
+async def scenario_sync_counts_pending_dust():
+    """Sync% must count the same-side pending dust buffer as ours: at tiny
+    copy ratios a position is born from its first ~$10 flush while the rest of
+    the copied intent is still accumulating sub-$10 in pending_dust — reading
+    only the flushed position (observed live: 0.8-1.5%) tells the user the
+    mirror is broken when it's actually tracking faithfully."""
+    print("\n== scenario: sync%% counts position + pending dust, not position alone ==")
+    from types import SimpleNamespace
+    sim._mids_cache.clear()
+    sim._mids_cache.update({"ZEC": 500.0})
+    s = make_session("0x_syncdust", "SyncDust", 10_000.0)
+    s.copy_ratio = 0.001
+    # Target holds 1000 ZEC → expected ours = 1.0 ZEC. We flushed 0.02 into a
+    # real position; 0.98 is still accumulating in the dust buffer.
+    s.monitor.current_state = SimpleNamespace(
+        balance=10_000_000.0,
+        positions=[SimpleNamespace(symbol="ZEC", size=-1000.0, current_price=500.0,
+                                   leverage=1, entry_price=500.0)],
+    )
+    s.simulated_positions["ZEC"] = {
+        "size": -0.02, "entry_price": 500.0, "leverage": 1, "side": "short",
+        "value": 10.0, "margin_used": 10.0, "copy_ratio": 0.001,
+    }
+    s.pending_dust["ZEC"] = {"size": 0.98, "px_volume": 490.0, "side": "short",
+                             "first_ts": time.time(), "fill_count": 49}
+    d = sim._session_to_dict(s)
+    zec = next(p for p in d["positions"] if p["symbol"] == "ZEC")
+    check("sync counts position + same-side dust buffer (~100%)",
+          zec["sync_pct"] is not None and zec["sync_pct"] > 95.0,
+          f"sync_pct={zec['sync_pct']} (position-only would read ~2%)")
+    check("not flagged desynced while buffer is tracking", zec["desynced"] is False)
+    # Opposite-side buffer must NOT inflate sync.
+    s.pending_dust["ZEC"]["side"] = "long"
+    d2 = sim._session_to_dict(s)
+    zec2 = next(p for p in d2["positions"] if p["symbol"] == "ZEC")
+    check("opposite-side buffer is ignored (sync ~2%)", zec2["sync_pct"] is not None
+          and zec2["sync_pct"] < 5.0, f"sync_pct={zec2['sync_pct']}")
+    del sim._sessions[s.address]
+
+
 async def scenario_downsize_on_unaffordable():
     """Industry 'partial copy': an open whose full copy size exceeds free
     margin is DOWNSIZED to the largest affordable size (margin + fee both fit
@@ -732,6 +772,7 @@ async def main():
     await scenario_dust_accumulator()
     await scenario_dust_buffer_survives_partial_close()
     await scenario_spot_alias_reconciliation()
+    await scenario_sync_counts_pending_dust()
     await scenario_downsize_on_unaffordable()
     await scenario_amount_sweep()
     await scenario_hft_round_trips()
