@@ -26,7 +26,7 @@ from loguru import logger
 from config.settings import settings
 from hyperliquid.client import HyperliquidClient, get_startup_sem
 from hyperliquid.models import PositionSide
-from copy_engine.monitor import WalletMonitor
+from copy_engine.monitor import WalletMonitor, resolve_spot_symbol_display
 from copy_engine.position_sizer import PositionSizer
 from web.db import (
     db_record_fill, db_record_close, db_snapshot_equity, db_update_latest_funding,
@@ -369,7 +369,7 @@ def _session_to_dict(s: WalletSession, price_override: dict | None = None) -> di
         desynced = sync_pct is not None and sync_pct < 90.0
 
         positions.append({
-            "symbol": sym, "side": pos.get("side", "LONG"),
+            "symbol": resolve_spot_symbol_display(sym), "side": pos.get("side", "LONG"),
             "size": size, "entry_price": entry, "current_price": current_price,
             "leverage": pos.get("leverage", 1), "value": val,
             "margin_used": margin, "upnl": round(upnl, 4), "pnl_pct": round(pnl_pct, 2),

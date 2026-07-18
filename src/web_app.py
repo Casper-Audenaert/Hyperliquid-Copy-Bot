@@ -29,7 +29,7 @@ from web.db import (
     db_get_equity_history, db_get_trades,
 )
 from web.sim import _sessions, _create_session, start_session, _reinit_session, _session_to_dict
-from copy_engine.monitor import MAX_WALLETS
+from copy_engine.monitor import MAX_WALLETS, resolve_spot_symbol_display
 from web.stats import compute_stats
 
 setup_logger(settings.log_file, settings.log_level)
@@ -220,7 +220,13 @@ def api_history(wallet):
 def api_trades(wallet):
     from_dt = request.args.get("from")  # optional YYYY-MM-DD
     to_dt   = request.args.get("to")
-    return jsonify(db_get_trades(wallet.lower(), from_date=from_dt, to_date=to_dt))
+    rows = db_get_trades(wallet.lower(), from_date=from_dt, to_date=to_dt)
+    # Trades recorded before spot-symbol resolution existed have the raw "@N"
+    # baked into the DB row — resolve for display only, same best-effort cache
+    # lookup as _session_to_dict uses for open positions; never touches the DB.
+    for r in rows:
+        r["symbol"] = resolve_spot_symbol_display(r["symbol"])
+    return jsonify(rows)
 
 
 @app.route("/api/stats/<wallet>")

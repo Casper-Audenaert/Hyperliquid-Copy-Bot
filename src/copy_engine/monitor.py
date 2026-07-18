@@ -84,6 +84,20 @@ async def _resolve_spot_symbol(client: HyperliquidClient, coin: str) -> str:
     return (_spot_symbol_map or {}).get(coin, coin)
 
 
+def resolve_spot_symbol_display(coin: str) -> str:
+    """Sync, no-fetch counterpart to _resolve_spot_symbol — a best-effort cache
+    lookup only, for display contexts that can't await a fetch (e.g. serializing
+    a position that was restored from the DB with its original raw "@N" coin,
+    which predates this cache and will never see a fresh fill to trigger the
+    async resolver). Returns the raw "@N" untouched if the cache isn't populated
+    yet or doesn't have this index — never wrong, just occasionally unresolved,
+    same fallback contract as the async version. Does NOT touch the value used
+    as the actual position dict key, only what's shown to the caller."""
+    if not coin.startswith("@"):
+        return coin
+    return (_spot_symbol_map or {}).get(coin, coin)
+
+
 def _wallets_on(ws: HyperliquidWebSocket) -> int:
     """Count distinct wallets assigned to this connection: those with a
     registered 'user:' callback PLUS those reserved at acquire time but not
