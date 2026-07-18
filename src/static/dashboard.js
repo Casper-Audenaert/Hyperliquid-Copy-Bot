@@ -933,6 +933,7 @@ const _SKIP_REASON_META = {
   blocked:        { label: 'Blocked asset',    tip: 'Symbol is on the blocked-assets list' },
   external_market:{ label: 'External market',  tip: 'External-builder market (pre-IPO/tokenized), not a perp fill' },
   other:          { label: 'Other',            tip: 'Target closed/reduced a symbol we never tracked (pre-dates this session)' },
+  ratio_unvalidated: { label: 'Ratio not ready', tip: "Target account state hasn't loaded yet this session (likely rate-limited) — skipped rather than open at an unproven size; the next fill copies normally once it loads" },
 };
 
 function renderGhostTab() {

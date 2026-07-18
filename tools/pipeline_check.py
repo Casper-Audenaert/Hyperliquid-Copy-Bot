@@ -76,6 +76,7 @@ def make_session(address: str, label: str, start_balance: float = 10_000.0) -> "
     )
     session._state_lock = asyncio.Lock()
     session.copy_ratio = 0.01  # 1% — matches a $10k sim vs a $1M target, e.g.
+    session._ratio_validated = True  # simulates a session whose initial state fetch succeeded
     sim._sessions[address] = session
     return session
 
@@ -248,6 +249,38 @@ async def scenario_skip_counts():
     await cbs["on_order_fill"](make_fill("BTC", "Open Long", "B", 1.0, 100_000.0, 603, now + 200))
     check("large price deviation increments skip_counts.deviation", s.skip_counts["deviation"] == 1,
           f"{s.skip_counts}")
+
+    del sim._sessions[s.address]
+
+
+async def scenario_ratio_validation_guard():
+    print("\n== scenario: a brand-new position never opens at an unvalidated ratio ==")
+    # Reproduces a bug found live: under sustained rate-limiting, start_session's
+    # initial target-state fetch can fail every retry while the WS fill stream
+    # (unaffected by REST throttling) keeps delivering live fills. A brand-new
+    # symbol arriving in that window used to open at copy_ratio's untouched
+    # default (1.0) instead of the real ratio — silently sizing the copy ~100x
+    # too large relative to a $10k-vs-target-account setup.
+    sim._mids_cache.clear()
+    sim._mids_cache.update({"BTC": 50_000.0})
+    s = make_session("0x_ratio_guard", "RatioGuard", 10_000.0)
+    s._ratio_validated = False  # simulates every retry of the initial state fetch failing
+    cbs = sim.make_callbacks(s, lambda *a, **k: None)
+    now = int(time.time() * 1000)
+
+    await cbs["on_order_fill"](make_fill("BTC", "Open Long", "B", 1.0, 50_000.0, 701, now))
+    check("unvalidated ratio: brand-new position does NOT open",
+          "BTC" not in s.simulated_positions)
+    check("unvalidated ratio: skip is categorized ratio_unvalidated",
+          s.skip_counts["ratio_unvalidated"] == 1, f"{s.skip_counts}")
+
+    # Once the ratio is validated (a later fetch succeeds), the next fill for
+    # the same symbol must copy normally — this is a transient skip, not a
+    # standing ghost.
+    s._ratio_validated = True
+    await cbs["on_order_fill"](make_fill("BTC", "Open Long", "B", 1.0, 50_000.0, 702, now + 100))
+    check("validated ratio: the next fill for the same symbol opens normally",
+          "BTC" in s.simulated_positions, f"{s.simulated_positions}")
 
     del sim._sessions[s.address]
 
@@ -461,6 +494,7 @@ async def main():
     await scenario_dedup_idempotence()
     await scenario_snapshot_lock_deferred()
     await scenario_skip_counts()
+    await scenario_ratio_validation_guard()
     await scenario_position_drift()
     await scenario_dust_accumulator()
     await scenario_hft_round_trips()
