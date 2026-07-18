@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>HL Sim Desk</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%237C6CFF'/></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
@@ -269,6 +270,7 @@ header{
 .kpi-sub.g{color:var(--green)}.kpi-sub.r{color:var(--red)}
 .kpi-tier-hero .kpi{padding:var(--sp-lg) var(--sp-lg) var(--sp-md)}
 .kpi-tier-hero .kpi-val{font-size:26px;letter-spacing:-.7px}
+.kpi-tier-hero .kpi-val.long{font-size:20px}  /* 6-7 figure compare-mode sums must not clip */
 .kpi-tier-sub .kpi{padding:var(--sp-sm) var(--sp-lg)}
 .kpi-tier-sub .kpi-lbl{margin-bottom:3px}
 .kpi-tier-sub .kpi-val{font-size:15px;letter-spacing:-.3px}
@@ -896,7 +898,7 @@ header{
         </div>
         <div class="phdr">
           <span class="ptitle" id="stats-title">Tearsheet</span>
-          <span class="badge" id="stats-badge">All time</span>
+          <span class="badge" id="stats-badge" title="Totals are lifetime; per-trade breakdowns cover the last 180 days, equity-based stats the last 90 days">Lifetime · 180d detail</span>
         </div>
         <div id="cmp-tabs">
           <button class="cmp-tab" data-tab="leaderboard" onclick="setCmpTab('leaderboard')">Leaderboard</button>

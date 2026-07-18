@@ -30,7 +30,9 @@ let activeWallet = null;
 function curWallet() {
   if (activeWallet) return activeWallet;
   const addrs = Object.keys(state);
-  return [...addrs].sort((a, b) => (state[b]?.return_pct || 0) - (state[a]?.return_pct || 0))[0] || null;
+  return [...addrs].sort((a, b) =>
+    (state[b]?.return_pct ?? 0) - (state[a]?.return_pct ?? 0) ||
+    (state[b]?.equity ?? 0) - (state[a]?.equity ?? 0))[0] || null;
 }
 let compareMode  = false;
 let rangeHours   = 24;
@@ -143,6 +145,10 @@ const fNum  = n => n == null ? '—' : Number(n).toLocaleString(undefined,{minim
 const fPct  = (n,plus=true) => n == null ? '—' : (plus&&n>=0?'+':'') + Number(n).toFixed(2) + '%';
 const fPx   = n => !n ? '—' : n>=1000 ? n.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}) : n>=1 ? n.toFixed(4) : n.toFixed(6);
 const fTime = iso => { try { const d=new Date(iso.endsWith('Z')?iso:iso+'Z'); return `${d.toLocaleDateString([],{month:'short',day:'numeric'})}, ${d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}`; } catch { return iso?.slice(0,19).replace('T',' ')||''; }};
+// Backend history/equity_tick timestamps are naive UTC ISO strings (no 'Z') — parsed as
+// local time by a bare new Date(iso), which silently shifts every chart point by the
+// browser's UTC offset. Normalize the same way fTime does before converting to ms.
+const tsMs = iso => new Date(iso.endsWith('Z') ? iso : iso + 'Z').getTime();
 
 // ── Sparkline ──────────────────────────────────────────────────────────────
 function sparklineSvg(addr) {
@@ -401,7 +407,7 @@ function _rebuildChartImpl() {
     const sb  = s.start_balance || 1;
     const hist = filteredHistory(addr);
     const data = hist.map(p => ({
-      x: new Date(p.t).getTime(),
+      x: tsMs(p.t),
       y: usePctView() ? ((p.equity / sb) - 1) * 100 : usePnlView() ? (p.equity - sb) : p.equity,
       upnl: p.upnl,
     }));
@@ -435,7 +441,7 @@ function _rebuildChartImpl() {
       label: 'Combined', borderColor: '#ffffff', borderWidth: 2,
       borderDash: [5, 3], backgroundColor: 'transparent',
       pointRadius: 0, pointHoverRadius: 4, tension: 0.35, fill: false,
-      data: combined.map(p => ({ x: new Date(p.t).getTime(), y: ((p.equity / sb) - 1) * 100 })),
+      data: combined.map(p => ({ x: tsMs(p.t), y: ((p.equity / sb) - 1) * 100 })),
     });
   }
 
@@ -478,7 +484,7 @@ function addEquityPoint(addr, pt) {
   const sb = state[addr].start_balance || 1;
   const y  = usePctView() ? ((pt.equity / sb) - 1) * 100 : usePnlView() ? (pt.equity - sb) : pt.equity;
   if (ds) {
-    ds.data.push({ x: new Date(pt.t).getTime(), y, upnl: pt.upnl });
+    ds.data.push({ x: tsMs(pt.t), y, upnl: pt.upnl });
     if (ds.data.length > 5000) ds.data.shift();
     // Debounce to one redraw per animation frame (~16 ms).
     // Calling chart.update('none') on every HFT fill (hundreds/sec) locks up
@@ -570,6 +576,17 @@ function setTab(tab) {
   activeTab = tab;
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
   document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('on', c.dataset.tabContent === tab));
+  // The decision panel ships display:none and is only ever un-hidden by
+  // renderDecisionWidget(), which normally runs after the async /api/stats
+  // fetch resolves — render synchronously from cache (or null → the
+  // "Waiting for stats…" placeholder) so the tab is never a blank panel
+  // during the fetch window.
+  if (tab === 'decision' && !compareMode) {
+    // addr may still be null right after page load (no socket data yet) —
+    // render anyway: a null st shows the placeholder instead of a blank panel.
+    const addr = curWallet();
+    safeRender('decision widget', () => renderDecisionWidget(addr ? (statsCache[addr] || null) : null, addr));
+  }
 }
 
 function renderSidebar() {
@@ -766,7 +783,9 @@ function renderKpis() {
   setKpi('b', fUsd(bal),  '', null);
   setKpi('u', fUsd(upnl), fPct(upPct), upnl);
   setKpi('e', fUsd(eq),   `${fUsd(bal)} + ${fUsd(margin)} margin + ${fUsd(upnl)} upnl`, ret);
-  const _fundPart = funding !== 0 ? ` − ${fUsd(Math.abs(funding))} funding` : '';
+  // total_funding_paid is signed: positive = paid (a cost, subtract), negative =
+  // earned (a credit, add) — net = gross − fees − funding, so the prefix must flip.
+  const _fundPart = funding !== 0 ? ` ${funding > 0 ? '−' : '+'} ${fUsd(Math.abs(funding))} funding` : '';
   const _pnlSub = grossPnl !== netPnl ? `${fUsd(grossPnl)} gross − ${fUsd(fees)} fees${_fundPart}` : 'realized net';
   setKpi('p', fUsd(netPnl), _pnlSub, netPnl);
   const wrColor = wr==null ? null : wr>=55 ? 1 : wr>=40 ? 0 : -1;
@@ -837,7 +856,9 @@ function setKpi(id, val, sub, num) {
   if (!vEl) return;
   const prev = vEl.textContent;
   vEl.textContent = val;
-  vEl.className   = 'kpi-val mono'+(num==null?'':num>0?' g':num<0?' r':'');
+  // `long` shrinks the hero font so 6-7 figure values (compare-mode sums) don't
+  // clip against the chip's right edge — see .kpi-tier-hero .kpi-val.long CSS.
+  vEl.className   = 'kpi-val mono'+(num==null?'':num>0?' g':num<0?' r':'')+(String(val).length>10?' long':'');
   if (sEl) { sEl.textContent=sub||''; sEl.className='kpi-sub mono'+(num==null?'':num>0?' g':num<0?' r':''); }
   if (cEl && prev && prev!==val && prev!=='—') {
     const cls = (num!=null&&num<0)?'flash-r':'flash-g';
@@ -883,7 +904,10 @@ function renderPositions() {
     _nextKeys.add(key);
     const isNew   = !_knownPositionKeys.has(key);
     const upnl    = p.upnl ?? 0;
-    const pct     = p.pnl_pct ?? 0;
+    // ROE = uPnL / margin committed (leveraged, matches the column header and HL's
+    // own convention); pnl_pct from the backend is the raw unleveraged price move —
+    // only used as fallback when margin is unknown.
+    const pct     = (p.margin_used > 0) ? ((p.upnl ?? 0) / p.margin_used) * 100 : (p.pnl_pct ?? 0);
     const pnlCls  = upnl>0?'pos':upnl<0?'neg':'z';
     const mark    = p.current_price || p.entry_price;
     const funding = p.funding_paid ?? 0;
@@ -1126,6 +1150,63 @@ function prependSkipRow(sk) {
   _scheduleFeedPagination();
 }
 
+// margin_call / liquidated payloads (see sim.py's _check_and_liquidate and the
+// equity-floor alert in _periodic_liquidation_check) carry no `label`, unlike
+// skip — resolve it from state the same way the chart legend does.
+function _walletLabel(addr) {
+  return state[addr]?.label || (addr ? addr.slice(0,8) : 'Wallet');
+}
+
+// A single position was force-liquidated — same inline-feed-row pattern as
+// prependSkipRow, plus an error toast since this is capital-destroying, not
+// just a skipped copy.
+function prependMarginCallRow(mc) {
+  const tbody = document.getElementById('feed-body');
+  const ph    = document.getElementById('feed-ph');
+  if (ph) ph.remove();
+
+  const tr = document.createElement('tr');
+  tr.className = 'fnew';
+  tr.innerHTML = `
+    <td class="mono dim">${fTime(new Date().toISOString())}</td>
+    <td><span class="sym-b">${mc.symbol||'—'}</span></td>
+    <td><span class="dc" style="color:var(--red)" title="Position force-liquidated at its liquidation price">⚠ Liquidated</span></td>
+    <td class="mono dim">—</td>
+    <td class="mono">$${fPx(mc.liq_price)}</td>
+    <td class="mono dim">—</td>
+    <td><span style="color:var(--red)">${fPnl(mc.pnl)??'—'}</span></td>
+    <td class="mono dim">—</td>
+    <td class="wlbl">${_walletLabel(mc.wallet)}</td>`;
+  tbody.prepend(tr);
+  while (tbody.children.length > 200) tbody.removeChild(tbody.lastChild);
+  _scheduleFeedPagination();
+}
+
+// Whole account hit zero equity — the most severe event this dashboard can
+// show, so it gets its own row (no single symbol/price to report) and a
+// longer-lived toast.
+function prependLiquidatedRow(li) {
+  const tbody = document.getElementById('feed-body');
+  const ph    = document.getElementById('feed-ph');
+  if (ph) ph.remove();
+
+  const tr = document.createElement('tr');
+  tr.className = 'fnew';
+  tr.innerHTML = `
+    <td class="mono dim">${fTime(new Date().toISOString())}</td>
+    <td><span class="sym-b">—</span></td>
+    <td><span class="dc" style="color:var(--red)" title="Account equity hit zero — all positions wiped out">⚠ ACCOUNT LIQUIDATED</span></td>
+    <td class="mono dim">—</td>
+    <td class="mono dim">—</td>
+    <td class="mono dim">—</td>
+    <td class="dim">—</td>
+    <td class="mono">${fUsd(li.equity)}</td>
+    <td class="wlbl">${_walletLabel(li.wallet)}</td>`;
+  tbody.prepend(tr);
+  while (tbody.children.length > 200) tbody.removeChild(tbody.lastChild);
+  _scheduleFeedPagination();
+}
+
 // Debounced wrapper for loadStats()'s compare-panel refresh — the periodic 25s
 // refresh and per-fill refreshes each resolve loadStats() once per wallet
 // independently, so without this an 11-wallet compare view would do 11
@@ -1162,7 +1243,7 @@ async function loadStats(addr) {
     const r  = await fetchT(`/api/stats/${addr}`);
     const st = await r.json();
     statsCache[addr] = st;
-    const isCur = !compareMode && (activeWallet||Object.keys(state)[0]) === addr;
+    const isCur = !compareMode && curWallet() === addr;
     if (isCur) renderStats(st);
     if (compareMode) _scheduleComparePanelRender(); // refresh active tab, not just leaderboard
   } catch(e) {
@@ -1262,7 +1343,7 @@ function _renderStatsImpl(st) {
         <div class="stat-row"><span class="stat-lbl">Avg Trade</span>${sv(fUsd(st.avg_trade), pnlC(st.avg_trade))}</div>
         <div class="stat-row"><span class="stat-lbl">Win Streak</span>${sv(st.longest_win_streak||0,'var(--green)')}</div>
         <div class="stat-row"><span class="stat-lbl">Loss Streak</span>${sv(st.longest_loss_streak||0,'var(--red)')}</div>
-        <div class="stat-row" title="% of trader fills your capital could execute on real HL ($10 min notional). 100% = no skipped trades at your ratio."><span class="stat-lbl">Copy Efficiency</span>${sv((state[activeWallet||Object.keys(state)[0]]?.copy_efficiency_pct??'—')+'%','var(--t2)')}</div>
+        <div class="stat-row" title="% of trader fills your capital could execute on real HL ($10 min notional). 100% = no skipped trades at your ratio."><span class="stat-lbl">Copy Efficiency</span>${sv((state[curWallet()]?.copy_efficiency_pct??'—')+'%','var(--t2)')}</div>
         ${st.trades_per_day_avg!=null?`<div class="stat-row" title="Mean closed trades per trading day"><span class="stat-lbl">Trades / Day</span>${sv(st.trades_per_day_avg,'var(--t2)')}</div>`:''}
         ${st.trades_per_day_cv!=null?`<div class="stat-row" title="Coefficient of variation of daily trade count — lower = more consistent frequency"><span class="stat-lbl">Freq. Stability</span>${sv(st.trades_per_day_cv+'% CV',st.trades_per_day_cv<30?'var(--green)':st.trades_per_day_cv<60?'var(--warn)':'var(--red)')}</div>`:''}
         ${st.best_week?`<div class="stat-row" title="Best calendar week by PnL"><span class="stat-lbl">Best Week</span>${sv(fUsd(st.best_week.pnl)+' ('+st.best_week.week+')','var(--green)')}</div>`:''}
@@ -1287,7 +1368,7 @@ function _renderStatsImpl(st) {
     ${(()=>{
       const cb = st.capital_brackets;
       if (!cb) return '';
-      const userBal = state[activeWallet || Object.keys(state)[0]]?.start_balance || 0;
+      const userBal = state[curWallet()]?.start_balance || 0;
       const fRatio  = r => r > 0 ? '1:' + Math.round(1/r) : '—';
 
       // Suffix per row: green tick if user meets it, dimmed delta if not
@@ -1363,7 +1444,7 @@ function _renderStatsImpl(st) {
             return `
               <div class="stat-row formula-row"><span class="stat-lbl">Gross PnL</span>${sv(fUsd(st.gross_realized_pnl),pnlC(st.gross_realized_pnl))}</div>
               <div class="stat-row formula-row"><span class="stat-lbl">− Taker Fees</span>${sv(fUsd(st.total_fees),'var(--red)')}</div>
-              ${fp!==0?`<div class="stat-row formula-row"><span class="stat-lbl">− Funding ${fp>0?'Paid':'Earned'}</span>${sv(fUsd(Math.abs(fp)),fp>0?'var(--red)':'var(--green)')}</div>`:''}
+              ${fp!==0?`<div class="stat-row formula-row"><span class="stat-lbl">${fp>0?'−':'+'} Funding ${fp>0?'Paid':'Earned'}</span>${sv(fUsd(Math.abs(fp)),fp>0?'var(--red)':'var(--green)')}</div>`:''}
               <div class="stat-row formula-total"><span class="stat-lbl">= Net PnL</span>${sv(fUsd(st.net_realized_pnl),pnlC(st.net_realized_pnl))}</div>`;
           })()}
         </div>
@@ -1446,7 +1527,7 @@ function _renderStatsImpl(st) {
 
     ${rollingWinrate.length ? `
     <div class="pnl-chart-section">
-      <div class="stat-section-title">Win Rate Stability (rolling ${rollingWinrate.length > 10 ? 50 : ''}trades)</div>
+      <div class="stat-section-title">Win Rate Stability (rolling ${rollingWinrate.length > 10 ? '50 ' : ''}trades)</div>
       <div class="pnl-chart-wrap" style="height:90px"><canvas id="wr-chart"></canvas></div>
     </div>` : ''}
 
@@ -1495,7 +1576,17 @@ function renderDecisionWidget(st, addr) {
   const panel = document.getElementById('decision-panel');
   const el    = document.getElementById('decision-widget');
   if (!panel || !el) return;
-  if (!st || !st.decision) { panel.style.display = 'none'; return; }
+  if (!st || !st.decision) {
+    // Compare mode (and reset/removal, handled at their own call sites) still
+    // hides the panel — this widget is single-wallet-only. But in single-wallet
+    // mode "no decision yet" just means stats haven't arrived (staggered
+    // connects); show the same kind of placeholder every other tab has instead
+    // of a completely blank panel.
+    if (compareMode) { panel.style.display = 'none'; return; }
+    panel.style.display = '';
+    el.innerHTML = '<div class="no-pos">Waiting for stats… the decision sheet appears once this wallet\'s first scores are computed</div>';
+    return;
+  }
   panel.style.display = '';
 
   const score   = st.score;
@@ -2403,7 +2494,7 @@ function closeModal() {
   document.getElementById('m-addr').value='';
   document.getElementById('m-lbl').value='';
   document.getElementById('m-bal').value='';
-  document.getElementById('m-ratio-mode').value='fixed';
+  document.getElementById('m-ratio-mode').value='proportional';  // match the product default + the HTML's `selected` option
   document.getElementById('m-fixed-amt').value='';
   document.getElementById('mf-fixed-amt').style.display='none';
   document.getElementById('merr').classList.remove('show');
@@ -2673,7 +2764,7 @@ socket.on('fill', f => {
   // Refresh stats after a fill (PnL may have changed) — debounced per wallet
   // so an HFT burst collapses to one refresh instead of one per fill.
   const addr = f.wallet;
-  if (addr && (compareMode || addr === (activeWallet||Object.keys(state)[0]))) {
+  if (addr && (compareMode || addr === curWallet())) {
     scheduleStatsRefresh(addr);
   }
 });
@@ -2692,6 +2783,28 @@ socket.on('skip', sk => {
   }
   const meta = _SKIP_REASON_META[sk.reason] || { label: sk.reason };
   showToast(`${sk.label||'Wallet'}: skip`, `${sk.symbol||''} — ${meta.label}`, '⚠');
+});
+
+// Liquidations previously had NO listener at all — a force-liquidated position
+// just vanished from the table on the next state_update with zero explanation.
+// Toast fires regardless of which wallet is selected (rare + capital-destroying);
+// the feed row follows the same selected-wallet gate as skip rows.
+socket.on('margin_call', mc => {
+  const cur = curWallet();
+  if (compareMode || !cur || cur === mc.wallet) {
+    prependMarginCallRow(mc);
+  }
+  showToast(`${_walletLabel(mc.wallet)}: position liquidated`,
+            `${mc.symbol||''} @ $${fPx(mc.liq_price)} (${fPnl(mc.pnl)??'—'})`, '⚠', 8000);
+});
+
+socket.on('liquidated', li => {
+  const cur = curWallet();
+  if (compareMode || !cur || cur === li.wallet) {
+    prependLiquidatedRow(li);
+  }
+  showToast(`${_walletLabel(li.wallet)}: ACCOUNT LIQUIDATED`,
+            `Equity ${fUsd(li.equity)} — all positions wiped out`, '⚠', 12000);
 });
 
 socket.on('equity_tick', tick => {

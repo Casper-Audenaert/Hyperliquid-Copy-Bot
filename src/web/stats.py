@@ -108,9 +108,13 @@ def _risk_stats(equity_rows: list) -> dict:
 
     vals = [v for _, v in sorted(daily.items())]
     if len(vals) < 2:
-        # Fallback: use raw snapshot-to-snapshot returns when < 2 calendar days
+        # Fallback: use raw snapshot-to-snapshot returns when < 2 calendar days.
         raw = [r.equity for r in equity_rows]
-        if len(raw) < 6:
+        span_s = abs((equity_rows[-1].timestamp - equity_rows[0].timestamp).total_seconds())
+        # Annualizing minutes of flat-account noise yields absurd figures
+        # (Sharpe of ±hundreds was observed live) — show nothing until at
+        # least an hour of history backs the estimate.
+        if len(raw) < 6 or span_s < 3600:
             return dict(sharpe=None, volatility=None)
         rets = [(raw[i] - raw[i-1]) / raw[i-1]
                 for i in range(1, len(raw)) if raw[i-1] > 0]
@@ -118,7 +122,11 @@ def _risk_stats(equity_rows: list) -> dict:
             return dict(sharpe=None, volatility=None)
         mean_r = statistics.mean(rets)
         std_r  = statistics.stdev(rets) if len(rets) > 1 else 0
-        ann    = (365 * 24 * 1200) ** 0.5  # 3-sec periods/year (snapshot tick is 3s, see sim.py _periodic_equity_snapshot)
+        # Snapshot rows are NOT a uniform 3s grid (fill-triggered extra rows,
+        # spike-guard and post-close suppression skips) — annualize from the
+        # actually-observed mean spacing, not the nominal tick interval.
+        mean_dt = span_s / (len(raw) - 1)
+        ann     = (365 * 24 * 3600 / mean_dt) ** 0.5
         return dict(
             sharpe     = round(mean_r / std_r * ann, 2) if std_r > 0 else None,
             volatility = round(std_r * ann * 100, 2),
@@ -323,7 +331,7 @@ def _rolling_sharpe_series(equity_rows: list, window_days: int = 7) -> list:
         return []
     rets = [(days[i][0], (days[i][1] - days[i - 1][1]) / days[i - 1][1] if days[i - 1][1] > 0 else 0)
             for i in range(1, len(days))]
-    ann = 252 ** 0.5
+    ann = 365 ** 0.5  # crypto trades 365 days/year — must match _risk_stats' headline Sharpe convention
     result = []
     for i in range(window_days - 1, len(rets)):
         w = [r for _, r in rets[i - window_days + 1:i + 1]]
@@ -401,7 +409,8 @@ def _compute_decision(score, sharpe, max_dd, win_rate, consistency_pct,
     return "SKIP", [f"Score {score}/100 below 45 minimum threshold"]
 
 
-def compute_stats(wallet_addr: str, open_positions: dict = None, copy_ratio: float = 1.0) -> dict:
+def compute_stats(wallet_addr: str, open_positions: dict = None, copy_ratio: float = 1.0,
+                  target_balance: float = 0.0) -> dict:
     """Return the full stats dict for one wallet."""
     counters = db_get_trade_counters(wallet_addr)  # exact lifetime totals — O(1), no table scan
 
@@ -453,7 +462,11 @@ def compute_stats(wallet_addr: str, open_positions: dict = None, copy_ratio: flo
     min_notional_ever = counters["min_open_notional"]
     if min_notional_ever and start_balance and copy_ratio > 0:
         n = min_notional_ever                  # smallest valid sim opening notional, lifetime
-        b_trader = start_balance / copy_ratio  # the trader's actual balance
+        # The trader's actual balance: prefer the live target-account figure when
+        # the caller has one — start_balance/copy_ratio only reconstructs it
+        # exactly for ratio_mode="fixed"; under "proportional" (the default)
+        # copy_ratio drifts with every new position's recompute.
+        b_trader = target_balance if target_balance > 0 else start_balance / copy_ratio
         # At each bracket, the smallest trade's real notional = threshold below
         capital_brackets = {
             "min":            round(10  * start_balance / n, 2),   # smallest trade = $10 (HL floor)

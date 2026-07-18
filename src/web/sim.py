@@ -223,7 +223,7 @@ def _upnl(s: WalletSession, price_override: dict | None = None) -> float:
     for sym in s.simulated_positions:
         mid_px = mids.get(sym)
         ws_px  = ws.get(sym)
-        # Always prefer allMids (REST, refreshed ≤3 s) over WS positionValue/size.
+        # Always prefer allMids (REST, refreshed ≤_MIDS_TTL, 15s) over WS positionValue/size.
         # positionValue is a sub-DEX aggregate that can be 1-3% off from the real mark
         # price, causing UPNL dips that snap back on the next WS update (e.g. 9999→9986→9999).
         if mid_px and mid_px > 0:
@@ -320,27 +320,36 @@ def _session_to_dict(s: WalletSession, price_override: dict | None = None) -> di
     # Build price map: WS current_state as primary (real-time), allMids as sanity check.
     # If WS price deviates > 5% from allMids it flags a sub-DEX positionValue
     # discrepancy — use allMids instead to prevent the inflation.
+    # THREAD SAFETY: this function runs on Flask/SocketIO request threads while
+    # the asyncio bot-loop thread (a different OS thread — session._state_lock is
+    # an asyncio.Lock and can't protect us here) mutates these containers.
+    # Snapshot every dict/list ONCE via list() (a single GIL-atomic C call) so
+    # iteration below can never raise "dictionary changed size during iteration".
+    # Individual position dicts stay shared — per-field reads are atomic and a
+    # momentarily torn multi-field view is acceptable for a dashboard snapshot.
+    _pos_snap = list(s.simulated_positions.items())
     _ws_prices  = {}
     _mid_prices = {}
     _target_sizes = {}
     if s.monitor and s.monitor.current_state:
+        _tpos = list(s.monitor.current_state.positions)
         _ws_prices = {p.symbol: p.current_price
-                      for p in s.monitor.current_state.positions if p.current_price > 0}
+                      for p in _tpos if p.current_price > 0}
         # For position-drift detection below — the target's actual size per
         # symbol, refreshed on the same ~100-140s cadence as current_state
         # itself (_periodic_state_refresh in monitor.py).
-        _target_sizes = {p.symbol: abs(p.size) for p in s.monitor.current_state.positions}
+        _target_sizes = {p.symbol: abs(p.size) for p in _tpos}
     if _mids_cache:
-        _mid_prices = {sym: float(px) for sym, px in _mids_cache.items() if float(px) > 0}
+        _mid_prices = {sym: float(px) for sym, px in list(_mids_cache.items()) if float(px) > 0}
 
     price_map = {}
-    for sym in s.simulated_positions:
+    for sym, _pos in _pos_snap:
         ws_px  = _ws_prices.get(sym)
         mid_px = _mid_prices.get(sym)
         if mid_px and mid_px > 0:
             price_map[sym] = mid_px
         elif ws_px:
-            entry = s.simulated_positions[sym].get("entry_price", 0)
+            entry = _pos.get("entry_price", 0)
             if entry > 0 and abs(ws_px - entry) / entry > 0.5:
                 price_map[sym] = entry  # ponytail: 0 upnl beats a sub-DEX spike
             else:
@@ -349,7 +358,7 @@ def _session_to_dict(s: WalletSession, price_override: dict | None = None) -> di
     total_upnl  = 0.0
     total_margin = 0.0
     positions   = []
-    for sym, pos in s.simulated_positions.items():
+    for sym, pos in _pos_snap:
         current_price = (price_override or {}).get(sym) or price_map.get(sym, pos.get("entry_price", 0))
         size   = abs(pos.get("size", 0))
         entry  = pos.get("entry_price", 0)
@@ -422,7 +431,7 @@ def _session_to_dict(s: WalletSession, price_override: dict | None = None) -> di
     total_attempted   = s.trades_copied_count + s.skipped_fills_count
     copy_efficiency   = round(s.trades_copied_count / total_attempted * 100, 1) if total_attempted else 100.0
 
-    ghosted = [{"symbol": sym, **g} for sym, g in s.ghost_positions.items()]
+    ghosted = [{"symbol": sym, **g} for sym, g in list(s.ghost_positions.items())]
     pending_dust = [
         {
             "symbol": sym,
@@ -432,7 +441,7 @@ def _session_to_dict(s: WalletSession, price_override: dict | None = None) -> di
             "vwap": round(buf["px_volume"] / buf["size"], 6) if buf["size"] > 0 else 0,
             "fill_count": buf["fill_count"],
         }
-        for sym, buf in s.pending_dust.items()
+        for sym, buf in list(s.pending_dust.items())
     ]
     feed_age_secs = None
     fill_queue_depth = None
@@ -633,7 +642,25 @@ def _ratio_for_new_position(session: WalletSession, target_size: float, price: f
         )
         return session.copy_ratio
 
-    return session.copy_ratio  # "fixed" (default) — unchanged behavior
+    # "fixed" mode. Late validation (heal path): if the boot fetch failed every
+    # retry, copy_ratio is still the unproven default and the ratio_unvalidated
+    # guard blocks every new position — and unlike proportional mode, nothing
+    # else ever revalidates fixed mode mid-session, so without this the wallet
+    # is locked out until a manual restart. Freeze the ratio at the first
+    # target state the ~100-140s background refresh manages to deliver — the
+    # same "frozen at first successful fetch" semantics start_session applies,
+    # just later than usual.
+    if (not session._ratio_validated and session.monitor
+            and session.monitor.current_state
+            and session.monitor.current_state.balance > 0):
+        session.copy_ratio = session.start_balance / session.monitor.current_state.balance
+        session._ratio_validated = True
+        logger.info(
+            f"[{session.label}] Fixed ratio validated late (boot fetch had failed): "
+            f"target ${session.monitor.current_state.balance:,.0f} → "
+            f"ratio {session.copy_ratio*100:.4f}%"
+        )
+    return session.copy_ratio
 
 
 # Rare, decision-relevant skip reasons only — ghosted/dust_buffered are
@@ -694,6 +721,15 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     is_flip    = ">" in direction
     is_opening = "Open" in direction or "Add" in direction
 
+    # Trust-boundary validation: a fill with no positive price or size is
+    # malformed exchange data — every sizing/ratio formula below divides or
+    # multiplies by these, so let none of them see zeros. Not counted: nothing
+    # copyable was missed.
+    if price <= 0 or target_size <= 0:
+        logger.warning(f"[{session.label}] Malformed fill dropped ({symbol}: sz={target_size}, px={price})")
+        _mark_skip(session, fill_id, "other", count=False, emit_fn=emit_fn, symbol=symbol)
+        return
+
     if not (is_closing or is_flip or is_opening):
         # Spot-style fill: Hyperliquid reports plain "Buy"/"Sell" with no Open/Close
         # qualifier (unlike perp fills). Infer intent from the existing position:
@@ -712,6 +748,21 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
                 is_closing = True
         else:
             is_opening = True
+
+    # Guard: close for a position we never tracked → skip (pre-dates our session).
+    # Also covers a symbol that was only ever a dust buffer (never flushed to a
+    # real position) and the target now closes it — nothing to close on our
+    # side, so discard the buffer rather than leaving it to accumulate toward
+    # a position the target no longer even holds. Not counted toward
+    # skipped_fills_count: there's nothing WE could have copied here (no
+    # symbol tracking existed on our side at all). Must run BEFORE the ratio
+    # resolution/validation below: an untracked close is not a "new position",
+    # and letting it fall into the ratio_unvalidated guard would wrongly count
+    # it against copy_efficiency_pct during a rate-limited startup window.
+    if is_closing and not is_flip and symbol not in session.simulated_positions:
+        session.pending_dust.pop(symbol, None)
+        _mark_skip(session, fill_id, "other", count=False, emit_fn=emit_fn, symbol=symbol)
+        return
 
     # Resolve which ratio to use for this fill. A flip always starts a brand-new
     # position (the old side is being closed out below), an add to an existing
@@ -924,19 +975,6 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
                 f"${session.simulated_balance:,.0f} ({our_leverage:.0f}x lev) — skip"
             )
             return
-
-    # Guard: close for a position we never tracked → skip (pre-dates our session).
-    # Also covers a symbol that was only ever a dust buffer (never flushed to a
-    # real position) and the target now closes it — nothing to close on our
-    # side, so discard the buffer rather than leaving it to accumulate toward
-    # a position the target no longer even holds. Not counted toward
-    # skipped_fills_count: there's nothing WE could have copied here (no
-    # symbol tracking existed on our side at all), unlike the guards above
-    # which reject a copy attempt we actually could have made.
-    if is_closing and not is_flip and symbol not in session.simulated_positions:
-        session.pending_dust.pop(symbol, None)
-        _mark_skip(session, fill_id, "other", count=False, emit_fn=emit_fn, symbol=symbol)
-        return
 
     # Snapshot target's pre-close position size for close-fraction calculation.
     # 3-tier resolution, most exact first:
@@ -1195,9 +1233,10 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
         await asyncio.to_thread(db_snapshot_equity, session.address, *_pending_snapshot)
 
     # Emit outside lock
-    # Force a fresh allMids fetch so _upnl() prices are accurate at fill time.
-    # Without this, _mids_cache can be up to 3 s stale; on high-leverage positions
-    # even a 1-2% price lag amplifies into a visible equity dip that snaps back next tick.
+    # Refresh the shared mids cache so _upnl() prices are recent at fill time —
+    # NOTE: still TTL-gated (_MIDS_TTL, 15s), so this bounds staleness to the
+    # TTL rather than truly forcing a fetch; on high-leverage positions a price
+    # lag amplifies into a visible equity dip that snaps back next tick.
     try:
         await _get_shared_mids(session.client)
     except Exception:
@@ -1499,10 +1538,10 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
                 return
 
 
-            # Build price_map: allMids (REST, ≤3 s) always preferred; WS positionValue/size
-            # only used as a last resort because it can be 1-3% off from the real mark price.
-            # Force a fresh allMids fetch every snapshot tick — reading _mids_cache directly
-            # would use up-to-3s-stale prices and cause chart dips that snap back next tick.
+            # Build price_map: allMids (REST, ≤_MIDS_TTL=15s) always preferred; WS
+            # positionValue/size only used as a last resort because it can be 1-3% off
+            # from the real mark price. _get_shared_mids is TTL-gated, so ticks between
+            # cache refreshes reuse the same ≤15s-old prices — no extra REST weight.
             try:
                 _fresh = await _get_shared_mids(session.client)
                 _snap_mids = {sym: float(px) for sym, px in _fresh.items() if float(px) > 0}
@@ -1719,7 +1758,7 @@ async def _periodic_liquidation_check(session: WalletSession, emit_fn: Callable)
     """Fast-cadence (3s) liquidation-only marking loop, independent of the slower
     30s funding/snapshot/circuit-breaker loop — bounds how long a fast-moving price
     can blow through a position's margin with nothing noticing. Reuses _mids_cache
-    (already refreshed on a 3s TTL elsewhere) so this adds no new REST calls."""
+    (refreshed on the shared _MIDS_TTL=15s elsewhere) so this adds no new REST calls."""
     while True:
         try:
             await asyncio.sleep(3)
@@ -2500,7 +2539,10 @@ async def _reinit_session_body(session: WalletSession, emit_fn: Callable):
     # EquitySnapshot only: the old full purge_wallet_data here also deleted
     # the ghost rows, seed TradeRecords, trade feed, and stats_counters this
     # reinit had just written.
-    purge_equity_snapshots(session.address)
+    # to_thread like every other DB call in this function — a synchronous
+    # SQLite delete here can block the shared event loop for up to
+    # busy_timeout (5s) under write contention, stalling ALL wallets.
+    await asyncio.to_thread(purge_equity_snapshots, session.address)
 
     upnl         = _upnl(session)
     total_margin = sum(p.get("margin_used", 0) for p in session.simulated_positions.values())
