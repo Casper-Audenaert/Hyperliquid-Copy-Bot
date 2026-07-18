@@ -243,11 +243,22 @@ class WalletMonitor:
         logger.info(f"WalletMonitor initialised for {target_address}")
 
     async def get_current_state(self) -> Optional[UserState]:
+        # BUG FIX: this used to unconditionally overwrite self.current_state
+        # with the fetch result, including None on a failed request (e.g. a
+        # 429 — common under today's rate-limit pressure). A transient failure
+        # would blank out a perfectly good previous snapshot, and every reader
+        # (Sync%, dist_to_liq_pct, position-close detection in
+        # _periodic_state_refresh) would suddenly see "no data" until the next
+        # successful refresh, purely from rate-limiting noise rather than any
+        # real change in the target. current_state is documented elsewhere as
+        # an eventually-consistent snapshot, not a live feed — so on failure,
+        # keep the last-known-good state instead of discarding it.
         async with self.client:
-            self.current_state = await self.client.get_user_state(self.target_address)
-            if self.current_state:
-                self.last_positions = self.current_state.positions.copy()
-                self.last_orders = self.current_state.orders.copy()
+            new_state = await self.client.get_user_state(self.target_address)
+            if new_state:
+                self.current_state = new_state
+                self.last_positions = new_state.positions.copy()
+                self.last_orders = new_state.orders.copy()
         return self.current_state
 
     async def start_monitoring(self):

@@ -933,6 +933,7 @@ const _SKIP_REASON_META = {
   blocked:        { label: 'Blocked asset',    tip: 'Symbol is on the blocked-assets list' },
   external_market:{ label: 'External market',  tip: 'External-builder market (pre-IPO/tokenized), not a perp fill' },
   other:          { label: 'Other',            tip: 'Target closed/reduced a symbol we never tracked (pre-dates this session)' },
+  ratio_unvalidated: { label: 'Ratio not ready', tip: "Target account state hasn't loaded yet this session (likely rate-limited) — skipped rather than open at an unproven size; the next fill copies normally once it loads" },
 };
 
 function renderGhostTab() {
@@ -2499,6 +2500,9 @@ async function openTestModal() {
     showToast('Failed to load test wallets', '', '⚠');
   }
   document.getElementById('tw-bal').value = '';
+  document.getElementById('tw-ratio-mode').value = 'proportional';
+  document.getElementById('tw-fixed-amt').value = '';
+  document.getElementById('twf-fixed-amt').style.display = 'none';
   document.getElementById('tw-merr').classList.remove('show');
   document.getElementById('tw-mbg').classList.add('open');
   setTimeout(() => document.getElementById('tw-bal').focus(), 60);
@@ -2514,10 +2518,18 @@ async function addTestWallets() {
   const errEl = document.getElementById('tw-merr');
   const btn = document.getElementById('tw-submit');
   const defaultBal = balRaw ? parseFloat(balRaw) : null;
+  const ratioMode = document.getElementById('tw-ratio-mode').value;
+  const fixedAmtRaw = document.getElementById('tw-fixed-amt').value.trim();
+  const fixedAmountUsd = fixedAmtRaw ? parseFloat(fixedAmtRaw) : null;
 
   errEl.classList.remove('show');
   if (defaultBal !== null && (isNaN(defaultBal) || defaultBal <= 0)) {
     errEl.textContent = 'Starting balance must be a positive number.';
+    errEl.classList.add('show');
+    return;
+  }
+  if (ratioMode === 'fixed_amount' && (fixedAmountUsd === null || isNaN(fixedAmountUsd) || fixedAmountUsd <= 0)) {
+    errEl.textContent = 'Enter a positive $ per trade for Fixed Amount mode.';
     errEl.classList.add('show');
     return;
   }
@@ -2531,7 +2543,11 @@ async function addTestWallets() {
     try {
       const r = await fetchT('/api/add-wallet', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ address, label, start_balance: defaultBal }),
+        body: JSON.stringify({
+          address, label, start_balance: defaultBal,
+          ratio_mode: ratioMode,
+          fixed_amount_usd: ratioMode === 'fixed_amount' ? fixedAmountUsd : null,
+        }),
       });
       const d = await r.json();
       if (d.ok) { succeeded++; } else { failed++; if (d.error) lastError = d.error; }

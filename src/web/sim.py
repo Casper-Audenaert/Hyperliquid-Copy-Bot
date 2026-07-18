@@ -50,6 +50,7 @@ _sessions: dict = {}
 _SKIP_CATEGORIES = (
     "ghosted", "dust_buffered", "dust_skipped", "deviation", "exposure",
     "affordability", "position_cap", "blocked", "external_market", "other",
+    "ratio_unvalidated",
 )
 
 DUST_GUARD = settings.copy_rules.min_position_size_usd  # HL's real minimum order notional (configurable via MIN_POSITION_SIZE_USD) — fills below this are skipped (same as live trading)
@@ -57,14 +58,28 @@ DUST_GUARD = settings.copy_rules.min_position_size_usd  # HL's real minimum orde
 # Shared caches — all market-wide data is identical across wallets.
 # Without caching: 15 wallets × 9 DEX calls each = 135 calls/30s per metric.
 # With caching: 9 calls per TTL window, shared by all wallets.
+#
+# BUG FIX: Hyperliquid's REST budget is a documented 1200 weight/min per IP.
+# metaAndAssetCtxs (funding) is weight 20/call and allMids is weight 2/call,
+# each fanned out across all 9 dexes per fetch (18 and 180 weight per fetch
+# respectively). At the old TTLs (3s mids, 35s funding) these two caches ALONE
+# cost ~360 + ~309 = ~669 weight/min — 56% of the entire per-IP budget spent
+# on background price/funding refresh, before counting any actual fill
+# processing, wallet state refreshes, or boot activity. Both TTLs were far
+# tighter than the data actually needs: funding rates only change hourly on
+# Hyperliquid, and mid prices don't need sub-15s freshness for a dashboard
+# display or the entry-deviation guard's tolerance check. The 3s mids TTL was
+# specifically tuned for the debounced-copy-mode feature ("accurate enough for
+# debounce re-pricing") — that feature was removed earlier in this project, so
+# the justification for such a tight TTL no longer applies.
 _funding_cache: dict = {}
 _funding_cache_ts: float = 0.0
-_FUNDING_TTL = 35.0
+_FUNDING_TTL = 300.0  # 5min — funding settles hourly; was 35s (~309 weight/min)
 _funding_lock: Optional[asyncio.Lock] = None   # lazily created in the asyncio loop
 
 _mids_cache: dict = {}
 _mids_cache_ts: float = 0.0
-_MIDS_TTL = 3.0   # 3s: accurate enough for debounce re-pricing; was 10s
+_MIDS_TTL = 15.0  # was 3s (~360 weight/min), tuned for the now-removed debounce feature
 _mids_lock: Optional[asyncio.Lock] = None      # lazily created in the asyncio loop
 
 
@@ -137,6 +152,15 @@ class WalletSession:
 
     is_paused: bool = False
     copy_ratio: float = 1.0          # frozen for ratio_mode="fixed"; recomputed on each new position for "proportional" (via _ratio_for_new_position)
+    # False until a target state fetch has ACTUALLY succeeded at least once this
+    # session. Guards against opening a brand-new position with copy_ratio still
+    # sitting at its untouched default (1.0) — observed live under sustained
+    # rate-limiting: start_session's initial fetch failed all retries, but the
+    # WS fill stream (unaffected by REST throttling) still delivered a live fill
+    # for a symbol never seen before, and _ratio_for_new_position happily
+    # returned the unvalidated default. See the new-position guard in
+    # _process_fill.
+    _ratio_validated: bool = False
     trades_copied_count: int = 0
     simulated_balance: float = 10_000.0
     start_balance: float = 10_000.0
@@ -150,7 +174,7 @@ class WalletSession:
     pending_dust: dict = field(default_factory=dict)
     copy_mode: str      = "all_fills"       # always "all_fills" now — every fill is copied live; field/DB column kept for legacy rows
     debounce_secs: int  = 30               # unused (debounced copy mode was removed) — kept only so legacy DB rows still round-trip
-    ratio_mode: str = "fixed"                    # "fixed" | "proportional" | "fixed_amount" — set once at add-time, never mutated
+    ratio_mode: str = "proportional"              # "fixed" | "proportional" | "fixed_amount" — set once at add-time, never mutated
     fixed_amount_usd: Optional[float] = None      # only used when ratio_mode == "fixed_amount"
     detected_style: str = "Swing"          # "HFT" | "Swing" — surfaced to UI as a badge
     _style_last_checked: float = 0.0                       # monotonic time of last _detect_trading_style call
@@ -587,6 +611,7 @@ def _ratio_for_new_position(session: WalletSession, target_size: float, price: f
         if target_equity > 0:
             your_equity, _, _ = _equity_from_cache(session)
             session.copy_ratio = your_equity / target_equity
+            session._ratio_validated = True
         else:
             # BUG FIX: this fallback path was previously silent (debug-level) —
             # sizing a new position off a stale/frozen ratio because the target's
@@ -615,7 +640,7 @@ def _ratio_for_new_position(session: WalletSession, target_size: float, price: f
 # high-frequency (every fill on an actively-traded ghost/accumulating-dust
 # symbol hits them) and are counter-only, surfaced via skip_counts instead
 # of flooding the socket with an event per fill.
-_SKIP_EMIT_CATEGORIES = frozenset({"deviation", "exposure", "affordability", "position_cap", "dust_skipped"})
+_SKIP_EMIT_CATEGORIES = frozenset({"deviation", "exposure", "affordability", "position_cap", "dust_skipped", "ratio_unvalidated"})
 
 
 def _mark_skip(session: "WalletSession", fill_id, category: str, count: bool = True,
@@ -693,12 +718,42 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     # tracked position reuses that position's own stored ratio (keeps it
     # internally consistent regardless of mode), anything else is a genuinely
     # new position.
-    if is_flip:
+    is_new_position = is_flip or symbol not in session.simulated_positions
+    if is_new_position:
+        # _ratio_for_new_position is called FIRST, before checking
+        # _ratio_validated below — for "proportional" mode this call is also
+        # what LIVE-recomputes and sets _ratio_validated, so checking the flag
+        # before ever attempting the call would permanently strand a wallet
+        # whose initial boot fetch failed: nothing else ever revalidates it
+        # mid-session, so it could never recover. Calling first lets a LATER
+        # successful periodic state refresh (independent of boot) heal a
+        # proportional-mode wallet the moment its next new position arrives.
         ratio = _ratio_for_new_position(session, target_size, price)
     elif symbol in session.simulated_positions:
         ratio = session.simulated_positions[symbol]["copy_ratio"]
-    else:
-        ratio = _ratio_for_new_position(session, target_size, price)
+
+    # Guard: never open a brand-new position off a ratio that's still
+    # unvalidated after the attempt above. Observed live: under sustained
+    # rate-limiting, start_session's initial state fetch can fail every retry
+    # while the WS fill stream (unaffected by REST throttling) keeps
+    # delivering live fills — a brand-new symbol arriving in that window would
+    # otherwise open at copy_ratio's untouched default (1.0), reproducing the
+    # exact stored-ratio corruption found and repaired elsewhere in this file,
+    # just via a fresh position instead of a restored one. fixed_amount mode
+    # is exempt: its ratio is derived per-fill from fixed_amount_usd/notional,
+    # never from copy_ratio, so it has no unvalidated-default failure mode to
+    # guard against. Safe to skip rather than ghost: this is a transient infra
+    # condition, not a standing "never copy this symbol" policy — the next
+    # fill for this symbol, or any other, copies normally once validated.
+    if is_new_position and session.ratio_mode != "fixed_amount" and not session._ratio_validated:
+        _mark_skip(session, fill_id, "ratio_unvalidated", emit_fn=emit_fn, symbol=symbol)
+        logger.warning(
+            f"[{session.label}] Ratio never validated this session (target state "
+            f"fetch hasn't succeeded yet) — skip new position {symbol} rather than "
+            f"open at an unproven ratio"
+        )
+        return
+
     our_size = target_size * ratio
 
     # Faithful mirror: no hardcoded position/exposure caps — our_size scales
@@ -1432,8 +1487,12 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
             # regular time grid — wallets are already staggered via start_session's
             # offset_secs, and _funding_cache/_mids_cache dedupe REST calls by TTL
             # regardless of tick alignment, so jitter wasn't load-bearing here.
-            # 3s matches _MIDS_TTL so this tick never fetches faster than the shared
-            # cache actually refreshes.
+            # This tick's own cadence (3s) is independent of _MIDS_TTL (now 15s) —
+            # _get_shared_mids' single-flight TTL gate is what controls actual
+            # network calls, not this loop's polling frequency, so a 3s snapshot
+            # cadence over a 15s-fresh price cache costs no extra API weight, just
+            # a coarser (still perfectly usable) price resolution between the
+            # network's real refreshes.
             await asyncio.sleep(3)
             if session.address not in _sessions:
                 logger.debug(f"[{session.label}] Snapshot task exiting — wallet removed")
@@ -1676,7 +1735,7 @@ async def _periodic_liquidation_check(session: WalletSession, emit_fn: Callable)
 
 def _create_session(address: str, label: str, start_balance: float = None,
                     copy_mode: str = "all_fills", debounce_secs: int = 30,
-                    detected_style: str = "Swing", ratio_mode: str = "fixed",
+                    detected_style: str = "Swing", ratio_mode: str = "proportional",
                     fixed_amount_usd: float | None = None,
                     last_fill_time_ms: int = 0,
                     skip_counters_json: str | None = None) -> "WalletSession":
@@ -1961,15 +2020,58 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
         )
 
     logger.info(f"[{session.label}] Fetching initial state for {session.address[:10]}…")
-    state = await session.monitor.get_current_state()
+    # BUG FIX: this was a single attempt — under sustained rate-limiting a 429
+    # here left copy_ratio at its untouched dataclass default (1.0) for the
+    # rest of the session's life (nothing else in start_session re-derives it),
+    # so the FIRST brand-new position this session ever opens could bake in a
+    # wildly wrong ratio, reproducing the exact stored-copy_ratio corruption
+    # found and repaired elsewhere in this file — but with no restored data to
+    # repair it against, since this is a fresh position. Retry with the same
+    # backoff already used for the mid-price fetch just below, instead of
+    # permanently accepting the first failure.
+    state = None
+    for _attempt in range(3):
+        state = await session.monitor.get_current_state()
+        if state and state.balance > 0:
+            break
+        if _attempt < 2:
+            await asyncio.sleep(2)
 
     if state and state.balance > 0:
         # Fix copy_ratio as a constant; never read from the shared settings global
         session.copy_ratio = session.start_balance / state.balance
+        session._ratio_validated = True
         logger.info(
             f"[{session.label}] Target ${state.balance:,.0f} → "
             f"ratio 1:{int(1/session.copy_ratio)} ({session.copy_ratio*100:.4f}%)"
         )
+
+        # BUG FIX: a position restored from the DB carries whatever copy_ratio
+        # was stored the moment it was first opened. Under "fixed" mode that's
+        # architecturally supposed to always equal session.copy_ratio (one
+        # constant ratio for the whole session) — but some already-persisted
+        # positions were found with copy_ratio=1.0 baked in (from an earlier
+        # bug or a since-changed code path), which is silently wrong two ways:
+        # it corrupts the Sync% drift indicator (compares against a phantom
+        # "expected size" ~1000x too big, showing every position as massively
+        # desynced when the real per-fill sizing was fine all along), and more
+        # seriously would size any FUTURE add to that same position at the
+        # wrong ratio (_process_fill reuses a tracked position's own stored
+        # copy_ratio for adds). Realign every restored position to the
+        # freshly-computed session.copy_ratio so a stale value can't keep
+        # propagating forward across restarts forever. Skipped for
+        # "proportional" mode, where a per-position ratio that differs from
+        # the current session-level one is the correct, intentional behavior.
+        if session.ratio_mode == "fixed":
+            for _sym, _pos in session.simulated_positions.items():
+                _stored = _pos.get("copy_ratio") or 0
+                if _stored <= 0 or abs(_stored - session.copy_ratio) / session.copy_ratio > 0.01:
+                    logger.warning(
+                        f"[{session.label}] Correcting stale copy_ratio for {_sym}: "
+                        f"{_stored} -> {session.copy_ratio}"
+                    )
+                    _pos["copy_ratio"] = session.copy_ratio
+                    await asyncio.to_thread(db_upsert_position, session.address, _sym, _pos)
 
         # ── Ghost reconciliation on restart ───────────────────────────────────
         # Load persisted ghost positions then cross-check against live target.
@@ -2219,6 +2321,7 @@ async def _reinit_session_body(session: WalletSession, emit_fn: Callable):
     session.simulated_positions  = {}
     session.ghost_positions      = {}
     session.pending_dust         = {}
+    session._ratio_validated     = False  # must re-earn validation from this reinit's own fetch
     session.simulated_pnl        = 0.0
     session.total_fees_paid      = 0.0
     session.total_funding_paid   = 0.0
@@ -2243,9 +2346,19 @@ async def _reinit_session_body(session: WalletSession, emit_fn: Callable):
     session._last_equity_tick_ts = 0.0   # reset rate-limit so first tick fires immediately
     session._style_last_checked  = 0.0   # force style re-detection after reinit
 
-    state = await session.monitor.get_current_state()
+    # Retry, same rationale as start_session's initial fetch: a single 429
+    # here would leave copy_ratio uncorrected for the rest of the session.
+    state = None
+    for _attempt in range(3):
+        state = await session.monitor.get_current_state()
+        if state and state.balance > 0:
+            break
+        if _attempt < 2:
+            await asyncio.sleep(2)
+
     if state and state.balance > 0:
         session.copy_ratio = session.start_balance / state.balance
+        session._ratio_validated = True
 
         if state.positions:
             all_mids = {}

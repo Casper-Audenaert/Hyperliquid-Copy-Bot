@@ -41,7 +41,7 @@ class Wallet(Base):
     debounce_secs  = Column(Integer, default=30)
     detected_style = Column(String, default="Swing")       # "HFT" | "Swing" — for UI badge
     stats_counters = Column(String, nullable=True)         # JSON blob of lifetime trade aggregates, see db_get_trade_counters
-    ratio_mode        = Column(String, default="fixed")    # "fixed" | "proportional" | "fixed_amount"
+    ratio_mode        = Column(String, default="proportional")    # "fixed" | "proportional" | "fixed_amount"
     fixed_amount_usd  = Column(Float, nullable=True)        # only meaningful when ratio_mode == "fixed_amount"
     last_fill_time_ms = Column(Integer, default=0)          # exchange ms of the last fill we processed — restart gap-replay watermark
     skip_counters     = Column(String, nullable=True)       # JSON blob of {reason: count} — see sim.py's _SKIP_CATEGORIES
@@ -424,8 +424,13 @@ def purge_wallet_data(address: str):
         # which conveniently is exactly the state this reset restores).
         w = db.get(Wallet, address)
         if w:
-            w.stats_counters = None
-            w.skip_counters  = None
+            w.stats_counters   = None
+            w.skip_counters    = None
+            # A genuine reset should also clear the fill-processing watermark —
+            # leaving it in place would make _replay_missed_fills silently skip
+            # replaying fills that predate a fresh purge, purely because the
+            # clock never got reset alongside everything else it gates.
+            w.last_fill_time_ms = 0
         db.commit()
 
 

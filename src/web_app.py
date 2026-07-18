@@ -247,9 +247,9 @@ def api_add_wallet():
     except (TypeError, ValueError):
         start_balance = settings.simulated_account_balance
 
-    ratio_mode = (data.get("ratio_mode") or "fixed").strip().lower()
+    ratio_mode = (data.get("ratio_mode") or "proportional").strip().lower()
     if ratio_mode not in ("fixed", "proportional", "fixed_amount"):
-        ratio_mode = "fixed"
+        ratio_mode = "proportional"
     fixed_amount_usd = None
     if ratio_mode == "fixed_amount":
         try:
@@ -457,6 +457,17 @@ if __name__ == "__main__":
     # 2. Load persisted wallets (added via GUI — no auto-seeding from env)
     db_wallets = list_wallets_from_db()
 
+    # User decision: every server restart wipes trading state (balance,
+    # positions, equity chart, PnL/skip counters, trade history) for every
+    # wallet and re-seeds fresh from the target's current positions — the
+    # exact same purge_wallet_data() + fresh-seed path the manual Reset
+    # button already uses (see api_reset_wallet), just applied to the whole
+    # fleet automatically at boot instead of one wallet at a time by hand.
+    # The wallet registry itself (address, label, start_balance, ratio_mode)
+    # is configuration, not state, and is deliberately left untouched.
+    for w in db_wallets:
+        purge_wallet_data(w.address)
+
     for i, w in enumerate(db_wallets):
         # Restore detected style from DB so restarts don't start with wrong defaults
         session = _create_session(
@@ -464,10 +475,10 @@ if __name__ == "__main__":
             copy_mode=getattr(w, "copy_mode", "all_fills") or "all_fills",
             debounce_secs=getattr(w, "debounce_secs", 30) or 30,
             detected_style=getattr(w, "detected_style", "Swing") or "Swing",
-            ratio_mode=getattr(w, "ratio_mode", "fixed") or "fixed",
+            ratio_mode=getattr(w, "ratio_mode", "proportional") or "proportional",
             fixed_amount_usd=getattr(w, "fixed_amount_usd", None),
-            last_fill_time_ms=getattr(w, "last_fill_time_ms", 0) or 0,
-            skip_counters_json=getattr(w, "skip_counters", None),
+            last_fill_time_ms=0,      # reset by the purge above — start "copy from now"
+            skip_counters_json=None,  # reset by the purge above
         )
         # Stagger starts by 5s each — 2s was too tight for 20+ wallets each making
         # 9+ REST calls during startup (fill history + style detection)
