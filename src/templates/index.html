@@ -936,8 +936,8 @@ header{
     <div class="mf">
       <label>Ratio Mode</label>
       <select id="m-ratio-mode" onchange="document.getElementById('mf-fixed-amt').style.display = this.value === 'fixed_amount' ? '' : 'none'">
-        <option value="fixed" selected>Fixed Ratio — locked at add-time</option>
-        <option value="proportional">Proportional — recalculated from live equity</option>
+        <option value="fixed">Fixed Ratio — locked at add-time</option>
+        <option value="proportional" selected>Proportional — recalculated from live equity</option>
         <option value="fixed_amount">Fixed Amount — flat $ per trade</option>
       </select>
     </div>
@@ -963,6 +963,18 @@ header{
       <textarea id="tw-addrs" rows="7" readonly style="opacity:.7;cursor:default;font-size:11px;line-height:1.6"></textarea>
     </div>
     <div class="mf"><label>Starting Balance ($)</label><input id="tw-bal" type="number" min="1" step="100" placeholder="10000" autocomplete="off"></div>
+    <div class="mf">
+      <label>Ratio Mode</label>
+      <select id="tw-ratio-mode" onchange="document.getElementById('twf-fixed-amt').style.display = this.value === 'fixed_amount' ? '' : 'none'">
+        <option value="fixed">Fixed Ratio — locked at add-time</option>
+        <option value="proportional" selected>Proportional — recalculated from live equity</option>
+        <option value="fixed_amount">Fixed Amount — flat $ per trade</option>
+      </select>
+    </div>
+    <div class="mf" id="twf-fixed-amt" style="display:none">
+      <label>$ per trade</label>
+      <input id="tw-fixed-amt" type="number" min="1" step="1" placeholder="1000" autocomplete="off">
+    </div>
     <div class="mfoot">
       <button class="btn" onclick="closeTestModal()">Cancel</button>
       <button class="btn btn-brand" id="tw-submit" onclick="addTestWallets()">Add All</button>

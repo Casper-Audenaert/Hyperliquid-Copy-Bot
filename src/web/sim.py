@@ -150,7 +150,7 @@ class WalletSession:
     pending_dust: dict = field(default_factory=dict)
     copy_mode: str      = "all_fills"       # always "all_fills" now — every fill is copied live; field/DB column kept for legacy rows
     debounce_secs: int  = 30               # unused (debounced copy mode was removed) — kept only so legacy DB rows still round-trip
-    ratio_mode: str = "fixed"                    # "fixed" | "proportional" | "fixed_amount" — set once at add-time, never mutated
+    ratio_mode: str = "proportional"              # "fixed" | "proportional" | "fixed_amount" — set once at add-time, never mutated
     fixed_amount_usd: Optional[float] = None      # only used when ratio_mode == "fixed_amount"
     detected_style: str = "Swing"          # "HFT" | "Swing" — surfaced to UI as a badge
     _style_last_checked: float = 0.0                       # monotonic time of last _detect_trading_style call
@@ -1676,7 +1676,7 @@ async def _periodic_liquidation_check(session: WalletSession, emit_fn: Callable)
 
 def _create_session(address: str, label: str, start_balance: float = None,
                     copy_mode: str = "all_fills", debounce_secs: int = 30,
-                    detected_style: str = "Swing", ratio_mode: str = "fixed",
+                    detected_style: str = "Swing", ratio_mode: str = "proportional",
                     fixed_amount_usd: float | None = None,
                     last_fill_time_ms: int = 0,
                     skip_counters_json: str | None = None) -> "WalletSession":

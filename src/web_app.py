@@ -247,9 +247,9 @@ def api_add_wallet():
     except (TypeError, ValueError):
         start_balance = settings.simulated_account_balance
 
-    ratio_mode = (data.get("ratio_mode") or "fixed").strip().lower()
+    ratio_mode = (data.get("ratio_mode") or "proportional").strip().lower()
     if ratio_mode not in ("fixed", "proportional", "fixed_amount"):
-        ratio_mode = "fixed"
+        ratio_mode = "proportional"
     fixed_amount_usd = None
     if ratio_mode == "fixed_amount":
         try:
@@ -464,7 +464,7 @@ if __name__ == "__main__":
             copy_mode=getattr(w, "copy_mode", "all_fills") or "all_fills",
             debounce_secs=getattr(w, "debounce_secs", 30) or 30,
             detected_style=getattr(w, "detected_style", "Swing") or "Swing",
-            ratio_mode=getattr(w, "ratio_mode", "fixed") or "fixed",
+            ratio_mode=getattr(w, "ratio_mode", "proportional") or "proportional",
             fixed_amount_usd=getattr(w, "fixed_amount_usd", None),
             last_fill_time_ms=getattr(w, "last_fill_time_ms", 0) or 0,
             skip_counters_json=getattr(w, "skip_counters", None),
