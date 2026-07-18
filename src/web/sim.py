@@ -58,14 +58,28 @@ DUST_GUARD = settings.copy_rules.min_position_size_usd  # HL's real minimum orde
 # Shared caches — all market-wide data is identical across wallets.
 # Without caching: 15 wallets × 9 DEX calls each = 135 calls/30s per metric.
 # With caching: 9 calls per TTL window, shared by all wallets.
+#
+# BUG FIX: Hyperliquid's REST budget is a documented 1200 weight/min per IP.
+# metaAndAssetCtxs (funding) is weight 20/call and allMids is weight 2/call,
+# each fanned out across all 9 dexes per fetch (18 and 180 weight per fetch
+# respectively). At the old TTLs (3s mids, 35s funding) these two caches ALONE
+# cost ~360 + ~309 = ~669 weight/min — 56% of the entire per-IP budget spent
+# on background price/funding refresh, before counting any actual fill
+# processing, wallet state refreshes, or boot activity. Both TTLs were far
+# tighter than the data actually needs: funding rates only change hourly on
+# Hyperliquid, and mid prices don't need sub-15s freshness for a dashboard
+# display or the entry-deviation guard's tolerance check. The 3s mids TTL was
+# specifically tuned for the debounced-copy-mode feature ("accurate enough for
+# debounce re-pricing") — that feature was removed earlier in this project, so
+# the justification for such a tight TTL no longer applies.
 _funding_cache: dict = {}
 _funding_cache_ts: float = 0.0
-_FUNDING_TTL = 35.0
+_FUNDING_TTL = 300.0  # 5min — funding settles hourly; was 35s (~309 weight/min)
 _funding_lock: Optional[asyncio.Lock] = None   # lazily created in the asyncio loop
 
 _mids_cache: dict = {}
 _mids_cache_ts: float = 0.0
-_MIDS_TTL = 3.0   # 3s: accurate enough for debounce re-pricing; was 10s
+_MIDS_TTL = 15.0  # was 3s (~360 weight/min), tuned for the now-removed debounce feature
 _mids_lock: Optional[asyncio.Lock] = None      # lazily created in the asyncio loop
 
 
@@ -1467,8 +1481,12 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
             # regular time grid — wallets are already staggered via start_session's
             # offset_secs, and _funding_cache/_mids_cache dedupe REST calls by TTL
             # regardless of tick alignment, so jitter wasn't load-bearing here.
-            # 3s matches _MIDS_TTL so this tick never fetches faster than the shared
-            # cache actually refreshes.
+            # This tick's own cadence (3s) is independent of _MIDS_TTL (now 15s) —
+            # _get_shared_mids' single-flight TTL gate is what controls actual
+            # network calls, not this loop's polling frequency, so a 3s snapshot
+            # cadence over a 15s-fresh price cache costs no extra API weight, just
+            # a coarser (still perfectly usable) price resolution between the
+            # network's real refreshes.
             await asyncio.sleep(3)
             if session.address not in _sessions:
                 logger.debug(f"[{session.label}] Snapshot task exiting — wallet removed")
