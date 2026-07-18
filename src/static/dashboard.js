@@ -43,6 +43,7 @@ let winRateChart       = null;
 let symPnlChart        = null;
 let histChart          = null;
 let sharpeSeriesChart  = null;
+let hoursChart         = null;
 let fillCount    = 0;
 let _feedPage    = 0;         // 0-indexed page into the trade feed table
 const FEED_PAGE_SIZE = 20;
@@ -110,6 +111,7 @@ function applyTheme(theme) {
   if (symPnlChart)        { symPnlChart.destroy();        symPnlChart        = null; }
   if (histChart)          { histChart.destroy();          histChart          = null; }
   if (sharpeSeriesChart)  { sharpeSeriesChart.destroy();  sharpeSeriesChart  = null; }
+  if (hoursChart)         { hoursChart.destroy();         hoursChart         = null; }
   if (weeklyPnlChartInst) { weeklyPnlChartInst.destroy(); weeklyPnlChartInst = null; }
   if (dailyTradesChartInst){dailyTradesChartInst.destroy();dailyTradesChartInst=null;}
   if (monthlyPnlChart)    { monthlyPnlChart.destroy();    monthlyPnlChart    = null; }
@@ -586,6 +588,15 @@ function setTab(tab) {
     // render anyway: a null st shows the placeholder instead of a blank panel.
     const addr = curWallet();
     safeRender('decision widget', () => renderDecisionWidget(addr ? (statsCache[addr] || null) : null, addr));
+    if (addr && !statsCache[addr]) loadStats(addr);
+  }
+  // Same synchronous-render-from-cache treatment for the tearsheet: without
+  // this the tab can sit on the "Select a wallet" placeholder for up to 25s
+  // after page load (until the periodic stats refresh fires) even though a
+  // wallet is already selected — seen in visual QA.
+  if (tab === 'tearsheet' && !compareMode) {
+    const addr = curWallet();
+    if (addr) statsCache[addr] ? renderStats(statsCache[addr]) : loadStats(addr);
   }
 }
 
@@ -1280,8 +1291,8 @@ function _renderStatsImpl(st) {
   const monthlyPnl       = st.monthly_pnl           || [];
   const weeklyPnl        = st.weekly_pnl            || [];
   const dailyTradeCounts = st.daily_trade_counts    || [];
-  const topAssets        = st.top_assets             || [];
   const symbolStats      = st.symbol_stats           || [];
+  const hourlyActivity   = st.hourly_activity        || [];
   const rollingWinrate   = st.rolling_winrate        || [];
   const symbolPnl      = st.symbol_pnl       || [];
   const pnlHistogram   = st.pnl_histogram    || [];
@@ -1292,6 +1303,7 @@ function _renderStatsImpl(st) {
   if (symPnlChart)      { symPnlChart.destroy();      symPnlChart      = null; }
   if (histChart)        { histChart.destroy();        histChart        = null; }
   if (sharpeSeriesChart){ sharpeSeriesChart.destroy();sharpeSeriesChart= null; }
+  if (hoursChart)       { hoursChart.destroy();       hoursChart       = null; }
   if (monthlyPnlChart)  { monthlyPnlChart.destroy();  monthlyPnlChart  = null; }
 
   el.innerHTML = `
@@ -1461,32 +1473,11 @@ function _renderStatsImpl(st) {
 
     ${symbolStats.length ? `
     <div class="stat-section full">
-      <div class="stat-section-title">Per-Symbol Win Rate</div>
-      <table style="width:100%;border-collapse:collapse;font-size:12px">
-        <thead><tr style="color:var(--t3);text-align:left">
-          <th style="padding:4px 6px">Symbol</th><th>Trades</th><th>W/L</th><th>Win%</th><th style="text-align:right">PnL</th>
-        </tr></thead>
-        <tbody>${symbolStats.map(s=>`<tr style="border-top:1px solid var(--hr)">
-          <td style="padding:5px 6px;font-weight:600">${s.symbol}</td>
-          <td class="mono">${s.count}</td>
-          <td class="mono" style="color:var(--t3)">${s.wins}/${s.losses}</td>
-          <td class="mono" style="color:${s.win_rate>=50?'var(--green)':'var(--red)'}">${s.win_rate!=null?s.win_rate+'%':'—'}</td>
-          <td class="mono" style="text-align:right;color:${s.pnl>=0?'var(--green)':'var(--red)'}">${fUsd(s.pnl)}</td>
-        </tr>`).join('')}</tbody>
-      </table>
+      <div class="stat-section-title">Asset Breakdown — Most Traded</div>
+      <div id="asset-tbl-wrap" style="overflow-x:auto"></div>
     </div>` : ''}
 
-    ${topAssets.length ? `
-    <div class="top-assets-section">
-      <div class="stat-section-title">Top Assets</div>
-      <div class="top-assets-list">${topAssets.map(a=>`
-        <div class="ta-row">
-          <span class="ta-sym">${a.symbol}</span>
-          <span class="ta-cnt">${a.count} trades</span>
-          <span class="ta-notional">${fUsd(a.notional)}</span>
-        </div>`).join('')}
-      </div>
-    </div>` : ''}
+    ${_directionSectionHtml(st.direction_stats)}
 
     ${pnlByDay.length >= 3 ? `
     <div class="pnl-chart-section">
@@ -1530,6 +1521,12 @@ function _renderStatsImpl(st) {
       <div class="pnl-chart-wrap" style="height:90px"><canvas id="sharpe-ts-chart"></canvas></div>
     </div>` : ''}
 
+    ${hourlyActivity.length ? `
+    <div class="pnl-chart-section">
+      <div class="stat-section-title" title="Closed trades per UTC hour of day — when is this trader active, and which hours make or lose money">Trading Hours (UTC)</div>
+      <div class="pnl-chart-wrap" style="height:90px"><canvas id="hours-chart"></canvas></div>
+    </div>` : ''}
+
     ${symbolPnl.length ? `
     <div class="pnl-chart-section">
       <div class="stat-section-title">Symbol PnL Breakdown</div>
@@ -1551,6 +1548,8 @@ function _renderStatsImpl(st) {
   if (rollingSharp.length)          safeRender('rolling Sharpe', () => renderSharpSeriesChart(rollingSharp));
   if (symbolPnl.length)             safeRender('symbol PnL', () => renderSymPnlChart(symbolPnl));
   if (pnlHistogram.length)          safeRender('PnL histogram', () => renderHistChart(pnlHistogram));
+  if (symbolStats.length)           { _assetItems = symbolStats; safeRender('asset table', renderAssetTable); }
+  if (hourlyActivity.length)        safeRender('trading hours', () => renderHoursChart(hourlyActivity));
 
   safeRender('decision widget', () => renderDecisionWidget(st, addr));
 }
@@ -1665,6 +1664,7 @@ function _renderComparePanelImpl() {
     const body = document.getElementById('cmp-modal-body');
     if (cmpTab === 'leaderboard')      renderLeaderboardInto(body);
     else if (cmpTab === 'stats')       renderStatsTableInto(body);
+    else if (cmpTab === 'assets')      renderAssetsInto(body);
     else if (cmpTab === 'correlation') renderCorrelationInto(body);
     else if (cmpTab === 'decision')    renderDecisionTabInto(body);
   }
@@ -1754,11 +1754,12 @@ function setCmpTab(tab) {
 function openCmpModal(tab) {
   const modal = document.getElementById('cmp-modal');
   const body  = document.getElementById('cmp-modal-body');
-  const titles = { leaderboard: 'Leaderboard', stats: 'Side-by-Side Stats', correlation: 'Return Correlation Matrix', decision: '2-Week Evaluation — Decision Sheet' };
+  const titles = { leaderboard: 'Leaderboard', stats: 'Side-by-Side Stats', assets: 'Combined Asset Breakdown', correlation: 'Return Correlation Matrix', decision: '2-Week Evaluation — Decision Sheet' };
   document.getElementById('cmp-modal-title').textContent = titles[tab] || 'Compare';
   softSwap(body, () => {
     if (tab === 'leaderboard')      renderLeaderboardInto(body);
     else if (tab === 'stats')       renderStatsTableInto(body);
+    else if (tab === 'assets')      renderAssetsInto(body);
     else if (tab === 'correlation') renderCorrelationInto(body);
     else if (tab === 'decision')    renderDecisionTabInto(body);
   });
@@ -2308,6 +2309,203 @@ function renderHistChart(data) {
       }
     }
   });
+}
+
+// ── Asset breakdown (per-symbol table + long/short + trading hours) ────────
+// Compact $ formatter for volume cells — full 2-decimal fUsd is too wide here.
+const fUsdK = n => n == null ? '—'
+  : Math.abs(n) >= 1e6 ? (n<0?'-$':'$') + (Math.abs(n)/1e6).toFixed(2) + 'M'
+  : Math.abs(n) >= 1e4 ? (n<0?'-$':'$') + (Math.abs(n)/1e3).toFixed(1) + 'K'
+  : fUsd(n);
+
+let _assetItems    = [];                       // last-rendered single-wallet symbol_stats
+let assetSort      = { key: 'volume', dir: -1 };
+let cmpAssetSort   = { key: 'volume', dir: -1 };
+
+// One table builder for both the single-wallet tearsheet section and the
+// compare-mode "Assets" modal — identical columns, compare adds a Wallets col.
+function _assetTableHtml(items, sortState, sortFnName, showWallets) {
+  const maxVol = Math.max(...items.map(s => s.volume || 0), 1);
+  const sorted = [...items].sort((a, b) => {
+    const va = a[sortState.key] ?? -Infinity, vb = b[sortState.key] ?? -Infinity;
+    // dir -1 = descending: dir*(va-vb) = vb-va → bigger first (leaderboard convention)
+    return sortState.dir * (va - vb) || (b.volume || 0) - (a.volume || 0);
+  });
+  const arrow = k => sortState.key === k ? (sortState.dir < 0 ? ' ▼' : ' ▲') : '';
+  const th = (k, lbl, tip) =>
+    `<th class="sortable" onclick="${sortFnName}('${k}')"${tip ? ` title="${tip}"` : ''}>${lbl}${arrow(k)}</th>`;
+  const rows = sorted.map(s => {
+    const wrCol  = s.win_rate == null ? 'var(--t2)' : s.win_rate >= 50 ? 'var(--green)' : 'var(--red)';
+    const pnlCol = s.pnl > 0 ? 'var(--green)' : s.pnl < 0 ? 'var(--red)' : 'var(--t2)';
+    const avgCol = s.avg_pnl == null ? 'var(--t2)' : s.avg_pnl >= 0 ? 'var(--green)' : 'var(--red)';
+    const lp     = s.long_pct;
+    const lsMix  = lp == null ? '—'
+      : `<span class="ls-mix" title="${lp}% of fills long / ${(100-lp).toFixed(1)}% short">
+           <i style="width:${lp}%;background:var(--green)"></i><i style="width:${100-lp}%;background:var(--red)"></i>
+         </span>`;
+    return `<tr>
+      <td class="pc-sym">${s.symbol}</td>
+      <td class="mono"><span class="vol-bar"><i style="width:${Math.max(2, s.volume / maxVol * 100).toFixed(0)}%"></i></span> ${fUsdK(s.volume)}</td>
+      <td class="mono">${s.fills ?? '—'}</td>
+      <td class="mono">${s.count}</td>
+      ${showWallets ? `<td class="mono">${s.wallets}</td>` : ''}
+      <td class="mono" style="color:var(--t3)">${s.wins}/${s.losses}</td>
+      <td class="mono" style="color:${wrCol}">${s.win_rate != null ? s.win_rate + '%' : '—'}</td>
+      <td class="mono" style="color:${pnlCol}">${s.pnl >= 0 ? '+' : ''}${fPnl(s.pnl)}</td>
+      <td class="mono" style="color:${avgCol}">${s.avg_pnl != null ? (s.avg_pnl >= 0 ? '+' : '') + fPnl(s.avg_pnl) : '—'}</td>
+      <td>${lsMix}</td>
+    </tr>`;
+  }).join('');
+  return `<table class="ftbl atbl" style="min-width:${showWallets ? 720 : 660}px"><thead><tr>
+    <th>Symbol</th>
+    ${th('volume', 'Volume', 'Total traded notional (every fill)')}
+    ${th('fills', 'Fills', 'Every copied fill, including opens/adds')}
+    ${th('count', 'Trades', 'Completed round-trips (closed with a PnL)')}
+    ${showWallets ? th('wallets', 'Wallets', 'How many compared wallets traded this asset') : ''}
+    <th title="Wins / losses across closed round-trips">W/L</th>
+    ${th('win_rate', 'Win%')}
+    ${th('pnl', 'PnL', 'Total realized PnL on this asset')}
+    ${th('avg_pnl', 'Avg', 'Average realized PnL per round-trip')}
+    <th title="Share of fills that were long (green) vs short (red)">L/S</th>
+  </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderAssetTable() {
+  const w = document.getElementById('asset-tbl-wrap');
+  if (w && _assetItems.length) w.innerHTML = _assetTableHtml(_assetItems, assetSort, 'sortAssets', false);
+}
+function sortAssets(key) {
+  if (assetSort.key === key) assetSort.dir *= -1; else assetSort = { key, dir: -1 };
+  renderAssetTable();
+}
+function sortCmpAssets(key) {
+  if (cmpAssetSort.key === key) cmpAssetSort.dir *= -1; else cmpAssetSort = { key, dir: -1 };
+  const body = document.getElementById('cmp-modal-body');
+  if (body) renderAssetsInto(body);
+}
+
+// Long vs Short breakdown — tearsheet section (single wallet) and, via the
+// second parameter, the summary strip on the compare Assets modal.
+function _directionSectionHtml(dirSt, bare=false) {
+  if (!dirSt || (!dirSt.long?.count && !dirSt.short?.count)) return '';
+  const row = (lbl, d, tagCls) => {
+    const wrCol  = d.win_rate == null ? 'var(--t2)' : d.win_rate >= 50 ? 'var(--green)' : 'var(--red)';
+    const pnlCol = d.pnl > 0 ? 'var(--green)' : d.pnl < 0 ? 'var(--red)' : 'var(--t2)';
+    return `<div class="stat-row">
+      <span class="stat-lbl"><span class="side-tag ${tagCls}">${lbl}</span></span>
+      <span class="stat-val mono">
+        <span style="color:var(--t2)">${d.count} trades</span> ·
+        <span style="color:var(--t3)">${d.wins}W/${d.losses}L</span> ·
+        <span style="color:${wrCol}">${d.win_rate != null ? d.win_rate + '%' : '—'}</span> ·
+        <span style="color:${pnlCol}">${d.pnl >= 0 ? '+' : ''}${fPnl(d.pnl)}</span>
+      </span>
+    </div>`;
+  };
+  const total = (dirSt.long?.count || 0) + (dirSt.short?.count || 0);
+  const longShare = total ? (dirSt.long.count / total * 100) : 50;
+  const inner = `
+    <div class="stat-grid">
+      ${row('Long',  dirSt.long,  'long')}
+      ${row('Short', dirSt.short, 'short')}
+    </div>
+    <div class="db-bar" style="margin-top:10px" title="${longShare.toFixed(0)}% of closed trades were longs">
+      <div class="db-bar-long" style="width:${longShare}%"></div>
+      <div class="db-bar-short" style="width:${100-longShare}%"></div>
+    </div>`;
+  return bare ? inner : `
+    <div class="stat-section">
+      <div class="stat-section-title" title="Closed round-trips split by position direction — does this trader make money on both sides?">Long vs Short</div>
+      ${inner}
+    </div>`;
+}
+
+function renderHoursChart(data) {
+  const ctx = document.getElementById('hours-chart');
+  if (!ctx) return;
+  if (hoursChart) { hoursChart.destroy(); hoursChart = null; }
+  const c = chartColors();
+  hoursChart = new Chart(ctx.getContext('2d'), {
+    type: 'bar',
+    data: {
+      labels: data.map(d => String(d.hour).padStart(2, '0')),
+      datasets: [{ data: data.map(d => d.count),
+        backgroundColor: data.map(d =>
+          d.count === 0 ? 'transparent'
+          : d.pnl > 0 ? 'rgba(22,199,132,0.65)'
+          : d.pnl < 0 ? 'rgba(240,80,106,0.65)'
+          : 'rgba(124,108,255,0.6)'),
+        borderRadius: 2 }]
+    },
+    options: {
+      animation:false, responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{display:false}, tooltip:{ backgroundColor:c.s1, borderColor:c.hr,
+        borderWidth:1, titleColor:c.t1, bodyColor:c.t2,
+        callbacks:{
+          title: items => `${items[0].label}:00–${items[0].label}:59 UTC`,
+          label: item => {
+            const d = data[item.dataIndex];
+            return ` ${d.count} trade${d.count!==1?'s':''} · ${d.pnl>=0?'+':''}${fUsd(d.pnl)}`;
+          } } }},
+      scales:{
+        x:{ ticks:{color:c.t3,font:{size:8},maxTicksLimit:24,autoSkip:false}, grid:{display:false}, border:{color:c.hr} },
+        y:{ ticks:{color:c.t3,font:{size:9},precision:0}, grid:{color:c.hr+'66'}, border:{color:c.hr} }
+      }
+    }
+  });
+}
+
+// Compare mode — combined asset breakdown across all selected wallets.
+function renderAssetsInto(el) {
+  const addrs = [...compareSelection].filter(a => statsCache[a]);
+  const agg = {};
+  addrs.forEach(a => (statsCache[a]?.symbol_stats || []).forEach(s => {
+    const t = agg[s.symbol] = agg[s.symbol] ||
+      { symbol: s.symbol, fills: 0, count: 0, wins: 0, losses: 0, pnl: 0, volume: 0, wallets: 0, _lf: 0 };
+    t.fills  += s.fills  || 0;
+    t.count  += s.count  || 0;
+    t.wins   += s.wins   || 0;
+    t.losses += s.losses || 0;
+    t.pnl    += s.pnl    || 0;
+    t.volume += s.volume || 0;
+    t.wallets++;
+    if (s.long_pct != null) t._lf += s.long_pct / 100 * (s.fills || 0);
+  }));
+  const items = Object.values(agg).map(t => ({ ...t,
+    pnl:      +t.pnl.toFixed(2),
+    volume:   +t.volume.toFixed(2),
+    win_rate: t.count ? +(t.wins / t.count * 100).toFixed(1) : null,
+    avg_pnl:  t.count ? t.pnl / t.count : null,
+    long_pct: t.fills ? +(t._lf / t.fills * 100).toFixed(1) : null,
+  }));
+
+  // Combined long/short summary across all selected wallets
+  const dir = { long: {count:0, wins:0, losses:0, pnl:0}, short: {count:0, wins:0, losses:0, pnl:0} };
+  addrs.forEach(a => {
+    const d = statsCache[a]?.direction_stats;
+    if (!d) return;
+    ['long', 'short'].forEach(k => {
+      dir[k].count  += d[k]?.count  || 0;
+      dir[k].wins   += d[k]?.wins   || 0;
+      dir[k].losses += d[k]?.losses || 0;
+      dir[k].pnl    += d[k]?.pnl    || 0;
+    });
+  });
+  ['long', 'short'].forEach(k => {
+    dir[k].win_rate = dir[k].count ? +(dir[k].wins / dir[k].count * 100).toFixed(1) : null;
+    dir[k].pnl = +dir[k].pnl.toFixed(2);
+  });
+
+  if (!items.length) {
+    el.innerHTML = '<div class="no-stats">No closed trades yet — the combined asset breakdown appears once the compared wallets complete round-trips.</div>';
+    return;
+  }
+  const dirHtml = _directionSectionHtml(dir, true);
+  el.innerHTML = `
+    ${dirHtml ? `<div style="max-width:520px;margin-bottom:14px">
+      <div class="stat-section-title">Combined Long vs Short</div>${dirHtml}</div>` : ''}
+    <div class="stat-section-title">Most Traded Assets — All Selected Wallets</div>
+    <div style="overflow-x:auto">${_assetTableHtml(items, cmpAssetSort, 'sortCmpAssets', true)}</div>
+    <div style="font-size:10px;color:var(--t3);padding-top:8px">Aggregated across ${addrs.length} wallet${addrs.length!==1?'s':''} · Volume counts every fill; W/L and PnL only completed round-trips.</div>`;
 }
 
 // ── Data loading ───────────────────────────────────────────────────────────
@@ -2865,9 +3063,9 @@ socket.on('wallet_removed', d => {
   if (compareMode) renderComparePanel();
   if (wasActive) {
     // Clear all tearsheet charts and load next wallet's stats
-    [pnlChart, winRateChart, symPnlChart, histChart, sharpeSeriesChart, underwaterChart]
+    [pnlChart, winRateChart, symPnlChart, histChart, sharpeSeriesChart, hoursChart, underwaterChart]
       .forEach(c => { if (c) c.destroy(); });
-    pnlChart = winRateChart = symPnlChart = histChart = sharpeSeriesChart = underwaterChart = null;
+    pnlChart = winRateChart = symPnlChart = histChart = sharpeSeriesChart = hoursChart = underwaterChart = null;
     document.getElementById('stats-title').textContent = 'Tearsheet';
     document.getElementById('stats-content').innerHTML = activeWallet
       ? '<div class="no-stats">Loading…</div>'
@@ -2883,9 +3081,9 @@ socket.on('clear', async d => {
 
   // Destroy all chart instances so stale data never bleeds through after a reset
   function _destroyCharts() {
-    [pnlChart, winRateChart, symPnlChart, histChart, sharpeSeriesChart, underwaterChart]
+    [pnlChart, winRateChart, symPnlChart, histChart, sharpeSeriesChart, hoursChart, underwaterChart]
       .forEach(c => { if (c) c.destroy(); });
-    pnlChart = winRateChart = symPnlChart = histChart = sharpeSeriesChart = underwaterChart = null;
+    pnlChart = winRateChart = symPnlChart = histChart = sharpeSeriesChart = hoursChart = underwaterChart = null;
   }
 
   if (addr && state[addr]) {

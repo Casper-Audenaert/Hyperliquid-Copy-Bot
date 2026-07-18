@@ -3,7 +3,7 @@ Advanced stats computed from TradeRecord + EquitySnapshot tables.
 All helpers are pure functions over lists — easy to test.
 """
 import statistics
-from collections import defaultdict, Counter
+from collections import defaultdict
 from datetime import date, datetime, timedelta
 
 from loguru import logger
@@ -199,14 +199,6 @@ def _activity_stats(trades: list, open_positions: dict) -> dict:
         else:
             cur = 0
 
-    # Top assets by trade count
-    asset_counts   = Counter(t.symbol for t in trades)
-    asset_notional = defaultdict(float)
-    for t in trades:
-        asset_notional[t.symbol] += t.notional or 0
-    top_assets = [{"symbol": s, "count": c, "notional": round(asset_notional[s], 2)}
-                  for s, c in asset_counts.most_common(5)]
-
     # Average leverage
     levs = [t.leverage for t in trades if t.leverage]
     avg_leverage = round(sum(levs) / len(levs), 1) if levs else 0
@@ -246,7 +238,6 @@ def _activity_stats(trades: list, open_positions: dict) -> dict:
         worst_week           = worst_week,
         max_loss_streak_days = max_loss_streak_days,
         monthly_pnl          = monthly_pnl,
-        top_assets           = top_assets,
         avg_leverage         = avg_leverage,
         longest_win_streak   = best_streak,
         longest_loss_streak  = best_loss_streak,
@@ -277,29 +268,69 @@ def _rolling_winrate(trades: list, window: int = 50) -> list:
 
 
 def _symbol_stats(trades: list) -> list:
-    """Per-symbol breakdown: PnL, trade count, win rate. Sorted by |PnL| desc, max 15."""
-    pnl_map:  dict = defaultdict(float)
-    wins_map: dict = defaultdict(int)
-    cnt_map:  dict = defaultdict(int)
+    """Per-symbol breakdown: volume, fills, closed count, W/L, win rate, PnL,
+    avg PnL, long share. Sorted by volume desc (most traded first), max 30.
+    Volume/fills count every fill; W/L/PnL only closed round-trips."""
+    agg: dict = {}
     for t in trades:
+        a = agg.setdefault(t.symbol, {"fills": 0, "volume": 0.0, "count": 0,
+                                      "wins": 0, "pnl": 0.0, "long_fills": 0})
+        a["fills"]  += 1
+        a["volume"] += t.notional or 0
+        if (t.side or "").upper() == "LONG":
+            a["long_fills"] += 1
         if t.realized_pnl is not None:
-            pnl_map[t.symbol]  += t.realized_pnl
-            cnt_map[t.symbol]  += 1
+            a["count"] += 1
+            a["pnl"]   += t.realized_pnl
             if t.realized_pnl > 0:
-                wins_map[t.symbol] += 1
+                a["wins"] += 1
     items = []
-    for sym, pnl in pnl_map.items():
-        n   = cnt_map[sym]
-        w   = wins_map[sym]
+    for sym, a in agg.items():
+        n = a["count"]
         items.append({
             "symbol":   sym,
-            "pnl":      round(pnl, 2),
+            "pnl":      round(a["pnl"], 2),
             "count":    n,
-            "wins":     w,
-            "losses":   n - w,
-            "win_rate": round(w / n * 100, 1) if n else None,
+            "fills":    a["fills"],
+            "wins":     a["wins"],
+            "losses":   n - a["wins"],
+            "win_rate": round(a["wins"] / n * 100, 1) if n else None,
+            "avg_pnl":  round(a["pnl"] / n, 2) if n else None,
+            "volume":   round(a["volume"], 2),
+            "long_pct": round(a["long_fills"] / a["fills"] * 100, 1) if a["fills"] else None,
         })
-    return sorted(items, key=lambda x: abs(x["pnl"]), reverse=True)[:15]
+    return sorted(items, key=lambda x: x["volume"], reverse=True)[:30]
+
+
+def _direction_stats(trades: list) -> dict:
+    """Long vs short: closed count, win rate, total PnL per direction.
+    Side on a closed row is the position side (PnL lands on the open fill)."""
+    out = {}
+    for side in ("LONG", "SHORT"):
+        pnls = [t.realized_pnl for t in trades
+                if (t.side or "").upper() == side and t.realized_pnl is not None]
+        wins = sum(1 for p in pnls if p > 0)
+        out[side.lower()] = {
+            "count":    len(pnls),
+            "wins":     wins,
+            "losses":   len(pnls) - wins,
+            "win_rate": round(wins / len(pnls) * 100, 1) if pnls else None,
+            "pnl":      round(sum(pnls), 2),
+        }
+    return out
+
+
+def _hourly_activity(trades: list) -> list:
+    """Closed-trade count + PnL per UTC hour-of-day — when does this trader act?"""
+    hours = [{"hour": h, "count": 0, "pnl": 0.0} for h in range(24)]
+    for t in trades:
+        if t.timestamp and t.realized_pnl is not None:
+            b = hours[t.timestamp.hour]
+            b["count"] += 1
+            b["pnl"]   += t.realized_pnl
+    for b in hours:
+        b["pnl"] = round(b["pnl"], 2)
+    return hours if any(b["count"] for b in hours) else []
 
 
 def _pnl_histogram(closed_pnls: list, buckets: int = 20) -> list:
@@ -565,6 +596,8 @@ def compute_stats(wallet_addr: str, open_positions: dict = None, copy_ratio: flo
         n_closed, sample_confidence, pnl_trend,
     )
 
+    sym_st = _symbol_stats(live_trades)
+
     return {
         **win_st,
         **profit_st,
@@ -574,8 +607,12 @@ def compute_stats(wallet_addr: str, open_positions: dict = None, copy_ratio: flo
         "calmar":             calmar,
         "annualized_return":  annualized_return,
         "rolling_winrate":    _rolling_winrate(live_trades),
-        "symbol_stats":       _symbol_stats(live_trades),
-        "symbol_pnl":         [{"symbol": s["symbol"], "pnl": s["pnl"], "count": s["count"]} for s in _symbol_stats(live_trades)],
+        "symbol_stats":       sym_st,
+        # Chart wants the biggest PnL movers, not the biggest volume — top 15 by |PnL|
+        "symbol_pnl":         [{"symbol": s["symbol"], "pnl": s["pnl"], "count": s["count"]}
+                               for s in sorted(sym_st, key=lambda x: abs(x["pnl"]), reverse=True)[:15]],
+        "direction_stats":    _direction_stats(live_trades),
+        "hourly_activity":    _hourly_activity(live_trades),
         "pnl_histogram":      _pnl_histogram(closed_pnls),
         "max_drawdown_duration_days": _drawdown_duration(equity_rows),
         "rolling_sharpe":     rolling_sharpe,
@@ -641,5 +678,25 @@ if __name__ == "__main__":
     act = _activity_stats(mock_trades, {})
     assert act["longest_win_streak"] == 2, f"streak: {act['longest_win_streak']}"
     assert len(act["pnl_by_day"]) == 4,   f"pnl_by_day: {act['pnl_by_day']}"
+
+    # Symbol / direction / hourly breakdowns
+    FT2 = namedtuple("FT2", ["realized_pnl", "symbol", "side", "notional", "timestamp"])
+    mock2 = [FT2(50,  "BTC", "LONG",  500, datetime(2024,1,1,9)),   # BTC long win
+             FT2(None,"BTC", "LONG",  500, datetime(2024,1,1,9)),   # BTC open fill (no pnl)
+             FT2(-20, "BTC", "SHORT", 200, datetime(2024,1,1,14)),  # BTC short loss
+             FT2(30,  "ETH", "LONG",  300, datetime(2024,1,2,9))]   # ETH long win
+    ss = _symbol_stats(mock2)
+    btc = next(s for s in ss if s["symbol"] == "BTC")
+    assert ss[0]["symbol"] == "BTC",  f"volume sort: {ss[0]}"      # $1200 > $300
+    assert btc["fills"] == 3 and btc["count"] == 2, f"btc counts: {btc}"
+    assert btc["wins"] == 1 and btc["losses"] == 1, f"btc W/L: {btc}"
+    assert btc["volume"] == 1200.0,   f"btc volume: {btc}"
+    assert btc["avg_pnl"] == 15.0,    f"btc avg: {btc}"
+    ds = _direction_stats(mock2)
+    assert ds["long"]["count"] == 2 and ds["long"]["wins"] == 2, f"long: {ds}"
+    assert ds["short"]["count"] == 1 and ds["short"]["pnl"] == -20.0, f"short: {ds}"
+    ha = _hourly_activity(mock2)
+    assert ha[9]["count"] == 2 and ha[9]["pnl"] == 80.0, f"hour 9: {ha[9]}"
+    assert ha[14]["count"] == 1, f"hour 14: {ha[14]}"
 
     logger.info("PASS: stats.py self-check passed")

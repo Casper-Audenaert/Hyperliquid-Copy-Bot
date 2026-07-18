@@ -153,18 +153,25 @@ header{
 /* Wallet cards */
 .wcard{
   border:1px solid var(--hr);border-radius:var(--r);background:var(--s2);
-  cursor:pointer;position:relative;box-shadow:0 0 0 0 transparent;
+  cursor:pointer;position:relative;overflow:hidden;box-shadow:0 0 0 0 transparent;
   transition:border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease),
              opacity var(--dur-med) var(--ease), box-shadow var(--dur-fast) var(--ease);
 }
 .wcard:hover{border-color:rgba(255,255,255,.15);box-shadow:var(--sh-hover)}
 .wcard.sel{border-color:var(--brand-b);background:var(--brand-a);box-shadow:var(--sh-selected)}
 .wcard-inner{padding:10px 11px}
-.wc-header{display:flex;align-items:center;gap:6px;margin-bottom:4px}
+/* Header: the action buttons are pinned top-right OUT of the flex flow
+   (padding-right reserves their zone), the name never shrinks below 40px,
+   and badges wrap to a second line when a card carries all three pills —
+   previously the fixed content (~229px) exceeded the card's inner width
+   (~199px), crushing the label and shoving the buttons into the edge. */
+.wc-header{display:flex;align-items:center;gap:6px;row-gap:3px;flex-wrap:wrap;
+  margin-bottom:4px;padding-right:58px;min-height:26px}
 .wc-rank{font-size:9px;font-weight:700;color:var(--t3);font-family:var(--mono);width:14px;flex-shrink:0}
 .wc-dot{width:6px;height:6px;border-radius:50%;background:var(--green);flex-shrink:0}
-.wc-name{font-weight:600;font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.wc-actions{display:flex;gap:5px;opacity:.75;transition:opacity var(--dur-fast) var(--ease);flex-shrink:0}
+.wc-name{font-weight:600;font-size:12px;flex:1;min-width:40px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wc-actions{display:flex;gap:5px;opacity:.75;transition:opacity var(--dur-fast) var(--ease);flex-shrink:0;
+  position:absolute;top:9px;right:10px}
 .wcard:hover .wc-actions{opacity:1}
 .wc-act-btn{
   width:26px;height:26px;border-radius:5px;border:1px solid var(--hr);
@@ -378,16 +385,13 @@ header{
 }
 .pnl-chart-wrap{height:120px;position:relative;margin-top:8px}
 
-.top-assets-section{
-  background:var(--s2);border:1px solid var(--hr);border-radius:var(--r2);
-  padding:var(--sp-md) var(--sp-lg)
-}
-.top-assets-list{display:flex;flex-direction:column;margin-top:8px}
-.ta-row{display:flex;align-items:center;gap:10px;padding:5px 0;border-bottom:1px solid var(--hr)}
-.ta-row:last-child{border-bottom:none}
-.ta-sym{font-weight:700;font-family:var(--mono);font-size:12px;min-width:60px;flex-shrink:0}
-.ta-cnt{color:var(--t2);font-size:11px;flex:1;white-space:nowrap}
-.ta-notional{font-family:var(--mono);font-size:11px;color:var(--t2);white-space:nowrap}
+/* ── Asset breakdown table (tearsheet + compare Assets modal) ── */
+.atbl th.sortable{cursor:pointer;user-select:none}
+.atbl th.sortable:hover{color:var(--t1)}
+.vol-bar{width:56px;height:4px;border-radius:2px;background:var(--s3);display:inline-block;vertical-align:middle;margin-right:5px}
+.vol-bar>i{display:block;height:100%;border-radius:2px;background:var(--brand)}
+.ls-mix{display:inline-flex;width:44px;height:4px;border-radius:2px;overflow:hidden;background:var(--s3);vertical-align:middle}
+.ls-mix>i{height:100%}
 
 /* ── Positions — dense table (Hyperdash-style), reuses .ftbl's table chrome ── */
 .pos-scroll{flex:1;overflow-y:auto;min-height:0}
@@ -900,6 +904,7 @@ header{
         <div id="cmp-tabs">
           <button class="cmp-tab" data-tab="leaderboard" onclick="setCmpTab('leaderboard')">Leaderboard</button>
           <button class="cmp-tab"    data-tab="stats"        onclick="setCmpTab('stats')">Stats</button>
+          <button class="cmp-tab"    data-tab="assets"       onclick="setCmpTab('assets')">Assets</button>
           <button class="cmp-tab"    data-tab="correlation"  onclick="setCmpTab('correlation')">Correlation</button>
           <button class="cmp-tab"    data-tab="decision"     onclick="setCmpTab('decision')">🎯 Decision</button>
         </div>
