@@ -394,7 +394,17 @@ def _session_to_dict(s: WalletSession, price_override: dict | None = None) -> di
         target_size = _target_sizes.get(sym)
         if target_size and target_size > 0 and size > 0:
             expected_size = target_size * pos.get("copy_ratio", s.copy_ratio)
-            sync_pct = round(min(size, expected_size) / max(size, expected_size) * 100, 1) \
+            # Ours = flushed position + same-side pending dust: at tiny copy
+            # ratios a position is born from its first ~$10 flush while the
+            # rest of the copied intent still sits sub-$10 in pending_dust —
+            # comparing the flushed sliver alone against the target's FULL
+            # position read 0.8-1.5% live and flagged a faithfully-tracking
+            # mirror as desynced. The buffer is captured intent, not a miss.
+            _buf = s.pending_dust.get(sym)
+            eff_size = size
+            if _buf and _buf.get("side", "").lower() == pos.get("side", "").lower():
+                eff_size += abs(_buf.get("size", 0.0))
+            sync_pct = round(min(eff_size, expected_size) / max(eff_size, expected_size) * 100, 1) \
                 if expected_size > 0 else None
         else:
             sync_pct = None
