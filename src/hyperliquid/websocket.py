@@ -1,10 +1,42 @@
 import asyncio
 import json
+import random
+import time
 import websockets
 from typing import Optional, Callable, Dict, Any, List
 from datetime import datetime
 from loguru import logger
 from .models import WebSocketUpdate
+
+
+# Module-level so ALL pooled connections' reconnect handlers share one global
+# stagger slot, not just handlers within a single connection. An IP-wide
+# network blip reconnects every connection in the pool at roughly the same
+# instant; _run_reconnect_handlers already staggers handlers *within* one
+# connection (its own 0.5s per-handler sleep below), but at 14 wallets each
+# connection typically has exactly one handler, so a same-instant reconnect
+# fired ~14 REST-replay bursts simultaneously with no cross-connection
+# coordination. This self-resetting slot scheduler mirrors web_app.py's
+# _next_start_offset pattern.
+_replay_last_scheduled_time = 0.0
+_replay_stagger_lock: Optional[asyncio.Lock] = None
+_REPLAY_STAGGER_SECS = 1.5
+
+
+def _get_replay_stagger_lock() -> asyncio.Lock:
+    global _replay_stagger_lock
+    if _replay_stagger_lock is None:
+        _replay_stagger_lock = asyncio.Lock()
+    return _replay_stagger_lock
+
+
+async def _next_replay_offset() -> float:
+    global _replay_last_scheduled_time
+    async with _get_replay_stagger_lock():
+        now = time.monotonic()
+        next_time = max(now, _replay_last_scheduled_time + _REPLAY_STAGGER_SECS)
+        _replay_last_scheduled_time = next_time
+        return next_time - now
 
 
 class HyperliquidWebSocket:
@@ -21,9 +53,25 @@ class HyperliquidWebSocket:
         self.ws_url = ws_url
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.is_running = False
-        self.reconnect_delay = 5
+        # Exponential backoff (Hyperliquid's own guidance: automated clients
+        # should handle disconnects and reconnect gracefully, not hammer the
+        # endpoint on a fixed interval). Doubles on each consecutive failed
+        # reconnect attempt, capped, jittered ±20% so 14 pooled connections
+        # failing together don't all retry in lockstep; reset to the base
+        # delay the moment a connection succeeds.
+        self._reconnect_base_delay = 2.0
+        self._reconnect_max_delay = 60.0
+        self.reconnect_delay = self._reconnect_base_delay
         self.subscriptions: Dict[str, Any] = {}
         self.callbacks: Dict[str, Callable] = {}
+        # Wallet addresses assigned to this connection by the pool, reserved at
+        # ACQUIRE time (under the pool lock) rather than at subscribe time.
+        # BUG FIX: the pool previously counted only registered "user:" callbacks,
+        # which a monitor registers well after acquiring its connection (after
+        # awaited REST calls) — so two wallets added concurrently could both see
+        # the same connection as "free" and end up sharing it even below the
+        # connection cap, silently degrading their userEvents delivery.
+        self.reserved_users: set = set()
         self.heartbeat_task: Optional[asyncio.Task] = None
         self.heartbeat_interval = 55  # Send ping every 55s (server closes at 60s)
         # List of handlers — all are called on reconnect so every monitor can
@@ -38,6 +86,7 @@ class HyperliquidWebSocket:
             logger.info(f"Connecting to Hyperliquid WebSocket: {self.ws_url}")
             self.ws = await asyncio.wait_for(websockets.connect(self.ws_url), timeout=30)
             self.is_running = True
+            self.reconnect_delay = self._reconnect_base_delay  # backoff resets on success
             logger.info("WebSocket connected successfully")
 
             if self.heartbeat_task is None or self.heartbeat_task.done():
@@ -368,13 +417,29 @@ class HyperliquidWebSocket:
                     await self._handle_message(message)
 
             except websockets.exceptions.ConnectionClosed:
-                logger.warning(f"WS closed, reconnecting in {self.reconnect_delay}s…")
-                await asyncio.sleep(self.reconnect_delay)
+                await self._sleep_and_back_off("WS closed")
             except Exception as e:
-                logger.error(f"WS listener error: {e}")
-                await asyncio.sleep(self.reconnect_delay)
+                await self._sleep_and_back_off(f"WS listener error: {e}")
+
+    async def _sleep_and_back_off(self, reason: str):
+        """Exponential backoff with jitter: doubles self.reconnect_delay after
+        every consecutive failure (reset to base on the next successful
+        connect(), in connect() itself), capped at _reconnect_max_delay.
+        Jitter keeps 14 pooled connections that all failed together from
+        retrying in lockstep."""
+        delay = self.reconnect_delay * random.uniform(0.8, 1.2)
+        logger.warning(f"{reason}, reconnecting in {delay:.1f}s…")
+        await asyncio.sleep(delay)
+        self.reconnect_delay = min(self.reconnect_delay * 2, self._reconnect_max_delay)
 
     async def _run_reconnect_handlers(self, handlers: List[Callable]):
+        # Cross-connection stagger first: at 14 wallets each pooled connection
+        # typically carries exactly one handler, so the per-handler 0.5s sleep
+        # below (which staggers handlers WITHIN this one connection) does
+        # nothing to prevent 14 different connections all reconnecting from
+        # an IP-wide blip and firing their single handler in the same instant.
+        # This awaits a globally-coordinated slot shared by every connection.
+        await asyncio.sleep(await _next_replay_offset())
         for i, handler in enumerate(handlers):
             if i > 0:
                 await asyncio.sleep(0.5)

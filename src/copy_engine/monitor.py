@@ -1,5 +1,6 @@
 import asyncio
 import aiohttp
+import time
 from typing import Callable, Optional, List
 from loguru import logger
 from hyperliquid.client import HyperliquidClient, get_startup_sem
@@ -11,7 +12,8 @@ from hyperliquid.models import Position, Order, UserState, WebSocketUpdate, Posi
 # HL enforces 15 WS connections per IP.  All monitors share connections from
 # this pool rather than each opening their own.  Each WS handles unlimited
 # subscriptions, so in practice a single connection serves all wallets.
-_MAX_WS_CONNECTIONS = 14     # keep 1 slot free for other HL WS usage
+MAX_WALLETS = 14     # keep 1 slot free for other HL WS usage
+_REPLAY_FILL_CAP = 2000     # Hyperliquid userFills REST endpoint's own max return size
 _ws_pool: List[HyperliquidWebSocket] = []
 _ws_pool_lock: Optional[asyncio.Lock] = None   # lazily created in the asyncio loop
 
@@ -23,53 +25,156 @@ def _get_pool_lock() -> asyncio.Lock:
     return _ws_pool_lock
 
 
+# ── Spot symbol resolution ────────────────────────────────────────────────────
+# Hyperliquid spot fills report the pair as a bare index like "@180" instead of
+# a ticker for any pair that hasn't graduated to a "canonical" listing (most of
+# them — even fairly established tokens). Resolved once via spotMeta (the spot
+# universe changes rarely) and shared across every wallet, same single-flight-
+# cache shape as sim.py's mids/funding caches.
+_spot_symbol_map: Optional[dict] = None
+_spot_symbol_lock: Optional[asyncio.Lock] = None
+_spot_symbol_last_attempt: float = 0.0
+_SPOT_SYMBOL_RETRY_SECS = 300  # a failed fetch (e.g. rate-limited) retries at
+                                # most every 5min — never hammers an already-
+                                # rate-limited API once per "@N" fill
+
+
+def _get_spot_symbol_lock() -> asyncio.Lock:
+    global _spot_symbol_lock
+    if _spot_symbol_lock is None:
+        _spot_symbol_lock = asyncio.Lock()
+    return _spot_symbol_lock
+
+
+async def _resolve_spot_symbol(client: HyperliquidClient, coin: str) -> str:
+    """'@180' -> 'USDHL' (the pair's base asset name, via spotMeta). Falls
+    back to the raw '@N' on any fetch failure or unrecognized index — never
+    blocks or drops a fill over a display-name lookup.
+
+    BUG FIX: the first version of this cached a failed fetch the exact same
+    way as a successful-but-empty one (both left _spot_symbol_map as a plain
+    {}), so a single rate-limited attempt permanently disabled resolution
+    for the rest of the process's life — every "@N" fill silently checked
+    `if _spot_symbol_map is None` against an already-non-None empty dict and
+    never tried again. Now a failure leaves the cache as None (so a later
+    call retries) and only the timestamp throttles how often that retry can
+    fire, instead of a boolean-shaped "tried once, forever done" cache.
+    """
+    if not coin.startswith("@"):
+        return coin
+    global _spot_symbol_map, _spot_symbol_last_attempt
+    if _spot_symbol_map is None:
+        async with _get_spot_symbol_lock():
+            if _spot_symbol_map is None:
+                now = time.monotonic()
+                if now - _spot_symbol_last_attempt < _SPOT_SYMBOL_RETRY_SECS:
+                    return coin
+                _spot_symbol_last_attempt = now
+                meta = await client.get_spot_meta()  # already catches/logs its own errors, returns {} on failure
+                universe = meta.get("universe", [])
+                tokens = meta.get("tokens", [])
+                if universe and tokens:
+                    tok_by_idx = {t.get("index"): t.get("name") for t in tokens}
+                    _spot_symbol_map = {
+                        u["name"]: tok_by_idx.get(u["tokens"][0]) or u["name"]
+                        for u in universe
+                        if not u.get("isCanonical", True) and u.get("name", "").startswith("@")
+                    }
+                # else: leave as None — an empty/failed response retries after the throttle window
+    return (_spot_symbol_map or {}).get(coin, coin)
+
+
+def resolve_spot_symbol_display(coin: str) -> str:
+    """Sync, no-fetch counterpart to _resolve_spot_symbol — a best-effort cache
+    lookup only, for display contexts that can't await a fetch (e.g. serializing
+    a position that was restored from the DB with its original raw "@N" coin,
+    which predates this cache and will never see a fresh fill to trigger the
+    async resolver). Returns the raw "@N" untouched if the cache isn't populated
+    yet or doesn't have this index — never wrong, just occasionally unresolved,
+    same fallback contract as the async version. Does NOT touch the value used
+    as the actual position dict key, only what's shown to the caller."""
+    if not coin.startswith("@"):
+        return coin
+    return (_spot_symbol_map or {}).get(coin, coin)
+
+
 def _wallets_on(ws: HyperliquidWebSocket) -> int:
-    """Count distinct wallets already routed to this connection (by their
-    'user:' callback registration — subscribe_user_events registers this key
-    right after a monitor acquires its connection)."""
-    return sum(1 for k in ws.callbacks if k.startswith("user:"))
+    """Count distinct wallets assigned to this connection: those with a
+    registered 'user:' callback PLUS those reserved at acquire time but not
+    yet subscribed (subscribe_user_events runs after awaited REST calls, so
+    counting callbacks alone races concurrent wallet additions)."""
+    registered = {k.split(":", 1)[1] for k in ws.callbacks if k.startswith("user:")}
+    return len(registered | ws.reserved_users)
 
 
-async def _acquire_shared_ws(ws_url: str) -> HyperliquidWebSocket:
-    """Distribute wallets one-per-connection up to _MAX_WS_CONNECTIONS, then
+async def _acquire_shared_ws(ws_url: str, address: str) -> HyperliquidWebSocket:
+    """Distribute wallets one-per-connection up to MAX_WALLETS, then
     fall back to the least-loaded connection once the pool is full.
 
-    Previously this always returned _ws_pool[0] once the pool held anything
-    (`if _ws_pool: return min(...)` on a list that could never grow past its
-    first entry) — every wallet funneled onto ONE socket regardless of
-    _MAX_WS_CONNECTIONS, making it a single point of failure for the whole
-    deployment and, combined with the userEvents-contamination fix (which
-    only delivers unattributable messages when exactly one monitor shares a
-    connection), silently dropping ALL userEvents traffic once 2+ wallets
-    existed. See _periodic_state_refresh's REST-driven safety net below for
-    the position-close signal that dropping restores.
+    The wallet's address is RESERVED on the chosen connection here, inside the
+    pool lock, so a concurrently-added wallet can never pick the same
+    connection while this one is still working through its pre-subscribe
+    awaits. Guarantees one-wallet-per-connection whenever the pool has room.
     """
+    addr_lower = address.lower()
     async with _get_pool_lock():
         if _ws_pool:
             free = [w for w in _ws_pool if _wallets_on(w) == 0]
             if free:
+                free[0].reserved_users.add(addr_lower)
                 return free[0]
-            if len(_ws_pool) < _MAX_WS_CONNECTIONS:
+            if len(_ws_pool) < MAX_WALLETS:
                 ws = HyperliquidWebSocket(ws_url)
+                ws.reserved_users.add(addr_lower)
                 _ws_pool.append(ws)
                 return ws
-            return min(_ws_pool, key=_wallets_on)
+            ws = min(_ws_pool, key=_wallets_on)
+            ws.reserved_users.add(addr_lower)
+            logger.warning(
+                f"WS pool full ({len(_ws_pool)} connections) — {addr_lower[:10]}… "
+                f"SHARES a connection ({_wallets_on(ws)} wallets on it). "
+                f"userEvents position-close/leverage signals are degraded for these "
+                f"wallets; the periodic REST refresh is the fallback."
+            )
+            _alert_shared_connection(addr_lower, _wallets_on(ws))
+            return ws
 
         # Pool is empty — create the first shared connection
         ws = HyperliquidWebSocket(ws_url)
+        ws.reserved_users.add(addr_lower)
         _ws_pool.append(ws)
         return ws
 
 
+def _alert_shared_connection(addr_lower: str, wallet_count: int):
+    """Operator-facing alert when a connection ends up serving 2+ wallets —
+    should never happen at ≤14 wallets now that acquisition reserves slots."""
+    try:
+        from web_app import _send_telegram  # late import to avoid circular
+        _send_telegram(
+            f"⚠️ <b>WS CONNECTION SHARING</b>\n{addr_lower[:10]}… now shares a "
+            f"connection with {wallet_count - 1} other wallet(s). Position-close/"
+            f"leverage WS signals degraded; REST refresh is covering."
+        )
+    except Exception:
+        pass
+
+
 async def _release_wallet_from_pool(address: str, dexs: list):
-    """Remove a wallet's subscriptions and callback from its shared WS.
-    Called when a wallet is removed from monitoring."""
+    """Remove a wallet's subscriptions, callback, and reservation from its
+    shared WS. Called when a wallet is removed from monitoring."""
     addr_lower = address.lower()
     async with _get_pool_lock():
         for ws in _ws_pool:
-            if f"user:{addr_lower}" in ws.callbacks:
-                await ws.unsubscribe_user_events(address, dexs)
-                await ws.unsubscribe_user_fills(address)
+            # Match by reservation too: a wallet that failed between acquire
+            # and subscribe has a reservation but no callback — without this
+            # its slot would leak and block a future wallet from a free
+            # connection.
+            if f"user:{addr_lower}" in ws.callbacks or addr_lower in ws.reserved_users:
+                if f"user:{addr_lower}" in ws.callbacks:
+                    await ws.unsubscribe_user_events(address, dexs)
+                    await ws.unsubscribe_user_fills(address)
+                ws.reserved_users.discard(addr_lower)
                 # Remove the reconnect handler registered for this address
                 ws.on_reconnect_handlers = [
                     h for h in ws.on_reconnect_handlers
@@ -85,6 +190,7 @@ class WalletMonitor:
         target_address: str,
         api_url: str = "https://api.hyperliquid.xyz",
         ws_url: str = "wss://api.hyperliquid.xyz/ws",
+        last_fill_time_ms: int = 0,
     ):
         self.target_address = target_address
         self.api_url = api_url
@@ -96,17 +202,34 @@ class WalletMonitor:
         self.current_state: Optional[UserState] = None
         self.last_positions: List[Position] = []
         self.last_orders: List[Order] = []
+        # Wall-clock time of the last WS message (any channel) for this wallet —
+        # distinguishes "target is just idle" from "the feed died" (a connection
+        # can report is_running=True while silently receiving nothing, e.g. a
+        # half-open TCP connection). Surfaced as feed_age_secs on the dashboard.
+        self.last_ws_event_ts: float = 0.0
         self._state_refresh_task: Optional[asyncio.Task] = None
-        # Bounds concurrent in-flight fill callbacks (each does a DB write + REST
-        # fetch and contends on the session's state lock). Without this, a burst
-        # of fills (an HFT target, or a post-reconnect replay of up to 500 fills)
-        # spawns one task per fill with no concurrency limit — tasks still queue
-        # up instantly (create_task is never blocked), only their execution is
-        # throttled, so no fill is dropped, just serialized in slices of 25.
-        self._fill_sem = asyncio.Semaphore(25)
+        # Per-wallet FIFO fill queue + single consumer task (started in
+        # start_monitoring). Replaces a create_task-per-fill dispatch that gave
+        # no ordering guarantee — concurrent fills for the same wallet could
+        # race each other through on_order_fill. A single consumer processes
+        # fills strictly in arrival order within this wallet's stream (rule:
+        # never debounce execution, always preserve per-wallet/per-symbol
+        # order), while different wallets remain fully parallel since each
+        # has its own queue/task.
+        self._fill_queue: asyncio.Queue = asyncio.Queue()
+        self._fill_consumer_task: Optional[asyncio.Task] = None
 
-        # Track the timestamp of the last processed fill for gap recovery
-        self._last_fill_time: int = 0
+        # Track the timestamp of the last processed fill for gap recovery.
+        # BUG FIX: this used to always start at 0 and was never persisted, so a
+        # process restart made the next userFills snapshot treat EVERY fill
+        # during the downtime window as pre-existing "history" and silently
+        # drop all of it (see _handle_user_fills_event) — trades that actually
+        # happened while the bot was down were never copied. Restoring the
+        # persisted watermark here (see db_update_last_fill_time /
+        # WalletSession.last_fill_time_ms) makes the same downtime window a
+        # replayable gap instead.
+        self._last_fill_time: int = last_fill_time_ms
+        self._last_fill_persist_ts: float = 0.0  # monotonic time of last DB persist (throttle)
 
         # Callbacks set by the session layer
         self.on_new_position: Optional[Callable] = None
@@ -131,8 +254,10 @@ class WalletMonitor:
         logger.info(f"Starting monitoring for {self.target_address}")
         await self.get_current_state()
 
-        # Attach to (or create) a shared WS connection from the pool
-        shared_ws = await _acquire_shared_ws(self.ws_url)
+        # Attach to (or create) a shared WS connection from the pool.
+        # The pool reserves this wallet's slot on the chosen connection
+        # atomically, so concurrent wallet additions can't share a socket.
+        shared_ws = await _acquire_shared_ws(self.ws_url, self.target_address)
         self.ws = shared_ws
 
         # Register this monitor's reconnect/fill-replay handler
@@ -162,6 +287,7 @@ class WalletMonitor:
         # Background state refresh — decoupled from fill events so high-frequency
         # fills don't trigger REST calls on every message.
         self._state_refresh_task = asyncio.create_task(self._periodic_state_refresh())
+        self._fill_consumer_task = asyncio.create_task(self._consume_fills())
 
         # Subscribe this wallet's address to the shared WS
         await shared_ws.subscribe_user_events(
@@ -176,6 +302,15 @@ class WalletMonitor:
         # Note: do NOT call await shared_ws.listen() here — it is already running
         # as an asyncio task created above (or by a previous monitor).
 
+        # A restored (nonzero) fill clock means this process just (re)started
+        # with a persisted watermark from before — replay whatever happened
+        # during the downtime gap. The userFills isSnapshot delivered by the
+        # subscribe above already covers HL's own "recent fills" window; this
+        # REST-paginated replay is the thorough backstop for a longer gap.
+        # tid dedup downstream makes any overlap between the two safe.
+        if self._last_fill_time > 0:
+            asyncio.create_task(self._replay_missed_fills())
+
     async def stop_monitoring(self):
         logger.info(f"Stopping monitoring for {self.target_address}")
         await _release_wallet_from_pool(self.target_address, self.client.dexs)
@@ -187,24 +322,63 @@ class WalletMonitor:
         if self._state_refresh_task is not None:
             self._state_refresh_task.cancel()
             self._state_refresh_task = None
+        if self._fill_consumer_task is not None:
+            self._fill_consumer_task.cancel()
+            self._fill_consumer_task = None
 
     async def _periodic_state_refresh(self):
-        """Refresh current_state every ~60s independent of fill events.
+        """Refresh current_state every ~2min independent of fill events.
 
         Also the REST-driven safety net for position closes: once a wallet's
-        connection is shared with others (pool full, _MAX_WS_CONNECTIONS
+        connection is shared with others (pool full, MAX_WALLETS
         reached), unattributable userEvents messages are dropped by design
         (see websocket.py), so on_position_close never fires from WS for that
         wallet. This periodic REST comparison against the previous snapshot
         is the only remaining signal for "target closed a position with no
         fill we saw" in that case, restoring the safety net's documented
         purpose independent of WS delivery.
+
+        BUG FIX: was 50-70s — with 14 wallets all on this same cadence,
+        get_user_state alone averaged a REST call roughly every 4s across the
+        fleet, on top of everything else calling the same rate-limited IP
+        (funding rates, mids, style detection, replay fetches). Real 429s
+        were observed at just 11 wallets during testing. current_state is
+        already documented as an eventually-consistent safety net (fills are
+        the real-time signal via WS), so the safety net can afford to be
+        twice as slow in exchange for roughly half the REST load.
         """
         import random
+        _FEED_STALE_SECS = 300  # 5 minutes with a connection that claims open but sent nothing
+        _stale_alerted = False
         await asyncio.sleep(random.uniform(0, 30))  # initial stagger
         while True:
-            await asyncio.sleep(50 + random.uniform(0, 20))  # 50–70s jitter
+            await asyncio.sleep(100 + random.uniform(0, 40))  # 100–140s jitter
             try:
+                # Feed-health: distinguishes "target is just idle" from "the
+                # feed died" (a connection can report is_running=True while
+                # silently receiving nothing, e.g. a half-open TCP connection).
+                # last_ws_event_ts == 0 means no event has arrived since this
+                # monitor started, which the subscribe-time userFills snapshot
+                # (see _handle_user_fills_event) makes normal at startup — only
+                # alert once an established feed has actually gone quiet, and
+                # only once per stale episode (a live event resets the flag).
+                if self.last_ws_event_ts > 0:
+                    age = time.time() - self.last_ws_event_ts
+                    if age > _FEED_STALE_SECS and self.ws and self.ws.is_running:
+                        if not _stale_alerted:
+                            _stale_alerted = True
+                            logger.warning(
+                                f"Feed stale for {self.target_address[:10]}…: no WS event in "
+                                f"{age:.0f}s despite an open connection"
+                            )
+                            if self.on_alert:
+                                self.on_alert(
+                                    f"Feed stale: no WS event in {age/60:.1f}min despite an "
+                                    f"open connection — the socket may be half-open"
+                                )
+                    else:
+                        _stale_alerted = False
+
                 prev_positions = {p.symbol: p for p in self.last_positions}
                 await self.get_current_state()
                 logger.debug(f"State refreshed for {self.target_address[:10]}…")
@@ -244,6 +418,12 @@ class WalletMonitor:
                 )
                 return
 
+            # Stamp AFTER the address check, not on every message this shared
+            # connection sees — feed_age_secs must reflect events actually
+            # about THIS wallet, so a connection shared with a busier wallet
+            # doesn't mask this one's feed having gone silent.
+            self.last_ws_event_ts = time.time()
+
             if "fills" in data:
                 await self._handle_fills(data["fills"])
             if "positions" in data:
@@ -260,6 +440,7 @@ class WalletMonitor:
         """Handle a userFills WS message (fills-only feed, separate from userEvents).
         Reuses _handle_fills so address filtering and the on_order_fill dispatch
         (and its downstream tid dedup) stay in one place."""
+        self.last_ws_event_ts = time.time()
         try:
             inner = update.data.get("data", {})
             fills = inner.get("fills", [])
@@ -297,6 +478,7 @@ class WalletMonitor:
 
     async def _handle_fills(self, fills: List[dict]):
         from config.settings import settings
+        _clock_before = self._last_fill_time
         for fill in fills:
             # Per-fill address check: HL includes "user" in each fill dict.
             # If it's present and doesn't match our target, skip this fill — it
@@ -304,6 +486,13 @@ class WalletMonitor:
             fill_user = (fill.get("user") or "").lower()
             if fill_user and fill_user != self.target_address.lower():
                 continue
+
+            raw_coin = fill.get("coin", "")
+            if raw_coin.startswith("@"):
+                # Resolve once here so every downstream consumer (position
+                # tracking, ghost tracking, DB rows, the dashboard) sees the
+                # friendly name — none of them need to know "@N" ever existed.
+                fill["coin"] = await _resolve_spot_symbol(self.client, raw_coin)
 
             symbol = fill.get("coin", "").upper()
             if symbol in settings.copy_rules.blocked_assets:
@@ -315,27 +504,54 @@ class WalletMonitor:
                 self._last_fill_time = fill_time
 
             logger.info(f"Fill: {fill.get('dir','')} {symbol} sz={fill.get('sz')} px={fill.get('px')}")
-            if self.on_order_fill:
-                if asyncio.iscoroutinefunction(self.on_order_fill):
-                    # Dispatch as a task so slow callbacks (DB write + REST fetch) don't
-                    # block subsequent fills.  session._state_lock inside _process_fill
-                    # serializes per-session mutations so concurrency is safe. The
-                    # semaphore bounds how many run AT ONCE (not how many get queued —
-                    # every fill still gets a task immediately, none are dropped).
-                    _t = asyncio.create_task(self._run_fill_callback(fill))
-                    _t.add_done_callback(
-                        lambda t: logger.error(f"Fill callback error: {t.exception()!r}")
-                        if not t.cancelled() and t.exception() else None
-                    )
-                else:
-                    try:
-                        self.on_order_fill(fill)
-                    except Exception as e:
-                        logger.error(f"Fill callback error: {e}")
+            # Enqueue in arrival order — the single consumer task (started in
+            # start_monitoring) processes fills for this wallet strictly FIFO.
+            # put_nowait never blocks/drops: the queue is unbounded, so a fast
+            # burst (HFT target, or a post-reconnect replay of up to 2000
+            # fills) still enqueues every fill instantly.
+            self._fill_queue.put_nowait(fill)
 
-    async def _run_fill_callback(self, fill: dict):
-        async with self._fill_sem:
-            await self.on_order_fill(fill)
+        if self._last_fill_time > _clock_before:
+            self._maybe_persist_fill_clock()
+
+    def _maybe_persist_fill_clock(self):
+        """Throttled (≤1/5s) persist of the fill-clock watermark to the DB so
+        a restart can restore it — see the note on __init__'s
+        _last_fill_time. Fire-and-forget: a missed persist just means a
+        slightly larger (still correct, still bounded by the replay cap)
+        replay window after the next restart, never data loss."""
+        now = time.monotonic()
+        if now - self._last_fill_persist_ts < 5.0:
+            return
+        self._last_fill_persist_ts = now
+        ts = self._last_fill_time
+        asyncio.create_task(self._persist_fill_clock(ts))
+
+    async def _persist_fill_clock(self, ts_ms: int):
+        try:
+            from web.db import db_update_last_fill_time
+            await asyncio.to_thread(db_update_last_fill_time, self.target_address.lower(), ts_ms)
+        except Exception as e:
+            logger.debug(f"Fill clock persist failed (non-fatal): {e}")
+
+    async def _consume_fills(self):
+        """The single consumer of self._fill_queue for this wallet — awaits
+        on_order_fill sequentially so fills apply in exact arrival order
+        (and therefore per-symbol order) within this wallet's stream, while
+        other wallets' consumers run fully in parallel. One bad fill must
+        never kill the stream, so each iteration is wrapped individually."""
+        while True:
+            fill = await self._fill_queue.get()
+            try:
+                if self.on_order_fill:
+                    if asyncio.iscoroutinefunction(self.on_order_fill):
+                        await self.on_order_fill(fill)
+                    else:
+                        self.on_order_fill(fill)
+            except Exception as e:
+                logger.error(f"Fill callback error: {e}")
+            finally:
+                self._fill_queue.task_done()
 
     async def _replay_missed_fills(self):
         """Fetch fills newer than last_fill_time after a WS reconnect and replay them."""
@@ -372,15 +588,21 @@ class WalletMonitor:
                     except Exception:
                         continue
             if all_new:
-                if len(all_new) > 500:
-                    dropped = len(all_new) - 500
-                    logger.warning(f"Replay capped at 500 fills (had {len(all_new)}) — likely HFT target")
+                # 2000 = Hyperliquid's userFills REST endpoint's own max return size,
+                # so this cap only ever bites when the gap genuinely exceeds what a
+                # single non-time-bounded request can return at all. Algorithmic
+                # targets can blow through the old 500-fill cap in minutes.
+                if len(all_new) > _REPLAY_FILL_CAP:
+                    dropped = len(all_new) - _REPLAY_FILL_CAP
+                    logger.warning(
+                        f"Replay capped at {_REPLAY_FILL_CAP} fills (had {len(all_new)}) — likely HFT target"
+                    )
                     if self.on_alert:
                         self.on_alert(
                             f"Replay truncated for {self.target_address[:10]}…: "
                             f"{dropped} older missed fill(s) were dropped, not copied"
                         )
-                    all_new = sorted(all_new, key=lambda f: f.get("time", 0))[-500:]
+                    all_new = sorted(all_new, key=lambda f: f.get("time", 0))[-_REPLAY_FILL_CAP:]
                 logger.info(f"Replaying {len(all_new)} missed fills across {len(self.client.dexs)} DEX(es)")
                 await self._handle_fills(sorted(all_new, key=lambda f: f.get("time", 0)))
         except Exception as e:

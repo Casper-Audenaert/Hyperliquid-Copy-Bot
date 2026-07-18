@@ -42,6 +42,8 @@ logs/
 # Database
 data/
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 
 # Config with sensitive data

@@ -26,9 +26,10 @@ from utils.logger import setup_logger
 from web.db import (
     add_wallet_to_db, remove_wallet_from_db,
     list_wallets_from_db, purge_wallet_data,
-    db_get_equity_history, db_get_trades, db_get_hft_calibration_stats,
+    db_get_equity_history, db_get_trades,
 )
 from web.sim import _sessions, _create_session, start_session, _reinit_session, _session_to_dict
+from copy_engine.monitor import MAX_WALLETS, resolve_spot_symbol_display
 from web.stats import compute_stats
 
 setup_logger(settings.log_file, settings.log_level)
@@ -65,11 +66,49 @@ def _safe_emit(event: str, data: dict):
     _emit_q.put_nowait((event, data))
 
 
+# Event types that are cheap to coalesce: each new one fully supersedes the
+# previous one for the same wallet (a fresh state snapshot / equity point),
+# so under a burst only the latest per wallet needs to reach the browser.
+# Everything else (fills, funding, closes, wallet add/remove) must be
+# delivered individually and in order — coalescing a "fill" would drop a
+# real trade from the feed.
+_COALESCABLE_EVENTS = {"state_update": "address", "equity_tick": "wallet"}
+
+
 def _emit_worker():
     while True:
         try:
-            event, data = _emit_q.get()
-            socketio.emit(event, data)
+            # Block for the first item, then drain whatever else is already
+            # queued without blocking further. This bounds work to one drain
+            # per burst (14 wallets ticking near-simultaneously coalesces to
+            # O(wallets) emits, not O(events)) while adding zero latency when
+            # the queue is quiet — a fixed-interval timer would add up to its
+            # full interval of delay even for a single isolated event, which
+            # is the common case outside a burst.
+            batch = [_emit_q.get()]
+            while True:
+                try:
+                    batch.append(_emit_q.get_nowait())
+                except queue.Empty:
+                    break
+
+            coalesced: dict = {}   # (event, wallet_key) -> data, latest wins
+            ordered: list = []     # everything else, original order preserved
+            for event, data in batch:
+                wallet_key_field = _COALESCABLE_EVENTS.get(event)
+                if wallet_key_field is not None:
+                    coalesced[(event, data.get(wallet_key_field))] = data
+                else:
+                    ordered.append((event, data))
+
+            for event, data in ordered:
+                socketio.emit(event, data)
+            # Coalesced updates go out after this batch's ordered events —
+            # each one already reflects any fills from the same batch (sim.py
+            # emits state_update right after mutating state), so this is the
+            # semantically correct order, not just a coalescing side effect.
+            for (event, _wallet), data in coalesced.items():
+                socketio.emit(event, data)
         except Exception as e:
             logger.error(f"Emit worker error: {e}")
 
@@ -181,7 +220,13 @@ def api_history(wallet):
 def api_trades(wallet):
     from_dt = request.args.get("from")  # optional YYYY-MM-DD
     to_dt   = request.args.get("to")
-    return jsonify(db_get_trades(wallet.lower(), from_date=from_dt, to_date=to_dt))
+    rows = db_get_trades(wallet.lower(), from_date=from_dt, to_date=to_dt)
+    # Trades recorded before spot-symbol resolution existed have the raw "@N"
+    # baked into the DB row — resolve for display only, same best-effort cache
+    # lookup as _session_to_dict uses for open positions; never touches the DB.
+    for r in rows:
+        r["symbol"] = resolve_spot_symbol_display(r["symbol"])
+    return jsonify(rows)
 
 
 @app.route("/api/stats/<wallet>")
@@ -190,13 +235,6 @@ def api_stats(wallet):
     open_pos   = s.simulated_positions if s else {}
     copy_ratio = s.copy_ratio if s else 1.0
     return jsonify(compute_stats(wallet.lower(), open_pos, copy_ratio=copy_ratio))
-
-
-@app.route("/api/calibration/<wallet>")
-def api_calibration(wallet):
-    """HFT accuracy calibration data — aggregates entry slippage and copy delay
-    across all debounced trades to measure the empirical simulation gap."""
-    return jsonify(db_get_hft_calibration_stats(wallet.lower()))
 
 
 @app.route("/api/add-wallet", methods=["POST"])
@@ -225,6 +263,11 @@ def api_add_wallet():
         return jsonify({"error": "address required"}), 400
     if address in _sessions:
         return jsonify({"error": "already monitored"}), 409
+    if len(_sessions) >= MAX_WALLETS:
+        return jsonify({
+            "error": f"Max {MAX_WALLETS} wallets — Hyperliquid allows 15 WebSocket "
+                     f"connections per IP and 1 is kept in reserve."
+        }), 409
 
     session = _create_session(address, label, start_balance,
                                ratio_mode=ratio_mode, fixed_amount_usd=fixed_amount_usd)
@@ -326,14 +369,21 @@ _server_start = time.time()
 def api_health():
     wallets = {}
     for addr, s in list(_sessions.items()):
-        ws_ok = getattr(s.monitor, "is_connected", None)
+        # BUG FIX: WalletMonitor has no `is_connected` attribute (only its
+        # `.ws.is_running`) — this always returned None, silently, for every
+        # wallet. Matches the same check _session_to_dict already uses.
+        ws_ok = bool(s.monitor and s.monitor.ws and getattr(s.monitor.ws, "is_running", False))
         uptime = (datetime.now() - s.bot_start_time).total_seconds() / 3600 if s.bot_start_time else 0
+        last_evt = getattr(s.monitor, "last_ws_event_ts", 0) if s.monitor else 0
+        fq = getattr(s.monitor, "_fill_queue", None) if s.monitor else None
         wallets[addr] = {
-            "label":          s.label,
-            "is_paused":      s.is_paused,
-            "uptime_h":       round(uptime, 2),
-            "trades_copied":  s.trades_copied_count,
-            "ws_connected":   ws_ok,
+            "label":            s.label,
+            "is_paused":        s.is_paused,
+            "uptime_h":         round(uptime, 2),
+            "trades_copied":    s.trades_copied_count,
+            "ws_connected":     ws_ok,
+            "feed_age_secs":    round(time.time() - last_evt, 1) if last_evt else None,
+            "fill_queue_depth": fq.qsize() if fq is not None else None,
         }
     return jsonify({
         "status":          "ok",
@@ -416,6 +466,8 @@ if __name__ == "__main__":
             detected_style=getattr(w, "detected_style", "Swing") or "Swing",
             ratio_mode=getattr(w, "ratio_mode", "fixed") or "fixed",
             fixed_amount_usd=getattr(w, "fixed_amount_usd", None),
+            last_fill_time_ms=getattr(w, "last_fill_time_ms", 0) or 0,
+            skip_counters_json=getattr(w, "skip_counters", None),
         )
         # Stagger starts by 5s each — 2s was too tight for 20+ wallets each making
         # 9+ REST calls during startup (fill history + style detection)

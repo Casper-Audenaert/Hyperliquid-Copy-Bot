@@ -43,6 +43,8 @@ class Wallet(Base):
     stats_counters = Column(String, nullable=True)         # JSON blob of lifetime trade aggregates, see db_get_trade_counters
     ratio_mode        = Column(String, default="fixed")    # "fixed" | "proportional" | "fixed_amount"
     fixed_amount_usd  = Column(Float, nullable=True)        # only meaningful when ratio_mode == "fixed_amount"
+    last_fill_time_ms = Column(Integer, default=0)          # exchange ms of the last fill we processed — restart gap-replay watermark
+    skip_counters     = Column(String, nullable=True)       # JSON blob of {reason: count} — see sim.py's _SKIP_CATEGORIES
 
 
 class TradeRecord(Base):
@@ -98,6 +100,7 @@ class SimulatedPosition(Base):
     leverage    = Column(Integer)
     margin_used = Column(Float)
     copy_ratio  = Column(Float)         # ratio locked at open time
+    funding_paid = Column(Float, default=0.0)  # cumulative funding for THIS position (positive = paid); throttled write, see sim.py
     updated_at  = Column(DateTime, default=datetime.utcnow)
 
 
@@ -160,6 +163,9 @@ for _col, _ddl in [
     ("stats_counters", "ALTER TABLE wallets ADD COLUMN stats_counters TEXT"),
     ("ratio_mode",       "ALTER TABLE wallets ADD COLUMN ratio_mode TEXT DEFAULT 'fixed'"),
     ("fixed_amount_usd", "ALTER TABLE wallets ADD COLUMN fixed_amount_usd REAL"),
+    ("last_fill_time_ms", "ALTER TABLE wallets ADD COLUMN last_fill_time_ms INTEGER DEFAULT 0"),
+    ("skip_counters",    "ALTER TABLE wallets ADD COLUMN skip_counters TEXT"),
+    ("position_funding_paid", "ALTER TABLE simulated_positions ADD COLUMN funding_paid REAL DEFAULT 0"),
 ]:
     try:
         with _db_engine.connect() as conn:
@@ -359,6 +365,38 @@ def db_update_wallet_style(address: str, copy_mode: str, debounce_secs: int, det
             db.commit()
 
 
+def db_update_last_fill_time(address: str, ts_ms: int):
+    """Persist the fill-clock watermark so a restart can replay exactly the
+    fills that happened during downtime instead of silently dropping them
+    (see WalletMonitor._last_fill_time). Cheap single-column UPDATE — caller
+    throttles how often this is invoked.
+
+    BUG FIX: this was missing db.commit() — Session.close() (called by this
+    context manager's __exit__) rolls back an uncommitted transaction rather
+    than persisting it, so the fill-clock watermark was computed correctly
+    in memory but never actually reached disk. Every restart silently fell
+    back to last_fill_time_ms=0, defeating the entire point of C2 (replaying
+    exactly the downtime gap instead of dropping it) without ever raising an
+    error — the in-memory clock still advanced and looked correct all
+    session long, only to reset silently on the next restart.
+    """
+    with DbSession(_db_engine) as db:
+        db.query(Wallet).filter(Wallet.address == address).update({"last_fill_time_ms": ts_ms})
+        db.commit()
+
+
+def db_update_skip_counters(address: str, skip_counts: dict):
+    """Persist the per-reason skip breakdown so a restart doesn't reset the
+    dashboard's visibility back to all-zero. Caller only invokes this when
+    skip_counts actually changed since the last write (see WalletSession's
+    _skip_counts_dirty flag)."""
+    with DbSession(_db_engine) as db:
+        db.query(Wallet).filter(Wallet.address == address).update(
+            {"skip_counters": json.dumps(skip_counts)}
+        )
+        db.commit()
+
+
 def remove_wallet_from_db(address: str):
     with DbSession(_db_engine) as db:
         w = db.get(Wallet, address)
@@ -387,6 +425,7 @@ def purge_wallet_data(address: str):
         w = db.get(Wallet, address)
         if w:
             w.stats_counters = None
+            w.skip_counters  = None
         db.commit()
 
 
@@ -442,56 +481,6 @@ def db_record_fill(wallet_addr: str, wallet_label: str, fill_id, symbol: str,
                         c["min_open_notional"] = notional
             w.stats_counters = json.dumps(c)
         db.commit()
-
-
-def db_get_hft_calibration_stats(wallet_addr: str, days: int = 180) -> dict:
-    """Aggregate calibration data for measuring the HFT simulation accuracy gap.
-
-    Returns metrics that quantify how far debounced copy entries deviate from
-    the target's original fills. Use this data to tune debounce_secs and the
-    slippage model after accumulating real live-trading results.
-
-    Bounded to the last `days` days — this used to be an unfiltered .all() over
-    the wallet's entire trade history, getting slower every week regardless of
-    how much of that history was actually relevant to current calibration.
-    """
-    cutoff = datetime.utcnow() - timedelta(days=days)
-    with DbSession(_db_engine) as db:
-        rows = (db.query(TradeRecord)
-                .filter(TradeRecord.wallet_addr == wallet_addr,
-                        TradeRecord.timestamp >= cutoff,
-                        TradeRecord.is_debounced == True,   # noqa: E712
-                        TradeRecord.is_seed == False,       # noqa: E712
-                        TradeRecord.target_entry_px.isnot(None))
-                .all())
-    if not rows:
-        return {"debounced_trades": 0}
-
-    slippages, delays, pnls = [], [], []
-    for r in rows:
-        if r.target_entry_px and r.target_entry_px > 0 and r.price and r.price > 0:
-            is_long = (r.side or "").upper() == "LONG"
-            slip = ((r.price - r.target_entry_px) / r.target_entry_px * 100
-                    if is_long else
-                    (r.target_entry_px - r.price) / r.target_entry_px * 100)
-            slippages.append(slip)
-        if r.copy_delay_ms is not None:
-            delays.append(r.copy_delay_ms)
-        if r.realized_pnl is not None:
-            pnls.append(r.realized_pnl)
-
-    total_closed = len(pnls)
-    wins = sum(1 for p in pnls if p > 0)
-    return {
-        "debounced_trades":       len(rows),
-        "closed_trades":          total_closed,
-        "win_rate_pct":           round(wins / total_closed * 100, 1) if total_closed else None,
-        "avg_entry_slippage_pct": round(sum(slippages) / len(slippages), 4) if slippages else None,
-        "avg_copy_delay_ms":      round(sum(delays) / len(delays)) if delays else None,
-        "median_copy_delay_ms":   sorted(delays)[len(delays) // 2] if delays else None,
-        # positive = we entered worse than target (paid more for longs, sold lower for shorts)
-        # negative = we got a better price (position moved in our favour during debounce)
-    }
 
 
 def db_record_close(wallet_addr: str, symbol: str, realized_pnl: float):
@@ -578,6 +567,7 @@ def db_upsert_position(wallet_addr: str, symbol: str, pos: dict):
             row.leverage    = int(pos.get("leverage", 1))
             row.margin_used = pos.get("margin_used", 0)
             row.copy_ratio  = pos.get("copy_ratio", 1.0)
+            row.funding_paid = pos.get("funding_paid", row.funding_paid or 0.0)
             row.updated_at  = datetime.utcnow()
         else:
             db.add(SimulatedPosition(
@@ -588,7 +578,23 @@ def db_upsert_position(wallet_addr: str, symbol: str, pos: dict):
                 leverage=int(pos.get("leverage", 1)),
                 margin_used=pos.get("margin_used", 0),
                 copy_ratio=pos.get("copy_ratio", 1.0),
+                funding_paid=pos.get("funding_paid", 0.0),
             ))
+        db.commit()
+
+
+def db_update_positions_funding(wallet_addr: str, funding_by_symbol: dict):
+    """Throttled batch persist of per-position funding_paid (see sim.py's
+    _periodic_equity_snapshot) — one DB session for the whole wallet instead
+    of one db_upsert_position round-trip per open position on every funding
+    tick, which would multiply write load by position count every 3s."""
+    if not funding_by_symbol:
+        return
+    with DbSession(_db_engine) as db:
+        for symbol, funding_paid in funding_by_symbol.items():
+            db.query(SimulatedPosition).filter_by(wallet_addr=wallet_addr, symbol=symbol).update(
+                {"funding_paid": funding_paid}
+            )
         db.commit()
 
 
@@ -660,6 +666,7 @@ def db_load_positions(wallet_addr: str) -> dict:
             "value":       r.size * r.entry_price,
             "margin_used": r.margin_used,
             "copy_ratio":  r.copy_ratio,
+            "funding_paid": r.funding_paid or 0.0,
         }
     return result
 

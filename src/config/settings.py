@@ -19,10 +19,6 @@ class TelegramConfig(BaseModel):
     report_interval_hours: int = 1
     api_base_url: str = "https://api.telegram.org"
 
-class SizingConfig(BaseModel):
-    max_position_size: float = 1000.0
-    max_total_exposure: float = 5000.0
-
 class LeverageConfig(BaseModel):
     # 1.0 = mirror the target's leverage exactly (still clamped to the real
     # per-asset Hyperliquid cap below, same as it would be on a live exchange).
@@ -35,31 +31,18 @@ class LeverageConfig(BaseModel):
     min_leverage: float = 1.0
 
 class CopyRulesConfig(BaseModel):
-    copy_existing_positions: bool = True
-    copy_existing_orders: bool = True
-    copy_open_positions: bool = True
-    auto_adjust_size: bool = True
-    use_limit_orders: bool = False  # Convert market orders to limit orders at fill price
     max_open_trades: Optional[int] = None  # None = unlimited
-    max_open_orders: Optional[int] = None  # None = unlimited
-    max_account_equity: Optional[float] = None  # None = unlimited
     max_entry_deviation_pct: float = 5.0  # skip a copy if price has already moved this far from the target's fill
-    min_position_size_usd: float = 10.0
+    min_position_size_usd: float = 10.0   # dust floor — HL's real minimum order notional; fills below this are skipped
     blocked_assets: list[str] = []  # Assets to NOT copy (e.g., ["BTC", "ETH"])
 
 class RiskManagementConfig(BaseModel):
-    max_concurrent_positions: int = 10
     max_daily_loss_usd: float = 500.0
     fast_loss_pct: float = 0.05           # pause if equity drops this fraction within the window
     fast_loss_window_secs: int = 300      # rolling window for the circuit breaker (5 minutes)
-    max_net_exposure_pct: float = 0.80    # |long_notional - short_notional| / equity cap
 
 class CopyStyleConfig(BaseModel):
-    hft_threshold_fills_per_hour: int = 60   # fills/hr above this → debounced copy mode
-    hft_debounce_secs: int = 30              # seconds to wait before confirming a debounced copy
-    fast_burst_window_secs: int = 90          # rolling window (seconds) for the fast in-memory burst check
-    fast_burst_same_symbol_closes: int = 3    # closes on ONE symbol within window → targeted churn signal
-    fast_burst_total_closes: int = 6          # total closes (any symbol combined) → broad-activity fallback
+    hft_threshold_fills_per_hour: int = 60   # fills/hr above this → "HFT" badge (informational only; all styles copy every fill live)
 
 class SimAccuracyConfig(BaseModel):
     slippage_bps: float = 3.0          # basis points of slippage per side on every fill
@@ -82,6 +65,25 @@ class StartupSeedingPolicy(BaseModel):
     pause_on_total_drawdown_pct: float = 0.10     # skip seeding if drawdown >= 10%
     allow_seed_small: bool = True                 # use SEED_SMALL for borderline positions
     ghost_on_failed_seed: bool = True             # ghost instead of ignoring failed seed orders
+
+def _parse_csv_env(raw: str) -> list[str]:
+    """Parse a comma-separated env var into a stripped, non-empty item list.
+
+    BUG FIX: python-dotenv only strips a trailing `# comment` when the value
+    before it is non-empty (e.g. `KEY=x  # comment` -> "x"); for an EMPTY
+    value followed by a comment (`KEY=  # comment`), it returns the comment
+    text itself as the literal value instead of "". That silently turned
+    `BLOCKED_ASSETS=  # Comma-separated list of assets to NOT copy (e.g.,
+    BTC,ETH,SOL)` into blocked_assets=["...NOT COPY (E.G.", "BTC", "ETH",
+    "SOL)"] — every BTC and ETH fill for every wallet was silently treated
+    as a blocked asset and never copied. Stripping any `#...` suffix here
+    (in addition to fixing the .env file itself) makes every comma-list env
+    var immune to this whole class of misconfiguration, not just this one
+    instance of it.
+    """
+    value = raw.split("#", 1)[0]
+    return [item.strip() for item in value.split(",") if item.strip()]
+
 
 def _validate_eth_address(v: Optional[str], field_name: str) -> Optional[str]:
     """Validate Ethereum address format."""
@@ -107,7 +109,6 @@ class Settings(BaseModel):
     # Configuration sections
     hyperliquid: HyperliquidConfig = Field(default_factory=HyperliquidConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
-    sizing: SizingConfig = Field(default_factory=SizingConfig)
     leverage: LeverageConfig = Field(default_factory=LeverageConfig)
     copy_rules: CopyRulesConfig = Field(default_factory=CopyRulesConfig)
     risk_management: RiskManagementConfig = Field(default_factory=RiskManagementConfig)
@@ -157,12 +158,10 @@ class Settings(BaseModel):
         settings.target_wallet = os.getenv('TARGET_WALLET_ADDRESS', settings.target_wallet)
 
         # Multi-wallet support (web dashboard)
-        wallets_env = os.getenv('TARGET_WALLETS', '')
-        settings.target_wallets = [w.strip() for w in wallets_env.split(',') if w.strip()]
+        settings.target_wallets = _parse_csv_env(os.getenv('TARGET_WALLETS', ''))
         if not settings.target_wallets and settings.target_wallet:
             settings.target_wallets = [settings.target_wallet]
-        labels_env = os.getenv('WALLET_LABELS', '')
-        settings.wallet_labels = [l.strip() for l in labels_env.split(',') if l.strip()]
+        settings.wallet_labels = _parse_csv_env(os.getenv('WALLET_LABELS', ''))
 
         # Wallets are managed via the GUI/DB — no wallet env var required at startup
         if not settings.target_wallet and settings.target_wallets:
@@ -175,19 +174,6 @@ class Settings(BaseModel):
         sim_balance = os.getenv('SIMULATED_ACCOUNT_BALANCE', '1000.0')
         settings.simulated_account_balance = float(sim_balance)
         
-        # Copy trading settings
-        copy_open_pos = os.getenv('COPY_OPEN_POSITIONS', 'true').lower()
-        settings.copy_rules.copy_open_positions = copy_open_pos in ('true', '1', 'yes')
-        
-        copy_orders = os.getenv('COPY_EXISTING_ORDERS', 'true').lower()
-        settings.copy_rules.copy_existing_orders = copy_orders in ('true', '1', 'yes')
-        
-        auto_adjust = os.getenv('AUTO_ADJUST_SIZE', 'true').lower()
-        settings.copy_rules.auto_adjust_size = auto_adjust in ('true', '1', 'yes')
-        
-        use_limit = os.getenv('USE_LIMIT_ORDERS', 'false').lower()
-        settings.copy_rules.use_limit_orders = use_limit in ('true', '1', 'yes')
-        
         # Leverage adjustment (default 1.0 = mirror target's leverage exactly;
         # this fallback must match LeverageConfig.adjustment_ratio's default
         # above, since this line unconditionally overwrites it either way)
@@ -196,17 +182,14 @@ class Settings(BaseModel):
         
         max_trades = os.getenv('MAX_OPEN_TRADES', 'x')
         settings.copy_rules.max_open_trades = None if max_trades.lower() == 'x' else int(max_trades)
-        
-        max_orders = os.getenv('MAX_OPEN_ORDERS', 'x')
-        settings.copy_rules.max_open_orders = None if max_orders.lower() == 'x' else int(max_orders)
-        
-        max_equity = os.getenv('MAX_ACCOUNT_EQUITY', 'x')
-        settings.copy_rules.max_account_equity = None if max_equity.lower() == 'x' else float(max_equity)
-        
+
+        settings.copy_rules.min_position_size_usd = float(
+            os.getenv('MIN_POSITION_SIZE_USD', str(settings.copy_rules.min_position_size_usd))
+        )
+
         # Blocked assets
-        blocked = os.getenv('BLOCKED_ASSETS', '')
         settings.copy_rules.blocked_assets = [
-            asset.strip().upper() for asset in blocked.split(',') if asset.strip()
+            asset.upper() for asset in _parse_csv_env(os.getenv('BLOCKED_ASSETS', ''))
         ]
         
         settings.telegram.bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
