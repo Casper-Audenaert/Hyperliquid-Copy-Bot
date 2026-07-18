@@ -424,8 +424,13 @@ def purge_wallet_data(address: str):
         # which conveniently is exactly the state this reset restores).
         w = db.get(Wallet, address)
         if w:
-            w.stats_counters = None
-            w.skip_counters  = None
+            w.stats_counters   = None
+            w.skip_counters    = None
+            # A genuine reset should also clear the fill-processing watermark —
+            # leaving it in place would make _replay_missed_fills silently skip
+            # replaying fills that predate a fresh purge, purely because the
+            # clock never got reset alongside everything else it gates.
+            w.last_fill_time_ms = 0
         db.commit()
 
 
