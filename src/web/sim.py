@@ -160,6 +160,14 @@ class WalletSession:
     # returned the unvalidated default. See the new-position guard in
     # _process_fill.
     _ratio_validated: bool = False
+    # True once a boot/reinit state fetch has succeeded and the target's book
+    # has been evaluated for seeding this session. Distinct from
+    # _ratio_validated: proportional mode can validate the RATIO from a live
+    # fill (heal path) long before any successful state fetch — observed live:
+    # that early validation killed _late_boot_recovery's loop, so the target's
+    # standing book was never seeded and a $20 dust-born position sat at 0.2%
+    # sync against the whale's $35M standing position forever.
+    _book_seeded: bool = False
     trades_copied_count: int = 0
     simulated_balance: float = 10_000.0
     start_balance: float = 10_000.0
@@ -2213,6 +2221,7 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
         # Fix copy_ratio as a constant; never read from the shared settings global
         session.copy_ratio = session.start_balance / state.balance
         session._ratio_validated = True
+        session._book_seeded     = True  # fetch succeeded → book gets evaluated below
         logger.info(
             f"[{session.label}] Target ${state.balance:,.0f} → "
             f"ratio 1:{int(1/session.copy_ratio)} ({session.copy_ratio*100:.4f}%)"
@@ -2525,16 +2534,22 @@ async def _late_boot_recovery(session: WalletSession, emit_fn: Callable):
     book seed) — the same path the manual Reset button uses. Exits once the
     wallet validates by any path (incl. proportional's per-fill heal) or is
     removed. Without this, an always_seed wallet stays bookless all session
-    after one rate-limited boot."""
-    while session.address in _sessions and not session._ratio_validated:
+    after one rate-limited boot.
+
+    Gates on _book_seeded, NOT _ratio_validated — BUG FIX: proportional mode
+    can validate the ratio from a live dust flush minutes before any state
+    fetch succeeds, and exiting on that left the target's standing book
+    permanently unseeded (observed live: a $20 dust-born HYPE position at
+    0.2% sync against the target's $35M standing short, recovery long gone)."""
+    while session.address in _sessions and not session._book_seeded:
         await asyncio.sleep(90 + random.uniform(0, 30))
-        if session._ratio_validated or session.address not in _sessions:
+        if session._book_seeded or session.address not in _sessions:
             break
         st = session.monitor.current_state if session.monitor else None
         if st and st.balance > 0:
             logger.info(f"[{session.label}] Late boot recovery: target reachable again — validating ratio and seeding book")
             await _reinit_session(session, emit_fn)
-            # loop re-checks _ratio_validated: if the reinit's own fetch
+            # loop re-checks _book_seeded: if the reinit's own fetch
             # failed again, keep polling.
 
 
@@ -2562,6 +2577,7 @@ async def _reinit_session_body(session: WalletSession, emit_fn: Callable):
     session.ghost_positions      = {}
     session.pending_dust         = {}
     session._ratio_validated     = False  # must re-earn validation from this reinit's own fetch
+    session._book_seeded         = False  # ditto for the book seed
     session.simulated_pnl        = 0.0
     session.total_fees_paid      = 0.0
     session.total_funding_paid   = 0.0
@@ -2599,6 +2615,7 @@ async def _reinit_session_body(session: WalletSession, emit_fn: Callable):
     if state and state.balance > 0:
         session.copy_ratio = session.start_balance / state.balance
         session._ratio_validated = True
+        session._book_seeded     = True
 
         if state.positions:
             all_mids = {}
