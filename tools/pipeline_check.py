@@ -285,6 +285,48 @@ async def scenario_ratio_validation_guard():
     del sim._sessions[s.address]
 
 
+async def scenario_proportional_self_heals_after_failed_boot():
+    print("\n== scenario: proportional mode self-heals once current_state becomes available ==")
+    # Regression for a bug in the fix above's first version: the guard checked
+    # _ratio_validated and returned BEFORE ever calling _ratio_for_new_position
+    # — but for "proportional" mode, that call is the ONLY thing that ever
+    # sets _ratio_validated mid-session (periodic refreshes alone don't touch
+    # it). Checking before attempting meant a proportional-mode wallet whose
+    # boot fetch failed could never recover for the rest of the session, even
+    # after a later periodic refresh successfully populated current_state —
+    # observed live as 105 stuck "ratio_unvalidated" skips on one wallet over
+    # nearly an hour with no recovery.
+    from hyperliquid.models import UserState
+    from datetime import datetime
+    sim._mids_cache.clear()
+    sim._mids_cache.update({"ETH": 3_000.0})
+    s = make_session("0x_prop_heal", "PropHeal", 10_000.0)
+    s.ratio_mode = "proportional"
+    s._ratio_validated = False  # boot's initial fetch failed, same as the live incident
+    cbs = sim.make_callbacks(s, lambda *a, **k: None)
+    now = int(time.time() * 1000)
+
+    await cbs["on_order_fill"](make_fill("ETH", "Open Long", "B", 1.0, 3_000.0, 801, now))
+    check("still unvalidated: first fill correctly skipped",
+          "ETH" not in s.simulated_positions and s.skip_counts["ratio_unvalidated"] == 1)
+
+    # A later periodic state refresh succeeds independently (this is what
+    # monitor.py's _periodic_state_refresh does on its own schedule) —
+    # nothing in sim.py needs to know that happened, it just populates
+    # monitor.current_state.
+    s.monitor.current_state = UserState(
+        address=s.address, positions=[], orders=[], balance=1_000_000.0,
+        margin_used=0.0, unrealized_pnl=0.0, timestamp=datetime.utcnow(),
+    )
+    await cbs["on_order_fill"](make_fill("ETH", "Open Long", "B", 1.0, 3_000.0, 802, now + 100))
+    check("self-healed: the next fill for a DIFFERENT new symbol now opens normally",
+          "ETH" in s.simulated_positions, f"{s.simulated_positions}")
+    check("_ratio_validated flips to True once a live recompute succeeds",
+          s._ratio_validated is True)
+
+    del sim._sessions[s.address]
+
+
 async def scenario_position_drift():
     print("\n== scenario: position drift — sync_pct/desynced reflect our size vs. target's ==")
     from hyperliquid.models import Position, PositionSide
@@ -495,6 +537,7 @@ async def main():
     await scenario_snapshot_lock_deferred()
     await scenario_skip_counts()
     await scenario_ratio_validation_guard()
+    await scenario_proportional_self_heals_after_failed_boot()
     await scenario_position_drift()
     await scenario_dust_accumulator()
     await scenario_hft_round_trips()

@@ -713,21 +713,38 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
         else:
             is_opening = True
 
-    # Guard: never open a brand-new position off a ratio that's never been
-    # validated against a real target-account fetch this session. Observed
-    # live: under sustained rate-limiting, start_session's initial state fetch
-    # can fail every retry while the WS fill stream (unaffected by REST
-    # throttling) keeps delivering live fills — a brand-new symbol arriving in
-    # that window would otherwise open at copy_ratio's untouched default
-    # (1.0), reproducing the exact stored-ratio corruption found and repaired
-    # elsewhere in this file, just via a fresh position instead of a restored
-    # one. fixed_amount mode is exempt: its ratio is derived per-fill from
-    # fixed_amount_usd/notional, never from copy_ratio, so it has no
-    # unvalidated-default failure mode to guard against. Safe to skip rather
-    # than ghost: this is a transient infra condition, not a standing "never
-    # copy this symbol" policy — the target's next fill for this symbol, or
-    # any other, copies normally as soon as a state fetch succeeds.
+    # Resolve which ratio to use for this fill. A flip always starts a brand-new
+    # position (the old side is being closed out below), an add to an existing
+    # tracked position reuses that position's own stored ratio (keeps it
+    # internally consistent regardless of mode), anything else is a genuinely
+    # new position.
     is_new_position = is_flip or symbol not in session.simulated_positions
+    if is_new_position:
+        # _ratio_for_new_position is called FIRST, before checking
+        # _ratio_validated below — for "proportional" mode this call is also
+        # what LIVE-recomputes and sets _ratio_validated, so checking the flag
+        # before ever attempting the call would permanently strand a wallet
+        # whose initial boot fetch failed: nothing else ever revalidates it
+        # mid-session, so it could never recover. Calling first lets a LATER
+        # successful periodic state refresh (independent of boot) heal a
+        # proportional-mode wallet the moment its next new position arrives.
+        ratio = _ratio_for_new_position(session, target_size, price)
+    elif symbol in session.simulated_positions:
+        ratio = session.simulated_positions[symbol]["copy_ratio"]
+
+    # Guard: never open a brand-new position off a ratio that's still
+    # unvalidated after the attempt above. Observed live: under sustained
+    # rate-limiting, start_session's initial state fetch can fail every retry
+    # while the WS fill stream (unaffected by REST throttling) keeps
+    # delivering live fills — a brand-new symbol arriving in that window would
+    # otherwise open at copy_ratio's untouched default (1.0), reproducing the
+    # exact stored-ratio corruption found and repaired elsewhere in this file,
+    # just via a fresh position instead of a restored one. fixed_amount mode
+    # is exempt: its ratio is derived per-fill from fixed_amount_usd/notional,
+    # never from copy_ratio, so it has no unvalidated-default failure mode to
+    # guard against. Safe to skip rather than ghost: this is a transient infra
+    # condition, not a standing "never copy this symbol" policy — the next
+    # fill for this symbol, or any other, copies normally once validated.
     if is_new_position and session.ratio_mode != "fixed_amount" and not session._ratio_validated:
         _mark_skip(session, fill_id, "ratio_unvalidated", emit_fn=emit_fn, symbol=symbol)
         logger.warning(
@@ -737,17 +754,6 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
         )
         return
 
-    # Resolve which ratio to use for this fill. A flip always starts a brand-new
-    # position (the old side is being closed out below), an add to an existing
-    # tracked position reuses that position's own stored ratio (keeps it
-    # internally consistent regardless of mode), anything else is a genuinely
-    # new position.
-    if is_flip:
-        ratio = _ratio_for_new_position(session, target_size, price)
-    elif symbol in session.simulated_positions:
-        ratio = session.simulated_positions[symbol]["copy_ratio"]
-    else:
-        ratio = _ratio_for_new_position(session, target_size, price)
     our_size = target_size * ratio
 
     # Faithful mirror: no hardcoded position/exposure caps — our_size scales
