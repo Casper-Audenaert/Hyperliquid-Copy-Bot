@@ -232,9 +232,16 @@ def api_trades(wallet):
 @app.route("/api/stats/<wallet>")
 def api_stats(wallet):
     s          = _sessions.get(wallet.lower())
-    open_pos   = s.simulated_positions if s else {}
+    # dict() snapshot: this route runs on a Flask thread while the asyncio
+    # bot-loop thread mutates simulated_positions (same rationale as
+    # _session_to_dict's snapshots).
+    open_pos   = dict(s.simulated_positions) if s else {}
     copy_ratio = s.copy_ratio if s else 1.0
-    return jsonify(compute_stats(wallet.lower(), open_pos, copy_ratio=copy_ratio))
+    target_bal = 0.0
+    if s and s.monitor and s.monitor.current_state:
+        target_bal = s.monitor.current_state.balance or 0.0
+    return jsonify(compute_stats(wallet.lower(), open_pos, copy_ratio=copy_ratio,
+                                 target_balance=target_bal))
 
 
 @app.route("/api/add-wallet", methods=["POST"])
