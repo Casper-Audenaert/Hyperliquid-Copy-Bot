@@ -753,8 +753,9 @@ function toggleCompare() {
     // mode exits).
     const dp = document.getElementById('decision-panel');
     if (dp) dp.style.display = 'none';
-    // Pre-fetch stats for all wallets so Decision tab is populated immediately
-    Promise.all([...compareSelection].map(addr => loadStats(addr))).then(() => renderComparePanel());
+    // Pre-fetch stats for all wallets in one batch so the compare tabs are
+    // populated immediately (was 14 parallel /api/stats requests).
+    loadAllStats().then(() => renderComparePanel());
     renderComparePanel();
     reloadFeedForCompare();
   } else {
@@ -1242,6 +1243,31 @@ function scheduleStatsRefresh(addr) {
 }
 
 // ── Stats tearsheet ────────────────────────────────────────────────────────
+// One request for every wallet's stats — replaces N parallel /api/stats calls
+// (compare mode, boot, resync), which piled up identical DB scans server-side
+// and caused intermittent 15s timeouts ("Failed to load stats" toasts).
+// Quiet on failure (console only): this runs on timers, and a transient miss
+// just means the next cycle refreshes — a toast every 25s would be spam.
+async function loadAllStats() {
+  try {
+    const r   = await fetchT('/api/stats-batch', {}, 30000);
+    const all = await r.json();
+    Object.assign(statsCache, all);
+    const cur = curWallet();
+    if (!compareMode && cur && statsCache[cur]) renderStats(statsCache[cur]);
+    if (compareMode) _scheduleComparePanelRender();
+    renderKpis(); // Volume/Sharpe/Max DD chips read statsCache
+  } catch(e) { console.warn('loadAllStats', e); }
+}
+
+// Trailing debounce so a burst of new wallets at boot (14 state_updates in a
+// tight window) produces ONE batch fetch instead of 14 individual ones.
+let _allStatsTimer = null;
+function scheduleAllStatsLoad() {
+  clearTimeout(_allStatsTimer);
+  _allStatsTimer = setTimeout(loadAllStats, 600);
+}
+
 async function loadStats(addr) {
   try {
     const r  = await fetchT(`/api/stats/${addr}`);
@@ -2869,7 +2895,7 @@ async function resyncAllHistory() {
   const addrs = Object.keys(state);
   await Promise.all(addrs.map(a => loadHistory(a)));
   rebuildChart();
-  addrs.forEach(loadStats);
+  loadAllStats();
 }
 
 // Independent of reconnects: the client-side history array is capped at 5000
@@ -2910,7 +2936,7 @@ socket.on('state_update', s => {
   state[s.address] = {...(state[s.address]||{}), ...s};
   if (isNew) {
     if (compareMode) compareSelection.add(s.address);
-    loadStats(s.address);
+    scheduleAllStatsLoad(); // debounced batch — a boot burst of new wallets = one fetch
     // Only load trades for the wallet that will actually be displayed;
     // selectWallet() handles it for any wallet the user explicitly clicks.
     if (!activeWallet && Object.keys(state).length === 1) loadTrades(s.address);
@@ -3161,8 +3187,8 @@ if (_addrTa) _addrTa.addEventListener('input', () => {
 // wallet every tick (which would reintroduce the O(N) load already fixed).
 // Scoped to only the wallet(s) currently on screen.
 setInterval(() => {
-  const addrs = compareMode ? [...compareSelection] : (curWallet() ? [curWallet()] : []);
-  addrs.forEach(loadStats);
+  if (compareMode) loadAllStats();               // one batch call, not N parallel
+  else if (curWallet()) loadStats(curWallet());  // single wallet stays cheap
 }, 25_000);
 
 // ── Init ───────────────────────────────────────────────────────────────────

@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 
 from sqlalchemy import (
-    create_engine, Column, Integer, String, Float, Boolean, DateTime, text, UniqueConstraint, func,
+    create_engine, Column, Integer, String, Float, Boolean, DateTime, text, UniqueConstraint, func, or_,
 )
 from sqlalchemy.orm import DeclarativeBase, Session as DbSession
 
@@ -769,7 +769,14 @@ def db_get_equity_history(wallet_addr: str, hours: int = 0,
             # SQLite's implicit rowid, so this predicate is evaluated against the
             # index itself and only the ~max_points accepted rows need a table
             # lookup for equity/balance/upnl.
-            bucket_size = max(1, (max_id - min_id + 1) // max_points)
+            # Bucket from this wallet's row COUNT, not the id range: ids are
+            # global across all wallets, so with N wallets interleaved the
+            # id-range bucket over-thins each wallet to ~1/N of the requested
+            # density (observed: 485 of 5000 requested points at 14 wallets).
+            # Any given id has a 1/bucket chance of hitting the modulo, so
+            # count//max_points yields ~max_points accepted rows regardless
+            # of interleaving.
+            bucket_size = max(1, count // max_points)
             q = q.filter((EquitySnapshot.id - min_id) % bucket_size == 0)
         rows = q.order_by(EquitySnapshot.timestamp).all()
 
@@ -777,6 +784,43 @@ def db_get_equity_history(wallet_addr: str, hours: int = 0,
     raw = [{"t": ts.isoformat(timespec='milliseconds'), "equity": equity,
             "balance": balance, "upnl": upnl} for ts, equity, balance, upnl in rows]
     return _despike(raw)
+
+
+from collections import namedtuple as _namedtuple
+_EqStatsRow = _namedtuple("_EqStatsRow", ["timestamp", "equity", "total_funding_paid"])
+
+
+def db_get_equity_rows_downsampled(wallet_addr: str, cutoff: datetime,
+                                   max_points: int = 5000) -> list:
+    """Windowed equity rows for compute_stats(), downsampled in SQL.
+
+    Same rowid-modulo bucketing as db_get_equity_history — compute_stats used
+    to fetch EVERY snapshot row in its 90-day window into ORM objects, which
+    grows without bound during a long uninterrupted run (3s cadence ≈ 29k
+    rows/day/wallet) and was the main reason /api/stats got slower every day.
+    The true last row is always included (or_ on max_id) because callers read
+    total_funding_paid and current-drawdown off the final row.
+    Returns lightweight namedtuples with .timestamp/.equity/.total_funding_paid.
+    """
+    with DbSession(_db_engine) as db:
+        filters = [EquitySnapshot.wallet_addr == wallet_addr,
+                   EquitySnapshot.timestamp >= cutoff]
+        min_id, max_id, count = (
+            db.query(func.min(EquitySnapshot.id), func.max(EquitySnapshot.id),
+                     func.count(EquitySnapshot.id))
+            .filter(*filters).one()
+        )
+        if not count:
+            return []
+        q = db.query(EquitySnapshot.timestamp, EquitySnapshot.equity,
+                     EquitySnapshot.total_funding_paid).filter(*filters)
+        if count > max_points:
+            # count-based bucket, same rationale as db_get_equity_history above
+            bucket_size = max(1, count // max_points)
+            q = q.filter(or_((EquitySnapshot.id - min_id) % bucket_size == 0,
+                             EquitySnapshot.id == max_id))
+        rows = q.order_by(EquitySnapshot.timestamp).all()
+    return [_EqStatsRow(ts, eq, fund or 0.0) for ts, eq, fund in rows]
 
 
 def db_get_trades(wallet_addr: str, limit: int = 200,
