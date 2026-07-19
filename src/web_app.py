@@ -230,10 +230,24 @@ def api_trades(wallet):
     return jsonify(rows)
 
 
-@app.route("/api/stats/<wallet>")
-def api_stats(wallet):
-    s          = _sessions.get(wallet.lower())
-    # dict() snapshot: this route runs on a Flask thread while the asyncio
+# Short-TTL cache over compute_stats. The frontend refreshes stats on a 25s
+# timer, after every fill (debounced), and per connected client — during a
+# fill burst those overlap and each one re-ran the windowed DB scans, piling
+# up Flask threads doing identical work (the observed "Failed to load stats"
+# timeouts). 10s staleness is invisible next to the 25s refresh cadence.
+_stats_cache: dict = {}          # addr -> (monotonic_ts, stats dict)
+_STATS_CACHE_TTL = 10.0
+_stats_cache_lock = threading.Lock()
+
+
+def _stats_for(addr: str) -> dict:
+    now = time.monotonic()
+    with _stats_cache_lock:
+        hit = _stats_cache.get(addr)
+        if hit and now - hit[0] < _STATS_CACHE_TTL:
+            return hit[1]
+    s          = _sessions.get(addr)
+    # dict() snapshot: this runs on a Flask thread while the asyncio
     # bot-loop thread mutates simulated_positions (same rationale as
     # _session_to_dict's snapshots).
     open_pos   = dict(s.simulated_positions) if s else {}
@@ -241,8 +255,27 @@ def api_stats(wallet):
     target_bal = 0.0
     if s and s.monitor and s.monitor.current_state:
         target_bal = s.monitor.current_state.balance or 0.0
-    return jsonify(compute_stats(wallet.lower(), open_pos, copy_ratio=copy_ratio,
-                                 target_balance=target_bal))
+    st = compute_stats(addr, open_pos, copy_ratio=copy_ratio, target_balance=target_bal)
+    with _stats_cache_lock:
+        _stats_cache[addr] = (time.monotonic(), st)
+    return st
+
+
+@app.route("/api/stats/<wallet>")
+def api_stats(wallet):
+    return jsonify(_stats_for(wallet.lower()))
+
+
+@app.route("/api/stats-batch")
+def api_stats_batch():
+    """Stats for every session in one response, computed sequentially.
+
+    Compare mode used to fire 14 parallel /api/stats requests every 25s —
+    14 Flask threads all scanning the DB at once. One request + sequential
+    computation (each hitting the 10s cache when warm) removes both the
+    request fan-out and the thread contention.
+    """
+    return jsonify({addr: _stats_for(addr) for addr in list(_sessions.keys())})
 
 
 @app.route("/api/add-wallet", methods=["POST"])
@@ -308,6 +341,8 @@ def api_remove_wallet(wallet):
     submit(s.client.close())  # otherwise each removal leaks an open aiohttp connector/socket
     remove_wallet_from_db(wallet)
     purge_wallet_data(wallet)
+    with _stats_cache_lock:
+        _stats_cache.pop(wallet, None)
     _safe_emit("wallet_removed", {"address": wallet})
     return jsonify({"ok": True})
 
@@ -319,6 +354,8 @@ def api_reset_wallet(wallet):
     if not s:
         return jsonify({"error": "not found"}), 404
     purge_wallet_data(wallet)          # wipe DB records before reinit
+    with _stats_cache_lock:
+        _stats_cache.pop(wallet, None)
     submit(_reinit_session(s, _safe_emit))
     return jsonify({"ok": True})
 
@@ -335,6 +372,8 @@ def api_clear():
     """
     for addr in list(_sessions.keys()):
         purge_wallet_data(addr)
+    with _stats_cache_lock:
+        _stats_cache.clear()
     for s in list(_sessions.values()):
         submit(_reinit_session(s, _safe_emit))
     return jsonify({"ok": True})

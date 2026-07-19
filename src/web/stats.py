@@ -8,7 +8,8 @@ from datetime import date, datetime, timedelta
 
 from loguru import logger
 
-from web.db import _db_engine, TradeRecord, EquitySnapshot, Wallet, db_get_trade_counters
+from web.db import (_db_engine, TradeRecord, Wallet, db_get_trade_counters,
+                    db_get_equity_rows_downsampled)
 from sqlalchemy.orm import Session as DbSession
 from config.settings import settings
 
@@ -455,11 +456,12 @@ def compute_stats(wallet_addr: str, open_positions: dict = None, copy_ratio: flo
                           TradeRecord.timestamp >= cutoff_trades)
                   .order_by(TradeRecord.timestamp)
                   .all())
-        equity_rows = (db.query(EquitySnapshot)
-                       .filter(EquitySnapshot.wallet_addr == wallet_addr,
-                               EquitySnapshot.timestamp >= cutoff_equity)
-                       .order_by(EquitySnapshot.timestamp)
-                       .all())
+    # Downsampled in SQL (max ~5000 rows regardless of uptime) — every consumer
+    # below is shape-based (drawdown, daily Sharpe, rolling series) and reads
+    # identically off a uniform sample; the true last row is always included so
+    # total_funding / current-drawdown stay exact. Fetching every raw row here
+    # was the unbounded cost that made /api/stats slower every day of a run.
+    equity_rows = db_get_equity_rows_downsampled(wallet_addr, cutoff_equity)
 
     # Seed fills are real entry costs but are NOT copied trades from the target wallet.
     # Exclude them from trade-count stats (wins, streaks, volume) but keep in fee totals.
