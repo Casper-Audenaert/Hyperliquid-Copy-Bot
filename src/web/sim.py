@@ -37,6 +37,10 @@ from web.db import (
     db_upsert_ghost, db_delete_ghost, db_load_ghosts,
     db_update_wallet_style, db_update_skip_counters,
 )
+# Shared with compute_stats so the sidebar KPI and the tearsheet apply the same
+# minimum track record before annualizing a return. stats.py owns the constant
+# and does not import sim, so this direction introduces no cycle.
+from web.stats import MIN_DAYS_FOR_ANNUALIZATION
 
 # Shared session registry (keyed by lowercase address)
 _sessions: dict = {}
@@ -395,16 +399,48 @@ def _liquidation_price(entry: float, lev: float, is_long: bool, symbol: str) -> 
     return entry * (1 + 1.0 / lev) / (1 + mm)
 
 
+_max_lev_fetch_started = False
+_MAX_LEV_FETCH_TIMEOUT = 20.0
+
+
 async def _refresh_max_leverage(client) -> None:
     """Populate _max_lev_cache from allPerpMetas. Best-effort: any failure just
-    leaves the hardcoded fallback table in play."""
+    leaves the hardcoded fallback table in play.
+
+    Deliberately NOT awaited from the startup path — see _ensure_max_leverage.
+    """
     try:
-        metas = await client.get_perp_max_leverage()
+        metas = await asyncio.wait_for(client.get_perp_max_leverage(),
+                                       timeout=_MAX_LEV_FETCH_TIMEOUT)
         if metas:
             _max_lev_cache.update(metas)
-            logger.debug(f"max-leverage cache: {len(_max_lev_cache)} assets")
+            logger.info(f"max-leverage cache populated: {len(_max_lev_cache)} assets")
+        else:
+            logger.warning("max-leverage fetch returned nothing — using fallback table")
     except Exception as e:
         logger.warning(f"max-leverage refresh failed (using fallback table): {e}")
+
+
+def _ensure_max_leverage(client) -> None:
+    """Kick off the max-leverage fetch once, in the background.
+
+    BUG FIX: start_session used to `await` this inline, before it did anything
+    else. Two problems. (1) It gated every wallet's entire startup — including
+    the first state_update emit — on a network round-trip, so a slow or hanging
+    metadata call left the wallet registered in _sessions (so re-adding it
+    returned "already monitored") while never appearing in the UI. (2) There was
+    no single-flight guard: the cache stays empty until the first call RETURNS,
+    so every wallet started in that window fired its own duplicate fetch.
+
+    Nothing needs this to be ready: _asset_max_leverage falls back to the
+    hardcoded table, so the only cost of it arriving late is that the first
+    moments use the fallback value.
+    """
+    global _max_lev_fetch_started
+    if _max_lev_fetch_started or _max_lev_cache:
+        return
+    _max_lev_fetch_started = True
+    asyncio.create_task(_refresh_max_leverage(client))
 
 
 async def _check_and_liquidate(session: WalletSession, symbol: str, price: float, emit_fn: Callable) -> bool:
@@ -1133,12 +1169,21 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             f"(${our_notional:,.2f})"
         )
 
-    # ── Entry deviation guard ─────────────────────────────────────────────────
-    # Skip if the target's reported fill price has already diverged too far from
-    # the current live market — copying a stale fill at a blown-out price is worse
-    # than not copying it. _mids_cache is built from get_all_mids() across every
-    # sub-dex (client.dexs), including the default "" dex that also returns spot
-    # mid prices, so this covers every dex and spot uniformly with no special-casing.
+    # ── Entry deviation guard (OFF by default) ────────────────────────────────
+    # Skips the copy when the leader's fill price has diverged this far from the
+    # live market. Its original rationale was "copying a stale fill at a blown-out
+    # price is worse than not copying it" — but the execution-price change below
+    # means a copy now always enters at the CURRENT mid, never at the leader's
+    # stale price, so that failure mode no longer exists. All this can do now is
+    # make the simulation miss a trade the target actually took, which is the
+    # largest possible copy inaccuracy.
+    #
+    # Left in place, defaulting to 0 (disabled), because real platforms do offer a
+    # price-difference tolerance and someone may want one. Set
+    # MAX_ENTRY_DEVIATION_PCT (or copy_rules.max_entry_deviation_pct) above 0 to
+    # re-enable. _mids_cache is built from get_all_mids() across every sub-dex
+    # (client.dexs), including the default "" dex that also returns spot mid
+    # prices, so this covers every dex and spot uniformly with no special-casing.
     if is_opening and not is_flip:
         max_dev = settings.copy_rules.max_entry_deviation_pct
         if max_dev > 0 and price > 0:
@@ -1154,8 +1199,38 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
                     )
                     return
 
+    # ── Execution price ───────────────────────────────────────────────────────
+    # A copy order executes at the market price when OUR order lands — not at the
+    # price the leader got. Pricing off the live mid is the faithful model, and it
+    # replaces what used to be "leader's fill price + a synthetic random drift":
+    #
+    #     drift_pct = (lat_ms / 1000) * 0.0001 * random.uniform(0.5, 1.5)
+    #
+    # That was an invented proxy for a quantity we can measure directly, and being
+    # random it meant identical inputs produced different P&L on every run, so no
+    # result was reproducible. The true cost of copy latency IS the gap between
+    # the leader's fill price and the market now, so using the mid captures it
+    # exactly instead of approximating it — and it makes a delayed or replayed
+    # fill open at today's price instead of minting phantom P&L at a stale one.
+    #
+    # Falls back to the leader's fill price when no mid is available.
+    target_fill_px = price
+    try:
+        _live_mid = float(_mids_cache.get(symbol, 0) or 0)
+    except (TypeError, ValueError):
+        _live_mid = 0.0
+    if _live_mid > 0:
+        price = _live_mid
+        _drift = (price - target_fill_px) / target_fill_px * 100 if target_fill_px else 0.0
+        if abs(_drift) > 1.0:
+            logger.info(
+                f"[{session.label}] {symbol}: leader filled ${target_fill_px:,.4f}, "
+                f"copying at market ${price:,.4f} ({_drift:+.2f}% copy-latency drift)"
+            )
+
     # ── Slippage model ────────────────────────────────────────────────────────
-    # Simulates the price impact of being a price-taker vs. the target's fill.
+    # Cost of crossing the spread as a price-taker. A real market order pays this
+    # on top of the execution price, so it stays.
     slippage = settings.sim_accuracy.slippage_bps / 10_000
     if slippage > 0:
         if is_opening and not is_flip:
@@ -1164,14 +1239,6 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
             is_long_pos = (session.simulated_positions.get(symbol, {}).get("side", "").upper() == "LONG")
             price = price * (1 - slippage) if is_long_pos else price * (1 + slippage)
     # ponytail: constant slippage; per-asset liquidity bucket if accuracy gap is measured
-
-    # ── Latency model ─────────────────────────────────────────────────────────
-    # Approximates the price drift during execution latency.
-    lat_ms = settings.sim_accuracy.sim_latency_ms
-    if lat_ms > 0 and is_opening and not is_flip:
-        drift_pct = (lat_ms / 1000) * 0.0001 * random.uniform(0.5, 1.5)
-        price = price * (1 + drift_pct) if position_side == PositionSide.LONG else price * (1 - drift_pct)
-    # ponytail: fixed volatility proxy; per-asset vol model if needed
 
     # ── Position count guard ──────────────────────────────────────────────────
     if is_opening and not is_flip:
@@ -1205,14 +1272,18 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
     # Cushion-aware leverage scaling: reduce applied leverage as the follower's own
     # free-margin buffer shrinks, so an already-heavily-committed account doesn't keep
     # taking on the target's full leverage with less and less room to absorb a move.
-    if is_opening and not is_flip and our_leverage > 1:
-        _equity_est = (session.simulated_balance
-                       + sum(p.get("margin_used", 0) for p in session.simulated_positions.values())
-                       + _upnl(session))
-        if _equity_est > 0:
-            cushion = session.simulated_balance / _equity_est
-            if cushion < 0.5:
-                our_leverage = max(1, round(our_leverage * max(cushion / 0.5, 0.2)))
+    # REMOVED: cushion-aware leverage scaling. It used to cut applied leverage by
+    # up to 5x once free balance fell below 50% of equity:
+    #
+    #     cushion = simulated_balance / equity
+    #     if cushion < 0.5: our_leverage *= max(cushion / 0.5, 0.2)
+    #
+    # No exchange or copy-trading platform does this — it silently made the copy
+    # stop mirroring the target's leverage exactly when the account was most
+    # active, so the simulated position diverged from the one being copied with
+    # nothing in the UI indicating why. Margin the account genuinely cannot cover
+    # is still handled, correctly, by the affordability downsizing below (which is
+    # a real constraint rather than an invented risk rule).
 
     pnl_realized = None
 
@@ -1382,7 +1453,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
                 await asyncio.to_thread(
                     db_record_fill, session.address, session.label, fill_id, symbol,
                     direction, position_side.value, close_size, price, our_leverage, fill_fee,
-                    False, False, None, None,
+                    False, False, target_fill_px, None,
                 )
                 await asyncio.to_thread(db_record_close, session.address, symbol, pnl)
             except Exception as e:
@@ -1503,7 +1574,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
                 await asyncio.to_thread(
                     db_record_fill, session.address, session.label, fill_id, symbol,
                     direction, position_side.value, our_size, price, our_leverage, fill_fee,
-                    False, False, None, None,
+                    False, False, target_fill_px, None,
                 )
             except Exception as e:
                 # Same reasoning as the close-fill path: in-memory position/balance is
@@ -2239,8 +2310,12 @@ def evaluate_startup_position(
         if policy.startup_mode != "always_seed":
             return "GHOST_ONLY", 0.0, "drift_too_large"
 
-    # 3. Cap leverage (never ghost on this — just reduce)
-    follower_leverage = min(pos.leverage, policy.max_seed_leverage)
+    # 3. Mirror the target's leverage exactly — no cap.
+    # The target is a real Hyperliquid account, so its leverage is already within
+    # that asset's real exchange limit; clamping it here only made the simulated
+    # position diverge from the one being copied. (Same reasoning as
+    # PositionSizer.calculate_leverage, which no longer caps either.)
+    follower_leverage = pos.leverage
 
     # 4. Compute seed size
     seed_size     = abs(pos.size) * copy_ratio * policy.startup_seed_size_multiplier
@@ -2301,10 +2376,10 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
     session._state_lock = asyncio.Lock()
 
     # Per-asset max leverage drives maintenance margin (see _liquidation_price).
-    # Module-level cache shared by every session, so only the first wallet to
-    # start actually pays for the fetch; the rest hit a populated dict.
-    if not _max_lev_cache:
-        await _refresh_max_leverage(session.client)
+    # Fire-and-forget: nothing below depends on it (the hardcoded fallback table
+    # covers the gap), and awaiting it here would gate this wallet's first
+    # state_update — and therefore its appearance in the UI — on a network call.
+    _ensure_max_leverage(session.client)
 
     # ── Restart recovery ──────────────────────────────────────────────────────
     _saved_positions = db_load_positions(session.address)
@@ -2546,7 +2621,7 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
                 # startup by inheriting the target's unrealized profit, which the user
                 # never actually earned and could never achieve by starting to copy today.
                 entry_px  = mark_px
-                your_lev  = min(pos.leverage, settings.seed_policy.max_seed_leverage)
+                your_lev  = pos.leverage   # mirror exactly — no seed leverage cap
                 your_lev  = session.position_sizer.calculate_leverage(
                     your_lev, settings.leverage.adjustment_ratio,
                     settings.leverage.max_leverage, settings.leverage.min_leverage, symbol=pos.symbol,
@@ -2854,7 +2929,7 @@ async def _reinit_session_body(session: WalletSession, emit_fn: Callable):
                     continue
 
                 entry_px = mark_px  # mark price = "copy from now"; pos.entry_price would inflate equity
-                your_lev = min(pos.leverage, settings.seed_policy.max_seed_leverage)
+                your_lev = pos.leverage   # mirror exactly — no seed leverage cap
                 your_lev = session.position_sizer.calculate_leverage(
                     your_lev, settings.leverage.adjustment_ratio,
                     settings.leverage.max_leverage, settings.leverage.min_leverage, symbol=pos.symbol,

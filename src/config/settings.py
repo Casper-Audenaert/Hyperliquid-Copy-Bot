@@ -32,7 +32,12 @@ class LeverageConfig(BaseModel):
 
 class CopyRulesConfig(BaseModel):
     max_open_trades: Optional[int] = None  # None = unlimited
-    max_entry_deviation_pct: float = 5.0  # skip a copy if price has already moved this far from the target's fill
+    # 0 = disabled (default). Skips a copy when the market has already moved this
+    # far from the leader's fill. Disabled because copies now execute at the live
+    # mid rather than at the leader's price (see _process_fill), so a late fill is
+    # no longer mispriced — it just enters at market, exactly as a real copy would.
+    # A non-zero value only makes the sim MISS trades the target actually took.
+    max_entry_deviation_pct: float = 0.0
     min_position_size_usd: float = 10.0   # dust floor — HL's real minimum order notional; fills below this are skipped
     blocked_assets: list[str] = []  # Assets to NOT copy (e.g., ["BTC", "ETH"])
 
@@ -189,6 +194,13 @@ class Settings(BaseModel):
 
         settings.copy_rules.min_position_size_usd = float(
             os.getenv('MIN_POSITION_SIZE_USD', str(settings.copy_rules.min_position_size_usd))
+        )
+
+        # 0 (the default) disables the entry-deviation skip entirely — see the
+        # field's comment. Set above 0 only if you deliberately want the sim to
+        # pass on trades where the market has already moved.
+        settings.copy_rules.max_entry_deviation_pct = float(
+            os.getenv('MAX_ENTRY_DEVIATION_PCT', str(settings.copy_rules.max_entry_deviation_pct))
         )
 
         # Blocked assets
