@@ -62,6 +62,11 @@ class HyperliquidWebSocket:
         self._reconnect_base_delay = 2.0
         self._reconnect_max_delay = 60.0
         self.reconnect_delay = self._reconnect_base_delay
+        # force_reconnect() cooldown — pooled connections carry several monitors
+        # and they all notice the same dead feed at roughly the same time, so
+        # without this N monitors would stack N teardowns on one socket.
+        self._last_force_reconnect_ts = 0.0
+        self._FORCE_RECONNECT_COOLDOWN = 120.0
         self.subscriptions: Dict[str, Any] = {}
         self.callbacks: Dict[str, Callable] = {}
         # Wallet addresses assigned to this connection by the pool, reserved at
@@ -112,6 +117,40 @@ class HyperliquidWebSocket:
         if self.ws:
             await self.ws.close()
             logger.info("WebSocket disconnected")
+
+    async def force_reconnect(self, reason: str) -> bool:
+        """Tear down the socket so listen()'s existing backoff/resubscribe path
+        rebuilds it. Returns True if a teardown was actually issued.
+
+        This exists because a TCP connection can go half-open: `is_running` stays
+        True, `ws.closed` stays False, and the read loop simply never yields
+        another message. Nothing in the reconnect machinery triggers on that,
+        because nothing ever raises — so the feed stays silently dead forever and
+        fills stop being copied while the UI still shows "connected".
+
+        Deliberately does NOT clear is_running (that's disconnect(), a permanent
+        shutdown). Closing the socket alone makes `async for message in self.ws`
+        raise ConnectionClosed, which listen() already handles by backing off,
+        reconnecting, resubscribing everything and firing the reconnect handlers
+        that replay the missed-fill gap.
+
+        Connections are pooled, so a forced reconnect affects every monitor
+        sharing this socket — correct, since a half-open socket is broken for all
+        of them — but the cooldown keeps N monitors noticing the same dead feed
+        from stacking N teardowns on top of each other.
+        """
+        now = time.monotonic()
+        if now - self._last_force_reconnect_ts < self._FORCE_RECONNECT_COOLDOWN:
+            logger.debug(f"force_reconnect suppressed (cooldown): {reason}")
+            return False
+        self._last_force_reconnect_ts = now
+        logger.warning(f"Forcing WS reconnect: {reason}")
+        try:
+            if self.ws and not self.ws.closed:
+                await self.ws.close()
+        except Exception as e:
+            logger.warning(f"force_reconnect close failed (listener will still recover): {e}")
+        return True
 
     async def _send_subscription(self, data: dict):
         if self.ws:

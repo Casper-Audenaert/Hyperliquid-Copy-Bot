@@ -216,7 +216,12 @@ class WalletMonitor:
         # never debounce execution, always preserve per-wallet/per-symbol
         # order), while different wallets remain fully parallel since each
         # has its own queue/task.
-        self._fill_queue: asyncio.Queue = asyncio.Queue()
+        # Bounded so a consumer that falls behind can't grow this without limit.
+        # 5000 comfortably absorbs the largest legitimate burst (a post-reconnect
+        # REST replay is capped at ~2000 fills) while still catching a genuine
+        # can't-keep-up condition. Depth is exposed via /api/health.
+        self._fill_queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
+        self._dropped_fills = 0
         self._fill_consumer_task: Optional[asyncio.Task] = None
 
         # Track the timestamp of the last processed fill for gap recovery.
@@ -387,6 +392,19 @@ class WalletMonitor:
                                     f"Feed stale: no WS event in {age/60:.1f}min despite an "
                                     f"open connection — the socket may be half-open"
                                 )
+                        # BUG FIX: detection used to stop at the alert above, so a
+                        # half-open socket was diagnosed and then left alone — the
+                        # feed stayed dead for the life of the process, silently
+                        # copying nothing, while the dashboard still showed
+                        # "connected". listen()'s reconnect loop can't notice on its
+                        # own because a half-open socket never raises. Escalate:
+                        # tear it down and let the existing backoff/resubscribe/
+                        # replay path rebuild it. force_reconnect has its own
+                        # cooldown, so re-firing on each stale check is safe and
+                        # gives us a retry if the first rebuild also comes up dead.
+                        await self.ws.force_reconnect(
+                            f"feed stale for {self.target_address[:10]}… ({age:.0f}s with no events)"
+                        )
                     else:
                         _stale_alerted = False
 
@@ -517,10 +535,34 @@ class WalletMonitor:
             logger.info(f"Fill: {fill.get('dir','')} {symbol} sz={fill.get('sz')} px={fill.get('px')}")
             # Enqueue in arrival order — the single consumer task (started in
             # start_monitoring) processes fills for this wallet strictly FIFO.
-            # put_nowait never blocks/drops: the queue is unbounded, so a fast
-            # burst (HFT target, or a post-reconnect replay of up to 2000
-            # fills) still enqueues every fill instantly.
-            self._fill_queue.put_nowait(fill)
+            # The queue is bounded: the consumer's per-fill cost includes several
+            # DB writes under the session lock, so if arrivals outpace it (HFT
+            # target, or a DB that has slowed as it grew) an unbounded queue just
+            # converts that into unbounded memory growth on a 4-8GB Pi and hides
+            # the problem until the process is OOM-killed. On overflow we drop the
+            # OLDEST fill: the newest ones are the ones still worth acting on, and
+            # a loud warning beats a silent leak.
+            try:
+                self._fill_queue.put_nowait(fill)
+            except asyncio.QueueFull:
+                try:
+                    dropped = self._fill_queue.get_nowait()
+                    self._fill_queue.task_done()
+                    self._dropped_fills += 1
+                    logger.error(
+                        f"Fill queue full ({self._fill_queue.maxsize}) for "
+                        f"{self.target_address[:10]}… — dropped oldest fill "
+                        f"{dropped.get('coin','?')} (total dropped: {self._dropped_fills}). "
+                        f"The consumer cannot keep up with arrivals."
+                    )
+                    if self.on_alert and self._dropped_fills % 25 == 1:
+                        self.on_alert(
+                            f"Fill queue saturated — {self._dropped_fills} fill(s) dropped; "
+                            f"copied positions may drift from the target"
+                        )
+                except asyncio.QueueEmpty:
+                    pass
+                self._fill_queue.put_nowait(fill)
 
         if self._last_fill_time > _clock_before:
             self._maybe_persist_fill_clock()

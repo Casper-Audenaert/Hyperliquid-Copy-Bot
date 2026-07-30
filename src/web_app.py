@@ -27,7 +27,7 @@ from utils.logger import setup_logger
 from web.db import (
     add_wallet_to_db, remove_wallet_from_db,
     list_wallets_from_db, purge_wallet_data,
-    db_get_equity_history, db_get_trades,
+    db_get_equity_history, db_get_trades, DB_URL,
 )
 from web.sim import _sessions, _create_session, start_session, _reinit_session, _session_to_dict
 from copy_engine.monitor import MAX_WALLETS, resolve_spot_symbol_display
@@ -121,7 +121,10 @@ def _emit_worker():
 # DB file or bad disk doesn't erase months of simulation history, and the WAL
 # checkpoint keeps the -wal file from growing unbounded under a constant
 # write rate.
-_DB_PATH = settings.database_url.removeprefix("sqlite:///")
+# Derived from web.db's RESOLVED url, not settings.database_url — otherwise a
+# relative configured path would send backups somewhere different from the
+# database actually in use (whichever directory the process happened to start in).
+_DB_PATH = DB_URL.removeprefix("sqlite:///")
 _BACKUP_DIR = Path(_DB_PATH).parent / "backups"
 _BACKUP_INTERVAL_SECS = 24 * 3600
 _BACKUP_RETAIN = 7
@@ -196,15 +199,36 @@ def api_state():
     return jsonify([_session_to_dict(s) for s in list(_sessions.values())])
 
 
+# Window used for the first-frame history in /api/full-state. Must match the
+# frontend's initial `rangeHours` (dashboard.js) so the series it returns is
+# already scoped to the range the chart will draw.
+_FULL_STATE_HISTORY_HOURS = 24
+
+
 @app.route("/api/full-state")
 def api_full_state():
     """All sessions plus each one's recent equity history in a single call —
     used on initial page load so an N-wallet dashboard doesn't need N separate
-    /api/history round-trips just to draw the first frame."""
+    /api/history round-trips just to draw the first frame.
+
+    BUG FIX: this used to request hours=0 (ALL retained history) per wallet,
+    sequentially, inside one request. With snapshots written every 3s and never
+    pruned, that walks every index entry the wallet ever wrote — cost grew every
+    day of a run until the whole call exceeded the frontend's 15s abort and the
+    dashboard loaded with no chart data at all. A bounded window rides the
+    (wallet_addr, timestamp) index as a range scan instead, so page-load cost is
+    a function of the window, not of uptime. Longer ranges are fetched on demand
+    by /api/history when the user selects them.
+    """
     out = []
     for s in list(_sessions.values()):
         d = _session_to_dict(s)
-        d["history"] = db_get_equity_history(s.address, hours=0, max_points=500)
+        d["history"] = db_get_equity_history(
+            s.address, hours=_FULL_STATE_HISTORY_HOURS, max_points=500
+        )
+        # Tells the client which window this series covers, so it knows the rows
+        # are already scoped and doesn't need to re-filter them client-side.
+        d["history_hours"] = _FULL_STATE_HISTORY_HOURS
         out.append(d)
     return jsonify(out)
 

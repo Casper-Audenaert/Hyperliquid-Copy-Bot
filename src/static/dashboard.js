@@ -36,6 +36,9 @@ function curWallet() {
 }
 let compareMode  = false;
 let rangeHours   = 24;
+// One-shot: the uptime-based range auto-advance (renderKpis) must fire at most
+// once per page load, or it would keep overriding a range the user picked by hand.
+let _autoRangeApplied = false;
 let chart        = null;
 let pnlChart     = null;
 let underwaterChart    = null;
@@ -308,24 +311,55 @@ function toggleSubChart(which) {
 // _check_and_liquidate), so this should only ever fire on genuine stale-price
 // blips — frequent firing signals a different upstream pricing bug, not
 // something to fix by loosening these thresholds.
+// Raw snapshot cadence (web/sim.py _periodic_equity_snapshot). The 0.2% threshold
+// below is only a valid spike test at roughly THIS spacing — see _despikeHistory.
+const _RAW_TICK_MS = 3000;
+// Widest 4-gap window still treated as "adjacent raw snapshots" (3x slack for
+// loop lag / fill-triggered extra rows).
+const _DESPIKE_MAX_SPAN_MS = _RAW_TICK_MS * 4 * 3;
+let _despikeFiredCount = 0;
+
 function _despikeHistory(h) {
   if (h.length < 5) return h;
   const result = h.map(p => ({...p}));
   for (let i = 2; i < result.length - 2; i++) {
+    // BUG FIX: this used to run unconditionally. The 0.2% threshold assumes the
+    // 5 points are consecutive 3s snapshots, where a 0.2% jump that immediately
+    // reverts can only be a stale-price glitch. But once the series is
+    // downsampled (a week of history at a 500-2000 point budget puts points
+    // 5-20 MINUTES apart), a 0.2% move between neighbours is completely normal
+    // price action — so the filter was median-flattening real P&L and getting
+    // more destructive the longer the bot ran. Only despike when the local
+    // spacing is actually near the raw cadence.
+    const span = tsMs(result[i+2].t) - tsMs(result[i-2].t);
+    if (!(span > 0 && span <= _DESPIKE_MAX_SPAN_MS)) continue;
     const vals = [
       result[i-2].equity, result[i-1].equity, result[i].equity,
       result[i+1].equity, result[i+2].equity,
     ].slice().sort((x, y) => x - y);
     const med = vals[2];
     const ref = Math.max(Math.abs(med), Math.abs(result[i-2].equity), 1);
-    if (Math.abs(result[i].equity - med) / ref > 0.002) result[i] = {...result[i], equity: med};
+    if (Math.abs(result[i].equity - med) / ref > 0.002) {
+      result[i] = {...result[i], equity: med};
+      // Frequent firing signals an upstream pricing bug, not something to fix by
+      // loosening the threshold — surface it instead of silently rewriting data.
+      if (++_despikeFiredCount % 50 === 0) {
+        console.warn(`_despikeHistory has corrected ${_despikeFiredCount} points — check upstream mark pricing`);
+      }
+    }
   }
   return result;
 }
 
 function filteredHistory(addr) {
   const h = state[addr]?._history || [];
-  const sliced = rangeHours ? h.filter(p => {
+  // When _history was fetched for exactly this range the server already applied
+  // the window, so re-filtering here would be a no-op that only risks trimming
+  // the oldest point to a rounding difference. The time filter is kept as the
+  // fallback for the transient window where the range just changed and the new
+  // series hasn't landed yet (and for live ticks appended past the boundary).
+  const alreadyScoped = state[addr]?._historyRange === rangeHours;
+  const sliced = (rangeHours && !alreadyScoped) ? h.filter(p => {
     // Slice to 23 chars ("YYYY-MM-DDTHH:MM:SS.mmm") before parsing — ECMAScript only
     // guarantees millisecond precision; 6-decimal microseconds (Python default) cause
     // Invalid Date in Safari and some strict-mode engines.
@@ -450,9 +484,20 @@ function _rebuildChartImpl() {
   // Dynamic Y-axis: compute actual data range AFTER datasets are built,
   // then enforce a minimum floor so the chart never collapses to noise.
   {
-    const allY = chart.data.datasets.flatMap(d => d.data.map(p => p.y)).filter(Number.isFinite);
-    if (allY.length > 0) {
-      const lo = Math.min(...allY), hi = Math.max(...allY);
+    // Reduce, not Math.min(...allY): spreading an array as arguments blows the
+    // call stack past ~65k entries, and with the 5000-points-per-wallet cap
+    // compare mode across ~14 wallets reaches ~70k — RangeError, swallowed by
+    // safeRender, leaving a silently blank chart.
+    let lo = Infinity, hi = -Infinity, allY = 0;
+    for (const d of chart.data.datasets) {
+      for (const p of d.data) {
+        if (!Number.isFinite(p.y)) continue;
+        allY++;
+        if (p.y < lo) lo = p.y;
+        if (p.y > hi) hi = p.y;
+      }
+    }
+    if (allY > 0) {
       // ponytail: 0.5% pts floor in % view (compare or single-wallet %), 0.4% of
       // account value in $ view for single-wallet
       const minRange = usePctView() ? 0.5 : (cur && state[cur]?.start_balance ? state[cur].start_balance * 0.004 : 10);
@@ -702,6 +747,7 @@ function selectWallet(addr) {
   renderPositions();
   renderGhostTab();
   rebuildChart();
+  refreshVisibleHistory();   // this wallet may have no series for the selected range yet
   if (showUnderwater) renderUnderwaterChart(addr);
   loadTrades(addr);
   loadStats(addr);
@@ -721,6 +767,7 @@ function toggleCompareWallet(addr) {
     _card.classList.toggle('cmp-off', !_in);
   }
   renderSidebar(); renderKpis(); rebuildChart(); renderComparePanel();
+  refreshVisibleHistory();   // newly-compared wallet may have no series for this range
 }
 
 function toggleCombined() {
@@ -746,6 +793,7 @@ function toggleCompare() {
   renderPositions();
   if (!compareMode) renderGhostTab();
   rebuildChart();
+  refreshVisibleHistory();   // the visible wallet set just changed wholesale
   if (compareMode) {
     // The decision widget is a single-wallet view — hide it rather than leave
     // stale data from whichever wallet was active before switching to compare
@@ -834,14 +882,22 @@ function renderKpis() {
   const maxDd = dds.length ? Math.min(...dds) : null;
   setKpi('dd', maxDd!=null ? maxDd.toFixed(1)+'%' : '—', '', maxDd!=null ? -Math.abs(maxDd) : null);
 
-  const uptime = Math.max(0, ...sess.map(s => s.uptime_h || 0));
-  // Auto-advance default range so users see full history after extended runs
-  if (rangeHours === 24 && uptime > 168) {       // > 7 days running → show ALL
-    rangeHours = 0;
-    document.querySelectorAll('.rp').forEach(r => r.classList.toggle('on', r.dataset.h === '0'));
-  } else if (rangeHours === 24 && uptime > 24) { // > 1 day running → show 7D
-    rangeHours = 168;
-    document.querySelectorAll('.rp').forEach(r => r.classList.toggle('on', r.dataset.h === '168'));
+  const uptime = sess.reduce((m, s) => Math.max(m, s.uptime_h || 0), 0);
+  // Auto-advance default range so users see full history after extended runs.
+  // BUG FIX (two of them): this used to (1) assign rangeHours directly without
+  // ever refetching or redrawing the chart — unlike the setRange click path —
+  // so the pills claimed a new range while the canvas still showed the old
+  // one; and (2) use a GLOBAL '.rp' selector, which also stripped the "on"
+  // class from #combined-btn, #btn-underwater and the Value/PnL/% chart-mode
+  // buttons (they share .rp for styling only), making the whole button row
+  // render deselected at 24h/7d uptime. setRange already scopes to
+  // #range-row-dates .rp and comments on exactly this; both now share applyRange.
+  if (rangeHours === 24 && !_autoRangeApplied && uptime > 24) {
+    _autoRangeApplied = true;
+    const target = uptime > 168 ? 0 : 168;   // >7d → ALL, else 7D
+    document.querySelectorAll('#range-row-dates .rp')
+      .forEach(r => r.classList.toggle('on', r.dataset.h === String(target)));
+    applyRange(target);
   }
   const total  = Object.keys(state).length;
   const selN   = compareMode ? compareSelection.size : 0;
@@ -2535,24 +2591,95 @@ function renderAssetsInto(el) {
 }
 
 // ── Data loading ───────────────────────────────────────────────────────────
-// hours=0 = full retained history, no time cutoff — the server downsamples to
-// a fixed point budget regardless of how long the wallet has been running, so
-// there's no client-side retention cap here and no need to couple this fetch
-// to whatever range happened to be selected at the moment this wallet was
-// first discovered. filteredHistory() slices this client-side per rangeHours.
-async function loadHistory(addr, _retried=false) {
-  try {
-    const r = await fetchT(`/api/history/${addr}?hours=0`);
-    const d = await r.json();
-    if (state[addr]) state[addr]._history = d;
-  } catch(e) {
-    if (!_retried) return loadHistory(addr, true);
-    console.warn('loadHistory', e);
-    showToast('Failed to load chart history', addr.slice(0,8), '⚠');
-    // Deliberately leave any previously-loaded _history in place rather than
-    // clearing it — a transient fetch failure should never blank a chart
-    // that already has data on screen.
+// BUG FIX: this used to always fetch `hours=0` (all retained history) once and
+// let filteredHistory() slice it client-side per rangeHours. Because the server
+// downsamples to a fixed point budget, that made the resolution of every SHORT
+// range decay linearly with total uptime: at 500 points spanning a week, points
+// sit ~20min apart, so the 1H view had ~3 points and 6H ~18 — the range buttons
+// looked like they did nothing, and got worse every day the bot ran. Now each
+// range is fetched with its own `hours`, so it gets the full point budget over
+// just that window. A bounded `hours` is also CHEAPER than hours=0, since it
+// rides the (wallet_addr, timestamp) index as a range scan instead of walking
+// every row the wallet ever wrote.
+const _HIST_TTL_MS = 30_000;   // re-use a fetched range for this long (instant back-and-forth switching)
+const _histCache   = {};       // `${addr}|${hours}` -> {t: fetchedAtMs, d: series}
+const _histInFlight = {};      // `${addr}|${hours}` -> Promise, so concurrent callers share one request
+
+function _histKey(addr, hours) { return `${addr}|${hours}`; }
+
+// Drop every cached range for one wallet (or one specific range). Needed after a
+// reset/clear, where the DB rows the cache summarizes no longer exist.
+function _invalidateHistCache(addr, hours) {
+  if (hours !== undefined) { delete _histCache[_histKey(addr, hours)]; return; }
+  Object.keys(_histCache).forEach(k => { if (k.startsWith(`${addr}|`)) delete _histCache[k]; });
+}
+
+// Records a freshly-fetched series as the active one for `hours`. Kept separate
+// from the fetch so loadFullState() (which gets its history inlined in the same
+// response) can register through the identical path.
+function _setHistory(addr, hours, series) {
+  if (!state[addr]) return;
+  _histCache[_histKey(addr, hours)] = { t: Date.now(), d: series };
+  if (hours === rangeHours) {
+    state[addr]._history      = series;
+    state[addr]._historyRange = hours;
   }
+}
+
+async function loadHistory(addr, hours = rangeHours, _retried = false) {
+  const key = _histKey(addr, hours);
+  const hit = _histCache[key];
+  if (hit && Date.now() - hit.t < _HIST_TTL_MS) { _setHistory(addr, hours, hit.d); return; }
+  if (_histInFlight[key]) return _histInFlight[key];
+
+  const p = (async () => {
+    try {
+      const r = await fetchT(`/api/history/${addr}?hours=${hours}`);
+      const d = await r.json();
+      _setHistory(addr, hours, d);
+    } catch(e) {
+      if (!_retried) { delete _histInFlight[key]; return loadHistory(addr, hours, true); }
+      console.warn('loadHistory', e);
+      showToast('Failed to load chart history', addr.slice(0,8), '⚠');
+      // Deliberately leave any previously-loaded _history in place rather than
+      // clearing it — a transient fetch failure should never blank a chart
+      // that already has data on screen.
+    } finally {
+      delete _histInFlight[key];
+    }
+  })();
+  _histInFlight[key] = p;
+  return p;
+}
+
+// Loads the current range for every wallet about to be drawn. Sequential on
+// purpose: a range switch in compare mode would otherwise fire N simultaneous
+// queries at one SQLite file (the same thundering-herd resyncAllHistory used to
+// cause). Each request is a bounded index range scan, so serial is still fast.
+async function ensureHistoryFor(addrs, hours = rangeHours) {
+  for (const a of addrs) {
+    if (!state[a]) continue;
+    await loadHistory(a, hours);
+  }
+}
+
+// Wallets whose series the chart needs right now.
+function visibleChartAddrs() {
+  if (compareMode) return [...compareSelection].filter(a => state[a]);
+  const cur = curWallet();
+  return cur && state[cur] ? [cur] : [];
+}
+
+// Call whenever the set of wallets ON SCREEN changes (wallet selected, compare
+// toggled, compare selection edited). Since history is now fetched per range,
+// a newly-shown wallet may have nothing loaded for the selected range yet —
+// without this it would fall back to slicing whatever stale series it happened
+// to have, which is exactly the low-resolution behaviour this change removes.
+function refreshVisibleHistory() {
+  const hours = rangeHours;
+  ensureHistoryFor(visibleChartAddrs(), hours).then(() => {
+    if (rangeHours === hours) rebuildChart();
+  });
 }
 
 async function loadTrades(addr, from='', to='') {
@@ -2628,12 +2755,29 @@ function setRange(el) {
   // Scoped to just the date-range pills, which are the only ones setRange owns.
   document.querySelectorAll('#range-row-dates .rp').forEach(r=>r.classList.remove('on'));
   el.classList.add('on');
-  rangeHours = parseInt(el.dataset.h)||0;
+  applyRange(parseInt(el.dataset.h) || 0);
+}
+
+// Single path for "the selected range changed" — used by the range pills AND by
+// renderKpis' uptime auto-escalation, which previously duplicated a subset of
+// this and so silently skipped the refetch/redraw entirely.
+function applyRange(hours) {
+  rangeHours = hours;
+  // Draw immediately with whatever is loaded (feels responsive), then redraw
+  // once this range's own series arrives at full resolution.
   softSwap(document.getElementById('chart-canvas'), rebuildChart);
   if (showUnderwater) {
     const cur = curWallet();
     if (cur) renderUnderwaterChart(cur);
   }
+  ensureHistoryFor(visibleChartAddrs(), hours).then(() => {
+    if (rangeHours !== hours) return;   // superseded by another click while in flight
+    rebuildChart();
+    if (showUnderwater) {
+      const cur = curWallet();
+      if (cur) renderUnderwaterChart(cur);
+    }
+  });
 }
 
 async function resetWallet(addr) {
@@ -2891,10 +3035,19 @@ socket.on('disconnect', () => {
 // chart is currently on screen. Used on reconnect and by the periodic resync
 // below — both exist to fix the same class of bug: a tab left open for a long
 // time (hours to months) must never show a truncated or stale timeline.
+// BUG FIX: this used to fire Promise.all(loadHistory) across EVERY wallet at
+// hours=0 — N simultaneous walk-all-history queries at one SQLite file on an SD
+// card, every 30 minutes, forever, growing more expensive every day. Now it
+// refetches only the wallets actually on screen, only for the selected range,
+// sequentially (ensureHistoryFor). Its TTL cache is bypassed deliberately: the
+// whole point of this timer is to replace a series that live ticks have been
+// mutating with a fresh server-authoritative one.
 async function resyncAllHistory() {
-  const addrs = Object.keys(state);
-  await Promise.all(addrs.map(a => loadHistory(a)));
-  rebuildChart();
+  const addrs = visibleChartAddrs();
+  const hours = rangeHours;
+  addrs.forEach(a => _invalidateHistCache(a, hours));
+  await ensureHistoryFor(addrs, hours);
+  if (rangeHours === hours) rebuildChart();
   loadAllStats();
 }
 
@@ -2914,12 +3067,17 @@ function _scheduleStateRender() {
   _stateRenderPending = true;
   requestAnimationFrame(() => {
     _stateRenderPending = false;
-    renderSidebar();
-    renderWalletHeader();
-    renderKpis();
-    renderPositions();
-    if (!compareMode) renderGhostTab();
-    if (compareMode) renderComparePanel();
+    // Each renderer is isolated: this used to be a bare sequence, so a throw in
+    // renderSidebar/renderWalletHeader/renderKpis silently prevented
+    // renderPositions() from ever running — the positions table would sit at
+    // "No open positions" with the real cause only visible in the console.
+    // safeRender is the same guard the chart renderers already use.
+    safeRender('sidebar',        renderSidebar);
+    safeRender('wallet header',  renderWalletHeader);
+    safeRender('KPIs',           renderKpis);
+    safeRender('positions',      renderPositions);
+    if (!compareMode) safeRender('ghost tab',     renderGhostTab);
+    if (compareMode)  safeRender('compare panel', renderComparePanel);
   });
 }
 
@@ -2956,10 +3114,13 @@ async function loadFullState() {
     const rows = await r.json();
     let touchedChart = false;
     rows.forEach(d => {
-      const { history, ...s } = d;
+      const { history, history_hours, ...s } = d;
       const hadHistory = !!state[s.address]?._history;
       state[s.address] = {...(state[s.address]||{}), ...s};
-      if (!hadHistory) { state[s.address]._history = history; touchedChart = true; }
+      // Register through the same path a direct fetch uses, tagged with the
+      // window the server actually applied, so filteredHistory() knows whether
+      // this series is already scoped to the selected range.
+      if (!hadHistory) { _setHistory(s.address, history_hours ?? rangeHours, history); touchedChart = true; }
     });
     if (touchedChart) rebuildChart();
     _scheduleStateRender();
@@ -3119,6 +3280,7 @@ socket.on('clear', async d => {
     // contains ONLY the fresh starting snapshot. loadHistory is therefore
     // authoritative — no stale periodic-snapshot rows can survive.
     state[addr]._history = [];
+    _invalidateHistCache(addr);   // else the TTL cache would re-serve pre-reset rows
     delete statsCache[addr];
     _destroyCharts();
     await loadHistory(addr);
@@ -3151,7 +3313,7 @@ socket.on('clear', async d => {
 
   } else {
     // Global clear (all wallets at once)
-    Object.values(state).forEach(s => { s._history = []; });
+    Object.values(state).forEach(s => { s._history = []; _invalidateHistCache(s.address); });
     statsCache = {};
     chart.data.datasets = []; chart.update('none');
     _destroyCharts();

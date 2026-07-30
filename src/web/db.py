@@ -1,7 +1,7 @@
 """Database models, engine, and all DB helper functions."""
 import json
-import os
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import List, Optional
 
 from sqlalchemy import (
@@ -11,8 +11,31 @@ from sqlalchemy.orm import DeclarativeBase, Session as DbSession
 
 from config.settings import settings
 
-os.makedirs("./data", exist_ok=True)
-_db_engine = create_engine(settings.database_url, connect_args={"check_same_thread": False})
+# BUG FIX: this used to be `os.makedirs("./data")` against a relative
+# `sqlite:///./data/trading.db`, so BOTH resolved against the current working
+# directory. Launched from src/ (the documented way) that's src/data/trading.db;
+# launched from anywhere else — e.g. a systemd unit with no WorkingDirectory= —
+# it silently creates a DIFFERENT, EMPTY database and the dashboard comes up with
+# every wallet's history gone, which looks exactly like data loss. Anchor
+# relative paths to the source tree so the launch directory can't decide which
+# database you get. An absolute DATABASE_URL is still honoured untouched.
+_SRC_ROOT = Path(__file__).resolve().parent.parent      # .../src
+
+
+def _resolve_sqlite_url(url: str) -> str:
+    prefix = "sqlite:///"
+    if not url.startswith(prefix):
+        return url
+    raw = url[len(prefix):]
+    if raw.startswith("/"):          # already absolute (sqlite:////abs/path)
+        return url
+    path = (_SRC_ROOT / raw).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return f"{prefix}{path}"
+
+
+DB_URL = _resolve_sqlite_url(settings.database_url)
+_db_engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
 
 # WAL mode: prevents DB corruption on crash by using write-ahead logging.
 # Must be set per-connection; SQLAlchemy's connect event is the right hook.
@@ -496,6 +519,15 @@ def db_record_close(wallet_addr: str, symbol: str, realized_pnl: float):
                .filter(TradeRecord.realized_pnl.is_(None))
                .order_by(TradeRecord.id.desc())
                .first())
+        if not rec:
+            # No open row to attach this PnL to. The in-memory session already
+            # counted the profit/loss, so the lifetime counters now silently
+            # disagree with it — and nothing ever reconciles them. Worth seeing.
+            from loguru import logger
+            logger.warning(
+                f"db_record_close: no open trade row for {wallet_addr[:10]}… {symbol} — "
+                f"realized PnL {realized_pnl:+.2f} is missing from lifetime counters"
+            )
         if rec:
             rec.realized_pnl = realized_pnl
             if not rec.is_seed:
@@ -703,6 +735,14 @@ def db_get_known_fill_ids(wallet_addr: str) -> set:
 
 # ── Query helpers ─────────────────────────────────────────────────────────────
 
+# Raw snapshot cadence (_periodic_equity_snapshot in web/sim.py). The 2% spike
+# threshold below is only meaningful at roughly this spacing — see _despike.
+_RAW_TICK_SECS = 3.0
+# Widest 2-gap window still treated as "adjacent raw snapshots" (3x slack for
+# loop lag and fill-triggered extra rows).
+_DESPIKE_MAX_SPAN_SECS = _RAW_TICK_SECS * 2 * 3
+
+
 def _despike(rows: list) -> list:
     """Remove single-point equity spikes using a 3-point median.
     A spike is any single point that deviates >2% from its neighbours' median and
@@ -710,16 +750,45 @@ def _despike(rows: list) -> list:
     Equity is now hard-floored server-side (web/sim.py _clamp_close_pnl /
     _check_and_liquidate), so this should only ever fire on genuine stale-price
     blips — frequent firing signals a different upstream pricing bug, not
-    something to fix by loosening this threshold."""
+    something to fix by loosening this threshold.
+
+    BUG FIX: this used to run on every returned series unconditionally, including
+    heavily downsampled ones. The 2% rule assumes the three points are
+    consecutive 3s snapshots; once downsampling puts them minutes-to-hours apart,
+    a >2% move between neighbours is ordinary price action, so the filter was
+    silently rewriting real P&L history — and worsening as retention grew, since
+    a bigger table means a bigger downsample bucket. Now it only fires where the
+    local spacing is actually near the raw cadence.
+
+    Consequence worth knowing: a glitch row that survives INTO a downsampled
+    series is no longer corrected here, because at that spacing a glitch and real
+    volatility are indistinguishable. Glitch suppression properly belongs at
+    WRITE time, on the raw 3s stream where the 2% rule is valid — doing it there
+    would make every downsampled read clean by construction. That's the right
+    follow-up; corrupting real history to approximate it here is not.
+    """
     if len(rows) < 3:
         return rows
     eq = [r["equity"] for r in rows]
+    ts = [r.get("_ts") for r in rows]
     result = list(rows)
+    fired = 0
     for i in range(1, len(eq) - 1):
+        # Skip when neighbours are too far apart in time for the threshold to mean
+        # anything. Missing timestamps (shouldn't happen) fall back to despiking,
+        # preserving the old behaviour rather than silently disabling the filter.
+        if ts[i - 1] is not None and ts[i + 1] is not None:
+            span = (ts[i + 1] - ts[i - 1]).total_seconds()
+            if not (0 < span <= _DESPIKE_MAX_SPAN_SECS):
+                continue
         med = sorted([eq[i - 1], eq[i], eq[i + 1]])[1]
         ref = max(abs(med), abs(eq[i - 1]), 1.0)
         if abs(eq[i] - med) / ref > 0.02:
             result[i] = {**result[i], "equity": round(med, 2)}
+            fired += 1
+    if fired:
+        from loguru import logger
+        logger.debug(f"_despike corrected {fired}/{len(rows)} equity points")
     return result
 
 
@@ -732,20 +801,54 @@ def _despike(rows: list) -> list:
 _EQUITY_HISTORY_MAX_POINTS = 2000
 
 
+def _thin_by_row_number(db, cols, filters, count: int, max_points: int,
+                        always_include_last: bool = False):
+    """Downsample to <= max_points rows, keeping every Nth row by TIME order.
+
+    BUG FIX: this replaces a `(id - min_id) % bucket_size == 0` predicate. `id`
+    is a global autoincrement, so with W wallets writing concurrently a single
+    wallet's ids advance by ~W per snapshot round. The modulo then accepted
+    `gcd(W, bucket_size)/bucket_size` of rows instead of `1/bucket_size` — i.e.
+    up to W times the requested budget, non-deterministically. Measured on a
+    6-wallet, 7-day synthetic DB: max_points=2000 returned 4032 rows, and the
+    24h range returned 12875 rows for the same 2000 budget (6.4x). That inflated
+    every payload and every render, and got less predictable as wallets were
+    added.
+
+    ROW_NUMBER() over the time order is independent of id spacing, so the result
+    is exactly floor(count/bucket) rows — the budget is now a real bound.
+    """
+    # Ceiling division, not floor: `count // max_points` rounds the bucket DOWN,
+    # which keeps count/bucket > max_points (e.g. 7200 rows / 2000 budget -> bucket
+    # 3 -> 2400 rows, 20% over). Ceiling guarantees the budget is a real ceiling.
+    bucket = max(1, -(-count // max_points))
+    rn = func.row_number().over(order_by=EquitySnapshot.timestamp).label("_rn")
+    sub = db.query(*cols, rn).filter(*filters).subquery()
+    picked = (sub.c._rn % bucket) == 0
+    if always_include_last:
+        # Callers that read cumulative fields off the final row (funding totals,
+        # current drawdown) need the true last row regardless of where it falls
+        # in the bucket pattern.
+        picked = or_(picked, sub.c._rn == count)
+    return (db.query(*[sub.c[c.key] for c in cols])
+              .filter(picked)
+              .order_by(sub.c.timestamp)
+              .all())
+
+
 def db_get_equity_history(wallet_addr: str, hours: int = 0,
                           max_points: int = _EQUITY_HISTORY_MAX_POINTS) -> list:
     """Returns the wallet's equity history, downsampled to at most max_points
     points spanning the full requested time range.
 
-    hours=0 (default) means "no time cutoff" — the entire retained history,
-    not just a recent window. Downsampling happens in SQL (bucket by rowid,
-    take one representative row per bucket) rather than fetching every row
-    into Python first: after months of 3s-cadence snapshots a wallet's table
-    can hold millions of rows, and building/despiking/downsampling a
-    multi-million-row Python list on every chart load does not scale — this
-    keeps Python-side memory and JSON payload size at O(max_points)
-    regardless of table size, while SQLite does the row-counting/bucketing
-    scan internally over the indexed (wallet_addr, timestamp) columns.
+    hours=0 means "no time cutoff" — the entire retained history. Any other
+    value windows to the last `hours`, which is both what the chart's range
+    buttons want AND far cheaper, since it becomes a range scan on the
+    (wallet_addr, timestamp) index instead of a walk over every row the wallet
+    ever wrote. Downsampling happens in SQL rather than fetching every row into
+    Python first: after months of 3s-cadence snapshots a wallet's table can hold
+    millions of rows, so this keeps Python-side memory and JSON payload size at
+    O(max_points) regardless of table size.
     """
     with DbSession(_db_engine) as db:
         filters = [EquitySnapshot.wallet_addr == wallet_addr]
@@ -753,37 +856,28 @@ def db_get_equity_history(wallet_addr: str, hours: int = 0,
             cutoff = datetime.utcnow() - timedelta(hours=hours)
             filters.append(EquitySnapshot.timestamp >= cutoff)
 
-        min_id, max_id, count = (
-            db.query(func.min(EquitySnapshot.id), func.max(EquitySnapshot.id),
-                     func.count(EquitySnapshot.id))
-            .filter(*filters).one()
-        )
+        count = db.query(func.count(EquitySnapshot.id)).filter(*filters).scalar() or 0
         if not count:
             return []
 
-        q = db.query(
-            EquitySnapshot.timestamp, EquitySnapshot.equity, EquitySnapshot.balance, EquitySnapshot.upnl,
-        ).filter(*filters)
+        cols = (EquitySnapshot.timestamp, EquitySnapshot.equity,
+                EquitySnapshot.balance, EquitySnapshot.upnl)
         if count > max_points:
-            # One representative row per bucket, chosen via rowid modulo — id is
-            # SQLite's implicit rowid, so this predicate is evaluated against the
-            # index itself and only the ~max_points accepted rows need a table
-            # lookup for equity/balance/upnl.
-            # Bucket from this wallet's row COUNT, not the id range: ids are
-            # global across all wallets, so with N wallets interleaved the
-            # id-range bucket over-thins each wallet to ~1/N of the requested
-            # density (observed: 485 of 5000 requested points at 14 wallets).
-            # Any given id has a 1/bucket chance of hitting the modulo, so
-            # count//max_points yields ~max_points accepted rows regardless
-            # of interleaving.
-            bucket_size = max(1, count // max_points)
-            q = q.filter((EquitySnapshot.id - min_id) % bucket_size == 0)
-        rows = q.order_by(EquitySnapshot.timestamp).all()
+            rows = _thin_by_row_number(db, cols, filters, count, max_points)
+        else:
+            rows = db.query(*cols).filter(*filters).order_by(EquitySnapshot.timestamp).all()
 
-    # timespec='milliseconds' → "YYYY-MM-DDTHH:MM:SS.mmm" — safe for all browsers
+    # timespec='milliseconds' → "YYYY-MM-DDTHH:MM:SS.mmm" — safe for all browsers.
+    # "_ts" carries the raw datetime through to _despike (which needs real spacing
+    # to decide whether its threshold applies) and is stripped before returning,
+    # so it never reaches the JSON payload.
     raw = [{"t": ts.isoformat(timespec='milliseconds'), "equity": equity,
-            "balance": balance, "upnl": upnl} for ts, equity, balance, upnl in rows]
-    return _despike(raw)
+            "balance": balance, "upnl": upnl, "_ts": ts}
+           for ts, equity, balance, upnl in rows]
+    out = _despike(raw)
+    for r in out:
+        r.pop("_ts", None)
+    return out
 
 
 from collections import namedtuple as _namedtuple
@@ -794,33 +888,75 @@ def db_get_equity_rows_downsampled(wallet_addr: str, cutoff: datetime,
                                    max_points: int = 5000) -> list:
     """Windowed equity rows for compute_stats(), downsampled in SQL.
 
-    Same rowid-modulo bucketing as db_get_equity_history — compute_stats used
+    Shares _thin_by_row_number with db_get_equity_history — compute_stats used
     to fetch EVERY snapshot row in its 90-day window into ORM objects, which
     grows without bound during a long uninterrupted run (3s cadence ≈ 29k
     rows/day/wallet) and was the main reason /api/stats got slower every day.
-    The true last row is always included (or_ on max_id) because callers read
-    total_funding_paid and current-drawdown off the final row.
+    The true last row is always included because callers read total_funding_paid
+    and current-drawdown off the final row.
     Returns lightweight namedtuples with .timestamp/.equity/.total_funding_paid.
+
+    CAVEAT for callers: this is a uniform SAMPLE, so extremum statistics computed
+    from it are biased toward zero — a max-drawdown trough that falls between
+    kept rows is simply invisible, and the bias grows with the bucket size (i.e.
+    with uptime). compute_stats therefore takes max drawdown from
+    db_get_equity_extremes(), not from these rows.
     """
     with DbSession(_db_engine) as db:
         filters = [EquitySnapshot.wallet_addr == wallet_addr,
                    EquitySnapshot.timestamp >= cutoff]
-        min_id, max_id, count = (
-            db.query(func.min(EquitySnapshot.id), func.max(EquitySnapshot.id),
-                     func.count(EquitySnapshot.id))
-            .filter(*filters).one()
-        )
+        count = db.query(func.count(EquitySnapshot.id)).filter(*filters).scalar() or 0
         if not count:
             return []
-        q = db.query(EquitySnapshot.timestamp, EquitySnapshot.equity,
-                     EquitySnapshot.total_funding_paid).filter(*filters)
+        cols = (EquitySnapshot.timestamp, EquitySnapshot.equity,
+                EquitySnapshot.total_funding_paid)
         if count > max_points:
-            # count-based bucket, same rationale as db_get_equity_history above
-            bucket_size = max(1, count // max_points)
-            q = q.filter(or_((EquitySnapshot.id - min_id) % bucket_size == 0,
-                             EquitySnapshot.id == max_id))
-        rows = q.order_by(EquitySnapshot.timestamp).all()
+            rows = _thin_by_row_number(db, cols, filters, count, max_points,
+                                       always_include_last=True)
+        else:
+            rows = db.query(*cols).filter(*filters).order_by(EquitySnapshot.timestamp).all()
     return [_EqStatsRow(ts, eq, fund or 0.0) for ts, eq, fund in rows]
+
+
+def db_get_equity_extremes(wallet_addr: str, cutoff: datetime) -> dict | None:
+    """Exact max/current drawdown over EVERY row in the window, computed in SQL.
+
+    BUG FIX: max drawdown used to be derived from db_get_equity_rows_downsampled's
+    uniform sample. Drawdown is an extremum statistic, so sampling systematically
+    biases it toward zero — the trough simply isn't in the sample — and the bias
+    grows with the bucket size, i.e. with uptime. That fed Calmar
+    (total_return / |max_dd|), which carries 25% of the composite `score`, so the
+    longer a wallet ran the more flattering its reported risk profile became.
+
+    A running-maximum window function gets the exact answer without pulling a
+    single row into Python: peak is the running max, and the deepest
+    (equity - peak)/peak over the window is the max drawdown.
+    """
+    with DbSession(_db_engine) as db:
+        sub = (db.query(
+                    EquitySnapshot.equity.label("equity"),
+                    func.max(EquitySnapshot.equity).over(
+                        order_by=EquitySnapshot.timestamp,
+                        rows=(None, 0),           # UNBOUNDED PRECEDING .. CURRENT ROW
+                    ).label("peak"),
+               )
+               .filter(EquitySnapshot.wallet_addr == wallet_addr,
+                       EquitySnapshot.timestamp >= cutoff)
+               .subquery())
+        max_dd = (db.query(func.min((sub.c.equity - sub.c.peak) / sub.c.peak))
+                    .filter(sub.c.peak > 0).scalar())
+        if max_dd is None:
+            return None
+        peak = (db.query(func.max(EquitySnapshot.equity))
+                  .filter(EquitySnapshot.wallet_addr == wallet_addr,
+                          EquitySnapshot.timestamp >= cutoff).scalar())
+        last_row = (db.query(EquitySnapshot.equity)
+                      .filter(EquitySnapshot.wallet_addr == wallet_addr,
+                              EquitySnapshot.timestamp >= cutoff)
+                      .order_by(EquitySnapshot.timestamp.desc())
+                      .limit(1).scalar())
+    cur_dd = ((last_row - peak) / peak * 100) if (peak and peak > 0 and last_row is not None) else 0.0
+    return {"max_drawdown": round(max_dd * 100, 2), "current_drawdown": round(cur_dd, 2)}
 
 
 def db_get_trades(wallet_addr: str, limit: int = 200,

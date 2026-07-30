@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta
 from loguru import logger
 
 from web.db import (_db_engine, TradeRecord, Wallet, db_get_trade_counters,
-                    db_get_equity_rows_downsampled)
+                    db_get_equity_rows_downsampled, db_get_equity_extremes)
 from sqlalchemy.orm import Session as DbSession
 from config.settings import settings
 
@@ -20,6 +20,15 @@ from config.settings import settings
 # from stats_counters instead and stay exact regardless of this window.
 TRADE_STATS_WINDOW_DAYS  = 180
 EQUITY_STATS_WINDOW_DAYS = 90
+
+# Minimum track record before a return may be compounded to a yearly figure.
+# BUG FIX: this used to be 1 day in both call sites (here and _session_to_dict in
+# web/sim.py), which turns ordinary short-run results into nonsense: +5% over one
+# day annualizes to ~5.4 BILLION percent, +10% over a week to ~14,300%. Geometric
+# annualization needs a real track record to mean anything. _risk_stats already
+# refuses to annualize under an hour of data for exactly this reason (see its
+# comment) — this applies the same discipline to the headline return figure.
+MIN_DAYS_FOR_ANNUALIZATION = 30
 
 
 def _win_stats(closed_pnls: list) -> dict:
@@ -275,7 +284,7 @@ def _symbol_stats(trades: list) -> list:
     agg: dict = {}
     for t in trades:
         a = agg.setdefault(t.symbol, {"fills": 0, "volume": 0.0, "count": 0,
-                                      "wins": 0, "pnl": 0.0, "long_fills": 0})
+                                      "wins": 0, "losses": 0, "pnl": 0.0, "long_fills": 0})
         a["fills"]  += 1
         a["volume"] += t.notional or 0
         if (t.side or "").upper() == "LONG":
@@ -285,17 +294,23 @@ def _symbol_stats(trades: list) -> list:
             a["pnl"]   += t.realized_pnl
             if t.realized_pnl > 0:
                 a["wins"] += 1
+            elif t.realized_pnl < 0:
+                a["losses"] += 1
     items = []
     for sym, a in agg.items():
         n = a["count"]
+        # wins/losses are counted separately rather than losses = n - wins, which
+        # silently classified every break-even close as a loss. win_rate uses the
+        # wins+losses denominator for the same reason (matches _win_stats).
+        wl = a["wins"] + a["losses"]
         items.append({
             "symbol":   sym,
             "pnl":      round(a["pnl"], 2),
             "count":    n,
             "fills":    a["fills"],
             "wins":     a["wins"],
-            "losses":   n - a["wins"],
-            "win_rate": round(a["wins"] / n * 100, 1) if n else None,
+            "losses":   a["losses"],
+            "win_rate": round(a["wins"] / wl * 100, 1) if wl else None,
             "avg_pnl":  round(a["pnl"] / n, 2) if n else None,
             "volume":   round(a["volume"], 2),
             "long_pct": round(a["long_fills"] / a["fills"] * 100, 1) if a["fills"] else None,
@@ -310,12 +325,13 @@ def _direction_stats(trades: list) -> dict:
     for side in ("LONG", "SHORT"):
         pnls = [t.realized_pnl for t in trades
                 if (t.side or "").upper() == side and t.realized_pnl is not None]
-        wins = sum(1 for p in pnls if p > 0)
+        wins   = sum(1 for p in pnls if p > 0)
+        losses = sum(1 for p in pnls if p < 0)   # not len(pnls)-wins: break-even is neither
         out[side.lower()] = {
             "count":    len(pnls),
             "wins":     wins,
-            "losses":   len(pnls) - wins,
-            "win_rate": round(wins / len(pnls) * 100, 1) if pnls else None,
+            "losses":   losses,
+            "win_rate": round(wins / (wins + losses) * 100, 1) if (wins + losses) else None,
             "pnl":      round(sum(pnls), 2),
         }
     return out
@@ -484,7 +500,11 @@ def compute_stats(wallet_addr: str, open_positions: dict = None, copy_ratio: flo
     avg_fee_per_fill      = round(live_fees / n_live_trades, 4) if n_live_trades else 0.0
     avg_fee_per_roundtrip = round(live_fees / n_closed, 4)      if n_closed else 0.0
     fee_pct_vol        = round(live_fees / total_volume * 100, 4)   if total_volume else 0.0
-    fee_drag_pct       = round(live_fees / gross_pnl * 100, 1) if gross_pnl > live_fees else None
+    # Condition is `gross_pnl > 0`, not `gross_pnl > live_fees`: the old test
+    # returned None whenever fees had eaten the profits, hiding fee drag in
+    # exactly the situation where it's the whole story. Drag above 100% is a real,
+    # meaningful reading ("fees exceeded gross profit").
+    fee_drag_pct       = round(live_fees / gross_pnl * 100, 1) if gross_pnl > 0 else None
     breakeven_notional = round(0.10 / settings.taker_fee_rate, 2)
 
     # ── Copy capital brackets ──────────────────────────────────────────────────
@@ -522,12 +542,22 @@ def compute_stats(wallet_addr: str, open_positions: dict = None, copy_ratio: flo
     win_st["total_trades"] = n_closed
     win_st["wins"]         = counters["wins_count"]
     win_st["losses"]       = counters["losses_count"]
-    win_st["win_rate"]     = round(counters["wins_count"] / n_closed * 100, 1) if n_closed else None
+    # Denominator is wins+losses, NOT closed_count: closed_count includes trades
+    # that closed at exactly 0, which are neither a win nor a loss. Using it made
+    # this win rate disagree with the one _session_to_dict shows in the sidebar
+    # for the same wallet. One convention, both places.
+    _wl = counters["wins_count"] + counters["losses_count"]
+    win_st["win_rate"]     = round(counters["wins_count"] / _wl * 100, 1) if _wl else None
 
     profit_st = _profit_stats(closed_pnls)
     profit_st["total_realized_pnl"] = gross_pnl  # lifetime-exact, overrides the windowed sum
 
-    dd_st   = _drawdown_stats(equities)
+    # Drawdown comes from an exact SQL pass over EVERY row in the window, not
+    # from `equities` (a uniform sample). Sampling can't see a trough that falls
+    # between kept rows, so it understated max drawdown by more and more as the
+    # table grew — and that number feeds Calmar and 25% of `score`. Falls back to
+    # the sampled computation only if the SQL path returns nothing.
+    dd_st   = db_get_equity_extremes(wallet_addr, cutoff_equity) or _drawdown_stats(equities)
     risk_st = _risk_stats(equity_rows)
     rolling_sharpe  = _rolling_sharpe_series(equity_rows)
 
@@ -542,7 +572,7 @@ def compute_stats(wallet_addr: str, open_positions: dict = None, copy_ratio: flo
 
     if len(equity_rows) >= 2:
         span_days = (equity_rows[-1].timestamp - equity_rows[0].timestamp).total_seconds() / 86400
-        if span_days >= 1 and total_ret_pct > -100:
+        if span_days >= MIN_DAYS_FOR_ANNUALIZATION and total_ret_pct > -100:
             annualized_return = round(((1 + total_ret_pct / 100) ** (365 / span_days) - 1) * 100, 1)
         else:
             annualized_return = None

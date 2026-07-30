@@ -203,6 +203,28 @@ class HyperliquidClient:
             logger.error(f"Failed to get assets: {e}")
             return []
     
+    async def get_perp_max_leverage(self) -> Dict[str, int]:
+        """{SYMBOL: maxLeverage} across every perp dex.
+
+        Hyperliquid derives maintenance margin from each asset's OWN max leverage
+        (mm = 1/(2*maxLeverage)), so this is what liquidation pricing needs — see
+        web/sim.py _liquidation_price. It comes from the same `allPerpMetas`
+        response already used for the asset universe, so this adds one cheap
+        metadata call rather than a new data source.
+        """
+        out: Dict[str, int] = {}
+        try:
+            response = await self._post(self.info_url, {"type": "allPerpMetas"})
+            for market in response or []:
+                for asset in market.get("universe", []) or []:
+                    name = (asset.get("name") or "").upper()
+                    lev  = asset.get("maxLeverage")
+                    if name and lev:
+                        out[name] = int(lev)
+        except Exception as e:
+            logger.error(f"Failed to get perp max leverage: {e}")
+        return out
+
     async def get_spot_meta(self) -> dict:
         """Get the spot market universe/token metadata. Used to resolve a
         spot fill's raw '@<index>' coin name (Hyperliquid's identifier for

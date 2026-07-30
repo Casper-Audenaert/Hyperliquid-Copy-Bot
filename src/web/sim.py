@@ -80,6 +80,17 @@ _funding_lock: Optional[asyncio.Lock] = None   # lazily created in the asyncio l
 _mids_cache: dict = {}
 _mids_cache_ts: float = 0.0
 _MIDS_TTL = 15.0  # was 3s (~360 weight/min), tuned for the now-removed debounce feature
+
+# Nominal cadence of _periodic_equity_snapshot / _periodic_liquidation_check.
+# Funding is pro-rated by MEASURED elapsed time rather than this constant, so
+# changing it can no longer silently corrupt funding math — it only affects
+# chart/liquidation-check resolution. (db.py's _despike uses the same value to
+# decide whether two points are adjacent raw snapshots; keep them in step.)
+_SNAPSHOT_TICK_SECS = 3.0
+# Upper bound on a single tick's funding charge, in seconds of elapsed time.
+# Protects against a pathological stall (host suspend, event-loop starvation)
+# billing hours of funding in one go.
+_MAX_FUNDING_TICK_SECS = 60.0
 _mids_lock: Optional[asyncio.Lock] = None      # lazily created in the asyncio loop
 
 
@@ -136,10 +147,48 @@ async def _get_shared_mids(client: HyperliquidClient) -> dict:
         # successful fetch, causing equity to intermittently compute UPNL=0 for held
         # positions on that dex (visible as a synchronized square-wave chart across
         # every wallet holding that symbol, since this cache is shared module-wide).
+        # Because this merges, a symbol whose dex has been failing (or that was
+        # delisted) keeps its LAST price forever, and _mids_cache_ts — a single
+        # global stamp — says "fresh" for it just the same as for symbols that
+        # actually refreshed. That price feeds uPnL -> equity -> the persisted
+        # chart, so a permanently stuck symbol silently corrupts equity with no
+        # signal anywhere. Replacing instead of merging would reintroduce the
+        # square-wave described above, so track per-symbol freshness instead and
+        # let callers see it (_warn_if_stale_price).
         if mids:
             _mids_cache.update(mids)
             _mids_cache_ts = now
+            for _sym in mids:
+                _mids_sym_ts[_sym] = now
         return _mids_cache or mids or {}
+
+
+# Per-symbol monotonic time of the last successful price refresh.
+_mids_sym_ts: dict = {}
+# A held position's price this old is no longer "slightly stale" — it means that
+# symbol has stopped refreshing entirely (dead dex, delisting) and its uPnL
+# contribution is fiction.
+_MID_STALE_WARN_SECS = 600.0
+_stale_price_warned: dict = {}
+
+
+def _warn_if_stale_price(symbol: str) -> None:
+    """Log once per stale episode when a held position's mark price has stopped
+    refreshing. Deliberately does NOT drop the price from equity — a stale price
+    is still closer to the truth than treating the position as having zero uPnL."""
+    ts = _mids_sym_ts.get(symbol)
+    if not ts:
+        return
+    age = time.monotonic() - ts
+    if age > _MID_STALE_WARN_SECS:
+        if not _stale_price_warned.get(symbol):
+            _stale_price_warned[symbol] = True
+            logger.warning(
+                f"Mark price for {symbol} has not refreshed in {age/60:.1f}min — "
+                f"equity for open {symbol} positions is being computed from a stale price"
+            )
+    elif _stale_price_warned.get(symbol):
+        _stale_price_warned[symbol] = False
 
 
 @dataclass
@@ -187,6 +236,7 @@ class WalletSession:
     _style_last_checked: float = 0.0                       # monotonic time of last _detect_trading_style call
     _last_equity_tick_ts: float = 0.0                      # monotonic time of last equity_tick emit from fills
     _last_fill_snap_ts: float = 0.0                        # monotonic time of last fill-triggered equity snapshot
+    _last_snap_tick_ts: float = 0.0                        # monotonic time of last snapshot-loop tick, for funding pro-ration
     _last_funding_persist_ts: float = 0.0                  # monotonic time of last per-position funding_paid persist (throttled, see the funding loop)
     median_hold_secs: float = 60.0                         # median position hold time (seconds) for this target
     simulated_pnl: float = 0.0        # cumulative realized PnL (gross, pre-fee)
@@ -254,6 +304,40 @@ def _upnl(s: WalletSession, price_override: dict | None = None) -> float:
     return total
 
 
+def _effective_leverage(pos: dict) -> float:
+    """Notional / margin actually committed.
+
+    pos["leverage"] is overwritten by whatever the LATEST fill used, so after an
+    add at a different leverage it no longer describes the combined position —
+    yet it drove both the liquidation threshold and the UI. Margin is accumulated
+    per fill, so notional/margin is the position's real leverage. Falls back to
+    the stored field when margin is missing (restored rows, seeds).
+    """
+    margin = pos.get("margin_used", 0) or 0
+    value  = abs(pos.get("size", 0)) * (pos.get("entry_price", 0) or 0)
+    if margin > 0 and value > 0:
+        return value / margin
+    return max(pos.get("leverage", 1) or 1, 1)
+
+
+def _clamp_balance(session: "WalletSession", where: str) -> None:
+    """Floor the simulated balance at zero, loudly.
+
+    A negative balance means the accounting identity broke somewhere upstream
+    (a loss that escaped _clamp_close_pnl, or funding charged against an account
+    that couldn't cover it). Flooring it silently — which is what the three bare
+    `max(balance, 0.0)` call sites used to do — creates money out of nothing and
+    erases the only evidence the bug ever happened.
+    """
+    if session.simulated_balance < 0:
+        logger.error(
+            f"[{session.label}] balance went negative (${session.simulated_balance:.2f}) at "
+            f"{where} — flooring to 0. This means a cost was charged that the account "
+            f"could not cover; equity is now overstated by that amount."
+        )
+        session.simulated_balance = 0.0
+
+
 def _clamp_close_pnl(pnl: float, margin_used: float) -> float:
     """Cap realized loss at the margin allocated to the position being closed —
     mirrors a real exchange's isolated-margin guarantee that a position can
@@ -263,6 +347,66 @@ def _clamp_close_pnl(pnl: float, margin_used: float) -> float:
     return max(pnl, -margin_used)
 
 
+# ── Liquidation pricing ───────────────────────────────────────────────────────
+# Per-asset max leverage, straight from Hyperliquid's `allPerpMetas` (the same
+# response szDecimals comes from). Populated in the background by
+# _refresh_max_leverage; falls back to PositionSizer._MAX_LEVERAGE's hardcoded
+# table and finally to the configured default, so a failed fetch never blocks a
+# liquidation check.
+_max_lev_cache: dict = {}
+
+
+def _asset_max_leverage(symbol: str) -> int:
+    """The asset's own maximum leverage — NOT the leverage the position uses.
+    Hyperliquid derives maintenance margin from this, so it must not be confused
+    with pos["leverage"] (that confusion was the bug this helper exists to fix)."""
+    sym = (symbol or "").upper()
+    cached = _max_lev_cache.get(sym)
+    if cached:
+        return int(cached)
+    from copy_engine.position_sizer import PositionSizer
+    return int(PositionSizer._MAX_LEVERAGE.get(sym, settings.leverage.max_leverage))
+
+
+def _liquidation_price(entry: float, lev: float, is_long: bool, symbol: str) -> Optional[float]:
+    """Liquidation price for an isolated-margin position, matching Hyperliquid.
+
+    BUG FIX: the previous formula was `entry * (1 - 1/lev + 1/(2*lev))`, i.e. it
+    (a) derived maintenance margin from the POSITION's leverage instead of the
+    ASSET's max leverage, and (b) dropped the `/(1 - mm)` denominator entirely.
+    Hyperliquid's maintenance margin is half the initial margin at max leverage —
+    `1/(2 * asset_max_leverage)` of notional, a per-asset constant — so solving
+    `margin + size*(px - entry) = mm * size * px` for a long gives the formula
+    below. The old version only agreed when position leverage happened to equal
+    the asset's max; at anything lower it liquidated roughly twice as early
+    (BTC 10x long, entry 100: old 95.00 = a 5% move, correct 90.91 = 9.1%),
+    force-closing positions the real exchange would never have touched and
+    booking losses that never happened.
+    """
+    if entry <= 0 or lev <= 1:
+        # 1x has no meaningful isolated liquidation before ~-100%; _clamp_close_pnl
+        # already caps the loss at margin, so leave these alone.
+        return None
+    mm = 1.0 / (2.0 * max(_asset_max_leverage(symbol), 1))
+    if mm >= 1.0:
+        return None
+    if is_long:
+        return entry * (1 - 1.0 / lev) / (1 - mm)
+    return entry * (1 + 1.0 / lev) / (1 + mm)
+
+
+async def _refresh_max_leverage(client) -> None:
+    """Populate _max_lev_cache from allPerpMetas. Best-effort: any failure just
+    leaves the hardcoded fallback table in play."""
+    try:
+        metas = await client.get_perp_max_leverage()
+        if metas:
+            _max_lev_cache.update(metas)
+            logger.debug(f"max-leverage cache: {len(_max_lev_cache)} assets")
+    except Exception as e:
+        logger.warning(f"max-leverage refresh failed (using fallback table): {e}")
+
+
 async def _check_and_liquidate(session: WalletSession, symbol: str, price: float, emit_fn: Callable) -> bool:
     """Synchronous (not polling) liquidation check for one position at one price point.
     Force-closes the position if price has crossed its liquidation threshold, clamping
@@ -270,13 +414,12 @@ async def _check_and_liquidate(session: WalletSession, symbol: str, price: float
     pos = session.simulated_positions.get(symbol)
     if not pos or price <= 0:
         return False
-    lev     = max(pos.get("leverage", 1), 1)
+    lev     = _effective_leverage(pos)   # not pos["leverage"] — see _effective_leverage
     entry   = pos.get("entry_price", 0)
     is_long = pos.get("side", "").upper() == "LONG"
-    if entry <= 0 or lev <= 1:
+    liq_px  = _liquidation_price(entry, lev, is_long, symbol)
+    if liq_px is None:
         return False
-    _maint = 1.0 / (2.0 * lev)
-    liq_px = entry * (1 - 1/lev + _maint) if is_long else entry * (1 + 1/lev - _maint)
     pos["_liq_px"] = liq_px
     liquidated = (is_long and price <= liq_px) or (not is_long and price >= liq_px)
     if not liquidated:
@@ -378,16 +521,17 @@ def _session_to_dict(s: WalletSession, price_override: dict | None = None) -> di
         total_margin += margin
 
         # Use the liq_px computed by the snapshot loop (HL-derived when available).
-        # Falls back to simplified formula for positions not yet seen by the snapshot.
-        lev = max(pos.get("leverage", 1), 1)
+        # Falls back to the shared _liquidation_price helper for positions not yet
+        # seen by the snapshot — same formula, so the displayed number can never
+        # disagree with the one the liquidation check actually enforces (it used
+        # to be a third hand-inlined copy of the old, wrong formula).
+        lev = _effective_leverage(pos)
         stored_liq = pos.get("_liq_px")
         if stored_liq and stored_liq > 0:
             liq_price = round(stored_liq, 4)
-        elif entry > 0 and lev > 1:
-            _maint = 1.0 / (2.0 * lev)
-            liq_price = round(entry * (1 - 1/lev + _maint), 4) if is_long else round(entry * (1 + 1/lev - _maint), 4)
         else:
-            liq_price = None
+            _lp = _liquidation_price(entry, lev, is_long, sym)
+            liq_price = round(_lp, 4) if _lp else None
         if liq_price and current_price > 0:
             dist_to_liq_pct = round((current_price - liq_price) / current_price * 100, 1) if is_long \
                          else round((liq_price - current_price) / current_price * 100, 1)
@@ -438,10 +582,14 @@ def _session_to_dict(s: WalletSession, price_override: dict | None = None) -> di
     )
     return_pct = (equity - s.start_balance) / s.start_balance * 100 if s.start_balance > 0 else 0
     uptime_h   = (datetime.now() - s.bot_start_time).total_seconds() / 3600 if s.bot_start_time else 0
+    # Denominator is wins+losses (break-even closes excluded), matching
+    # stats.py's _win_stats convention — these two used to disagree, so the
+    # sidebar KPI and the tearsheet could show different win rates for the same
+    # wallet whenever any trade closed at exactly 0.
     total_closed = s.wins + s.losses
     win_rate   = round(s.wins / total_closed * 100, 1) if total_closed > 0 else None
     days_running = uptime_h / 24
-    if days_running >= 1 and return_pct > -100:
+    if days_running >= MIN_DAYS_FOR_ANNUALIZATION and return_pct > -100:
         annualized_return = round(((1 + return_pct / 100) ** (365 / days_running) - 1) * 100, 1)
     else:
         annualized_return = None
@@ -1367,7 +1515,7 @@ async def _process_fill(session: WalletSession, fill_data: dict, fill_id, emit_f
 
         # Aggregate floor: fees/funding deductions are individually too small to
         # matter, but correctness shouldn't depend on chasing every deduction site.
-        session.simulated_balance = max(session.simulated_balance, 0.0)
+        _clamp_balance(session, "on_position_close")
 
     # Lock released above — now safe to do the (possibly slow, DB-contended)
     # equity snapshot write without blocking this wallet's next fill.
@@ -1496,7 +1644,7 @@ def make_callbacks(session: WalletSession, emit_fn: Callable) -> dict:
             pnl      = _clamp_close_pnl(pnl, margin)
 
             session.simulated_balance += margin + pnl - close_fee
-            session.simulated_balance  = max(session.simulated_balance, 0.0)
+            _clamp_balance(session, "funding tick")
             session.total_fees_paid   += close_fee
             if not pos.get("seeded_on_startup"):
                 session.simulated_pnl += pnl
@@ -1672,10 +1820,26 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
             # cadence over a 15s-fresh price cache costs no extra API weight, just
             # a coarser (still perfectly usable) price resolution between the
             # network's real refreshes.
-            await asyncio.sleep(3)
+            await asyncio.sleep(_SNAPSHOT_TICK_SECS)
             if session.address not in _sessions:
                 logger.debug(f"[{session.label}] Snapshot task exiting — wallet removed")
                 return
+
+            # Real elapsed time since the previous tick, for funding pro-ration.
+            # BUG FIX: funding used to be charged as a flat `rate / 1200`, i.e. it
+            # assumed every tick was exactly 3s. The true period is sleep(3) PLUS
+            # this loop body's own cost (two REST-cached lookups and several
+            # to_thread DB writes), so on a loaded Pi it drifts well above 3s and
+            # each hour charged noticeably fewer than 1200 ticks' worth of funding.
+            # The error was systematic (always under-charging) and scaled with
+            # load. Measuring dt removes both that bias and the hidden coupling
+            # between the funding divisor and the sleep constant.
+            _now_tick = time.monotonic()
+            _tick_dt  = _now_tick - (session._last_snap_tick_ts or (_now_tick - _SNAPSHOT_TICK_SECS))
+            session._last_snap_tick_ts = _now_tick
+            # Guard against a pathological gap (debugger pause, laptop sleep,
+            # event-loop starvation) charging hours of funding in one tick.
+            _tick_dt = min(max(_tick_dt, 0.0), _MAX_FUNDING_TICK_SECS)
 
 
             # Build price_map: allMids (REST, ≤_MIDS_TTL=15s) always preferred; WS
@@ -1719,6 +1883,7 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
                 px    = price_map.get(sym, 0)
                 if px <= 0:
                     continue
+                _warn_if_stale_price(sym)
                 size  = abs(pos["size"])
                 entry = pos.get("entry_price", 0)
                 total_upnl += (size * (px - entry) if pos.get("side", "").upper() == "LONG"
@@ -1727,7 +1892,9 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
             total_margin = sum(p.get("margin_used", 0) for p in session.simulated_positions.values())
 
             # HL `funding` field = current predicted 1-hour rate (not 8h).
-            # Pro-rate to this 3s tick: 1h = 3600s → 1200 ticks of 3s each.
+            # Pro-rate by the tick's ACTUAL elapsed seconds (_tick_dt / 3600),
+            # not by a constant derived from the nominal cadence — see the
+            # _tick_dt comment above.
             _funding_breakdown: list = []  # per-symbol charges this tick, for feed visibility
             try:
                 funding_map = await _get_shared_funding_rates(session.client)
@@ -1740,7 +1907,7 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
                         if px <= 0:
                             continue
                         pos_value = abs(pos["size"]) * px
-                        charge    = pos_value * rate / 1200  # 1h rate ÷ 1200 three-second ticks
+                        charge    = pos_value * rate * (_tick_dt / 3600.0)  # 1h rate → this tick's real share
                         is_long   = pos.get("side", "").upper() == "LONG"
                         # Sign convention matches total_funding_paid: positive = paid, negative = earned.
                         signed_charge = charge if is_long else -charge
@@ -1752,7 +1919,7 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
                             session.total_funding_paid  -= charge
                         pos["funding_paid"] = pos.get("funding_paid", 0.0) + signed_charge
                         _funding_breakdown.append({"symbol": sym, "charge": round(signed_charge, 4)})
-                    session.simulated_balance = max(session.simulated_balance, 0.0)
+                    _clamp_balance(session, "liquidation sweep")
             except Exception as e:
                 logger.warning(f"[{session.label}] funding rate fetch failed, skipping: {e}")
 
@@ -1816,7 +1983,7 @@ async def _periodic_equity_snapshot(session: WalletSession, emit_fn: Callable):
 
             # ── Liquidation simulation ────────────────────────────────────────
             # Reuses the synchronous check shared with the fill path (_check_and_liquidate) —
-            # same simplified maintenance-margin formula, now with a single source of truth
+            # maintenance margin comes from _liquidation_price, the single source of truth
             # and a clamped realized loss.
             async with session._state_lock:
                 for sym in list(session.simulated_positions.keys()):
@@ -1901,7 +2068,7 @@ async def _periodic_liquidation_check(session: WalletSession, emit_fn: Callable)
     (refreshed on the shared _MIDS_TTL=15s elsewhere) so this adds no new REST calls."""
     while True:
         try:
-            await asyncio.sleep(3)
+            await asyncio.sleep(_SNAPSHOT_TICK_SECS)
             if session.address not in _sessions:
                 return
             if session.simulated_positions:
@@ -2132,6 +2299,12 @@ async def start_session(session: WalletSession, emit_fn: Callable, offset_secs: 
     if offset_secs:
         await asyncio.sleep(offset_secs)
     session._state_lock = asyncio.Lock()
+
+    # Per-asset max leverage drives maintenance margin (see _liquidation_price).
+    # Module-level cache shared by every session, so only the first wallet to
+    # start actually pays for the fetch; the rest hit a populated dict.
+    if not _max_lev_cache:
+        await _refresh_max_leverage(session.client)
 
     # ── Restart recovery ──────────────────────────────────────────────────────
     _saved_positions = db_load_positions(session.address)
